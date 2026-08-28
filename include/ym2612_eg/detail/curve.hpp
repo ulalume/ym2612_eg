@@ -209,6 +209,10 @@ inline CurveResult sample_curve(const CurveRequest &request) {
       // record the new value at the key-off instant.
       push_point(ms, true);
       key_off_done = true;
+      // Key-off puts the envelope in motion again (release), so re-arm the
+      // park detector; without this a curve that parked during sustain hold
+      // would end here and lose its whole release segment.
+      parked = false;
       if (sim.output() >= kSilenceAttenuation) {
         if (silence_start_ms < 0.0) {
           silence_start_ms = ms;
@@ -253,7 +257,10 @@ inline CurveResult sample_curve(const CurveRequest &request) {
 
     if (!parked && sim.is_static()) {
       parked = true;
-      res.park_ms = ms;
+      // park_ms is the FIRST time the envelope came to rest (e.g. the sustain
+      // hold of an SR=0 patch); later Park markers still record re-parks.
+      if (!std::isfinite(res.park_ms))
+        res.park_ms = ms;
       add_marker(ms, MarkerKind::Park);
       push_point(ms, true);
     }

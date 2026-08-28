@@ -408,11 +408,30 @@ void test_clock_selection() {
   CHECK_REL(b / a, kNtscClockHz / kPalClockHz, 0.001);
 }
 
+// Regression: a curve that parks during sustain hold (SR=0) must still get
+// its release segment after the gate ends.  The park detector re-arms at
+// key-off; park_ms stays at the first (sustain-hold) park.
+void test_park_then_key_off_keeps_release() {
+  CurveRequest req;
+  req.op = OperatorParams{31, 31, 0, 7, 4, 0, 0, 0}; // instant decay, SR=0
+  req.pitch = kC4;
+  req.gate_ms = 500.0;
+  req.max_ms = 3000.0;
+  const CurveResult r = sample_curve(req);
+
+  CHECK(r.park_ms < 500.0);              // first park = sustain hold
+  CHECK(count_marker(r, MarkerKind::Park) == 2); // re-park at end of release
+  CHECK(marker_ms(r, MarkerKind::KeyOff) >= 500.0 - 0.1);
+  CHECK(r.points.back().ms > 600.0);     // release actually simulated
+  CHECK(r.points.back().att == kMaxAttenuation);
+}
+
 } // namespace
 
 int main() {
   std::cout << "curve_test\n";
   RUN_TEST(test_points_and_marker_ordering);
+  RUN_TEST(test_park_then_key_off_keeps_release);
   RUN_TEST(test_park_when_held_forever);
   RUN_TEST(test_never_parks_within_max_ms);
   RUN_TEST(test_ssg_loop_detection);
