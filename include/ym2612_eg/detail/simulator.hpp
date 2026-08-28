@@ -69,12 +69,17 @@ enum EventBits : uint32_t {
 
 inline NotePitch NotePitch::from_midi(int midi_note) {
   const int m = midi_note < 0 ? 0 : (midi_note > 127 ? 127 : midi_note);
-  // megatoy computes `uint8_t block = midi_note / 12 - 1` and then clamps it
-  // to 0..7.  For MIDI 0..11 (octave -1) the uint8_t wrap yields 255, which
-  // clamps to block 7.  Replicated deliberately so the graph matches what
+  // megatoy computes `int octave = midi_note / 12 - 1` in signed arithmetic
+  // and clamps negative octaves up to 0.  MIDI 0..11 (octave -1) therefore
+  // lands on block 0 -- the lowest representable octave -- rather than
+  // wrapping to the highest.  Replicated here so the graph matches what
   // megatoy actually plays.
-  const uint8_t octave = static_cast<uint8_t>(static_cast<uint8_t>(m / 12) - 1);
-  const uint8_t block = octave > 7 ? uint8_t{7} : octave;
+  int octave = m / 12 - 1;
+  if (octave < 0) {
+    octave = 0;
+  }
+  const uint8_t block =
+      octave > 7 ? uint8_t{7} : static_cast<uint8_t>(octave);
   // frequency_with_bend() renormalises F-num into [322, 644); every table
   // entry is already inside that window, so block is untouched.
   return NotePitch{detail::kMegatoyFnum[m % 12], block};

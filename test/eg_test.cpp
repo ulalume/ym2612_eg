@@ -588,12 +588,12 @@ void test_from_midi_matches_megatoy() {
     CHECK_EQ(p.fnum, table[m % 12]);
     CHECK_EQ(p.block, block);
   }
-  // Extremes.  megatoy computes the octave in a uint8_t, so MIDI 0..11 wrap
-  // to 255 and clamp to block 7; replicated deliberately.
+  // Extremes.  megatoy clamps negative octaves (MIDI 0..11) up to block 0,
+  // the lowest representable octave, while keeping the pitch-class F-num.
   CHECK_EQ(NotePitch::from_midi(0).fnum, 322);
-  CHECK_EQ(NotePitch::from_midi(0).block, 7);
+  CHECK_EQ(NotePitch::from_midi(0).block, 0);
   CHECK_EQ(NotePitch::from_midi(11).fnum, 608);
-  CHECK_EQ(NotePitch::from_midi(11).block, 7);
+  CHECK_EQ(NotePitch::from_midi(11).block, 0);
   CHECK_EQ(NotePitch::from_midi(12).block, 0);
   CHECK_EQ(NotePitch::from_midi(127).fnum, 482);
   CHECK_EQ(NotePitch::from_midi(127).block, 7);
