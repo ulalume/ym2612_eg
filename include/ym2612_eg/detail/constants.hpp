@@ -1,14 +1,13 @@
 #pragma once
 
 // Clocks, fixed-point conventions and unit conversions.
-// See EG_SPEC.md sections 1 and 2.
 
 #include <cmath>
 #include <cstdint>
 
 namespace ym2612_eg {
 
-// Genesis / Mega Drive master clocks (EG_SPEC 1).
+// Genesis / Mega Drive master clocks.
 inline constexpr double kNtscClockHz = 53693175.0 / 7.0; // 7670453.57 Hz
 inline constexpr double kPalClockHz = 53203424.0 / 7.0;  // 7600489.14 Hz
 
@@ -19,7 +18,7 @@ inline constexpr int kEgClockDivider = 3;
 
 // 10-bit attenuation, 4.6 fixed point.  0 = loudest.
 inline constexpr uint16_t kMaxAttenuation = 0x3FF;
-// SSG-EG folds / freezes here (EG_SPEC 2, SSG_EG_SPEC 2b).
+// SSG-EG folds / freezes here.
 inline constexpr uint16_t kSsgFoldAttenuation = 0x200;
 // Any output attenuation at or above this multiplies to exactly 0 in hardware.
 inline constexpr uint16_t kSilenceAttenuation = 0x340;

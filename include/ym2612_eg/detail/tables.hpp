@@ -1,20 +1,15 @@
 #pragma once
 
 // The 64x8 envelope increment table and the effective-rate arithmetic.
-// See EG_SPEC.md sections 3 and 4.
 
 #include <cstdint>
 
 namespace ym2612_eg {
 namespace detail {
 
-// EG_SPEC 4.  Identical in jsgroth's article and in ymfm's nibble-packed
-// s_increment_table[64] (all 512 cells compared programmatically).
-//
-// Rows 0/1 are all-zero (rate 0 never advances -> R=0 holds forever).
+// Rows 0/1 are all-zero: rate 0 never advances, so R=0 holds forever.
 // Rows 2-7 are degenerate because shift >= 10 leaves fewer than 3 usable
-// index bits in the 12-bit counter.
-// Rows 8-47 repeat a four-row group with period 4.
+// index bits in the 12-bit counter.  Rows 8-47 repeat with period 4.
 inline constexpr uint8_t kIncTable[64][8] = {
     /* 0*/ {0, 0, 0, 0, 0, 0, 0, 0},
     /* 1*/ {0, 0, 0, 0, 0, 0, 0, 0},
@@ -82,13 +77,12 @@ inline constexpr uint8_t kIncTable[64][8] = {
     /*63*/ {8, 8, 8, 8, 8, 8, 8, 8},
 };
 
-// EG_SPEC 4: shift = max(0, 11 - (rate >> 2)); rates >= 44 must all give 0.
+// Rates >= 44 must all give shift 0.
 inline constexpr int rate_shift(int rate) {
   const int s = 11 - (rate >> 2);
   return s > 0 ? s : 0;
 }
 
-// EG_SPEC 3: rate = (R == 0) ? 0 : min(2*R + ksv, 63).
 // R == 0 ignores ksv entirely; that is how SR=0 holds forever.
 inline constexpr int effective_rate(int raw_r, int ksv) {
   if (raw_r == 0)
@@ -97,14 +91,13 @@ inline constexpr int effective_rate(int raw_r, int ksv) {
   return r > 63 ? 63 : r;
 }
 
-// EG_SPEC 2: sl5 = SL | ((SL + 1) & 0x10); sustain_att = sl5 << 5.
-// SL=15 therefore becomes 0x3E0 (992), not 480.
+// SL=15 becomes 0x3E0 (992), not 480.
 inline constexpr int sustain_attenuation(int sl) {
   const int sl4 = sl & 0x0F;
   return (sl4 | ((sl4 + 1) & 0x10)) << 5;
 }
 
-// EG_SPEC 4: increment for this rate at this 12-bit counter value.
+// Increment for this rate at this 12-bit counter value.
 inline constexpr int increment_at(int rate, int counter) {
   const int shift = rate_shift(rate);
   if (counter & ((1 << shift) - 1))

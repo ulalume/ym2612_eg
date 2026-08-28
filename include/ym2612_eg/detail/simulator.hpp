@@ -1,14 +1,7 @@
 #pragma once
 
-// Sample-accurate YM2612 (OPN2) envelope generator simulator, one operator.
-//
-// Normative references:
-//   EG_SPEC.md      - base envelope generator (timing, rates, ADSR)
-//   SSG_EG_SPEC.md  - SSG-EG state machine
-//
-// This is a *visualisation* model: no phase generator, no sine/exp tables,
-// no channel mixing.  Everything that changes the envelope shape is modelled
-// exactly, including the 12-bit skip-0 counter and the /3 EG divider.
+// YM2612 (OPN2) envelope generator, one operator, stepped at the chip's
+// sample rate.  No phase generator, no sine/exp tables, no channel mixing.
 
 #include "constants.hpp"
 #include "tables.hpp"
@@ -34,7 +27,7 @@ struct OperatorParams {
                    //   bit3 enable, bit2 attack, bit1 alternate, bit0 hold
 };
 
-// Pitch matters: key scaling derives from block + F-num (EG_SPEC 3, 8).
+// Key scaling derives from block + F-num, so pitch changes the envelope.
 struct NotePitch {
   uint16_t fnum = 0; // 11-bit
   uint8_t block = 0; // 0..7
@@ -43,7 +36,7 @@ struct NotePitch {
   // ym2612::Note::from_midi_note() followed by frequency_with_bend(note, 0).
   static NotePitch from_midi(int midi_note);
 
-  // EG_SPEC 3: keycode = (block << 2) | (F11 << 1) | lsb.
+  // keycode = (block << 2) | (F11 << 1) | lsb.
   uint8_t keycode() const;
 };
 
@@ -69,11 +62,8 @@ enum EventBits : uint32_t {
 
 inline NotePitch NotePitch::from_midi(int midi_note) {
   const int m = midi_note < 0 ? 0 : (midi_note > 127 ? 127 : midi_note);
-  // megatoy computes `int octave = midi_note / 12 - 1` in signed arithmetic
-  // and clamps negative octaves up to 0.  MIDI 0..11 (octave -1) therefore
-  // lands on block 0 -- the lowest representable octave -- rather than
-  // wrapping to the highest.  Replicated here so the graph matches what
-  // megatoy actually plays.
+  // Follows megatoy's mapping: octave = midi/12 - 1, negative octaves clamped
+  // up, so MIDI 0..11 land on block 0.
   int octave = m / 12 - 1;
   if (octave < 0) {
     octave = 0;
@@ -102,7 +92,7 @@ public:
     reset(0);
   }
 
-  // Mid-note register write: rates are recomputed immediately (EG_SPEC 3).
+  // Mid-note register write: rates are recomputed immediately.
   void set_params(const OperatorParams &params) {
     params_ = params;
     recompute();
@@ -113,12 +103,12 @@ public:
     recompute();
   }
 
-  // Edge-triggered, exactly like a $28 write (EG_SPEC 7).
+  // Edge-triggered, like a $28 write.
   void key_on() {
     if (keyed_on_)
       return;
     keyed_on_ = true;
-    ssg_invert_ = false; // SSG_EG_SPEC 2c: inversion flag cleared on key-on
+    ssg_invert_ = false; // inversion flag cleared on key-on
     ssg_held_ = false;
     phase_ = EgPhase::Attack;
     // Attenuation is NOT reset; attack resumes from the current level,
@@ -130,8 +120,8 @@ public:
   void key_off() {
     if (!keyed_on_)
       return;
-    // SSG_EG_SPEC 3: the *audible* (inverted) level is latched in place, so
-    // release continues from what was heard, not from the internal level.
+    // The audible (inverted) level is latched in place, so release continues
+    // from what was heard, not from the internal level.
     if (ssg_enable_ && (ssg_attack_ != ssg_invert_))
       att_ = (0x200 - att_) & 0x3FF;
     ssg_invert_ = false;
@@ -141,7 +131,7 @@ public:
 
   // Advance one output sample (clock / 144).  SSG-EG logic runs every sample
   // and *before* the envelope update; the envelope itself advances once per
-  // three samples (SSG_EG_SPEC 2b).
+  // three samples.
   void step() {
     events_ = 0;
     if (ssg_enable_)
@@ -160,11 +150,9 @@ public:
       step();
   }
 
-  // Re-initialise.  counter_phase presets the free-running 12-bit EG counter
-  // (it is shared by all 24 operators on real hardware and is not reset by
-  // key-on, so the phase at key-on jitters the first update by up to one
-  // period).  start_att presets the attenuation, which is what a retrigger
-  // into a still-sounding operator looks like.
+  // counter_phase presets the 12-bit EG counter, which is shared by all 24
+  // operators and not reset by key-on, so its phase jitters the first update
+  // by up to one period.  start_att presets the attenuation for a retrigger.
   void reset(uint16_t counter_phase = 0, uint16_t start_att = kMaxAttenuation) {
     counter_ = counter_phase & 0x0FFF;
     att_ = start_att > kMaxAttenuation ? kMaxAttenuation : start_att;
@@ -179,7 +167,7 @@ public:
 
   uint16_t attenuation() const { return static_cast<uint16_t>(att_); }
 
-  // Inversion (keyed-on only) then TL, clamped.  EG_SPEC 2, SSG_EG_SPEC 5.
+  // Inversion (keyed-on only) then TL, clamped.
   uint16_t output() const {
     int a = att_;
     if (ssg_enable_ && keyed_on_ && (ssg_attack_ != ssg_invert_))
@@ -205,8 +193,8 @@ public:
       if (ssg_churning())
         return false;
       // Rate 0/1 (only reachable with AR=0) and rates 62/63 both freeze the
-      // attack: rows 0/1 of the table are all-zero, and the update itself is
-      // guarded by `rate < 62` (EG_SPEC 5).
+      // attack: rows 0/1 of the table are all-zero, and the update is guarded
+      // by `rate < 62`.
       return rate_[0] < 2 || rate_[0] >= 62;
     }
     if (ssg_enable_ && att_ >= kSsgFoldAttenuation) {
@@ -221,9 +209,8 @@ public:
     }
     if (att_ >= kMaxAttenuation)
       return true;
-    // envelope_off_step() still owes this attenuation its snap to 0x3FF, which
-    // lands on the next output sample even if the phase rate is 0 (reachable
-    // by writing SR = 0 mid-decay).
+    // The snap to 0x3FF is still pending on the next output sample, even if
+    // the phase rate is 0 (reachable by writing SR = 0 mid-decay).
     if (!ssg_enable_ && (att_ & 0x3F0) == 0x3F0)
       return false;
     // A Decay that already satisfies the sustain test moves to Sustain on the
@@ -238,7 +225,7 @@ public:
     return static_cast<double>(samples_) * 1000.0 / sample_rate_hz(clock_hz_);
   }
 
-  // Introspection used by the tests and by sample_curve().
+  // Effective values after key scaling.
   int rate_of(EgPhase p) const { return rate_[static_cast<int>(p)]; }
   int sustain_attenuation() const { return sustain_att_; }
   int key_scale_value() const { return ksv_; }
@@ -263,13 +250,13 @@ private:
     ssg_hold_ = (params_.ssg & 0x01) != 0;
   }
 
-  // Would the SSG block keep firing (and therefore keep changing something)?
+  // The SSG block keeps firing, so something keeps changing.
   bool ssg_churning() const {
     return ssg_enable_ && att_ >= kSsgFoldAttenuation && !ssg_hold_;
   }
 
-  // SSG_EG_SPEC 2b.  Runs once per output sample, gated on A >= 0x200.
-  // Step 1 must precede step 4; the rest are order-independent.
+  // Runs once per output sample, gated on A >= 0x200.  Step 1 must precede
+  // step 4; the rest are order-independent.
   void ssg_step() {
     if (att_ < kSsgFoldAttenuation)
       return;
@@ -303,33 +290,25 @@ private:
         ssg_held_ = true;
         events_ |= detail::kEvSsgHold;
       }
+      // The jump to silence is the same "envelope off" branch as below, so it
+      // sets the phase as well.  Modes 3 and 5 keep both level and phase.
       if (!(ssg_attack_ != ssg_invert_)) {
         att_ = kMaxAttenuation;
-        // golden: the jump to silence is Nuked's generic "envelope off" branch
-        // (OPN2_EnvelopeADSR: nextlevel = 0x3FF *and* nextstate = release), so
-        // the phase becomes Release here too -- EG_SPEC 6 documents the pair.
-        // The inverted-hold modes 3 and 5 take Nuked's hold_up_latch path
-        // instead, which leaves both the level and the state alone.
         phase_ = EgPhase::Release;
       }
     }
 
-    // 5. keyed off -> hard cut, unconditionally (SSG_EG_SPEC 3.4).
+    // 5. keyed off -> hard cut, unconditionally.
     if (!keyed_on_) {
       att_ = kMaxAttenuation;
-      phase_ = EgPhase::Release; // golden: same "envelope off" branch
+      phase_ = EgPhase::Release;
     }
   }
 
-  // Nuked's "envelope off": in any non-attack phase, once (att & 0x3F0) ==
-  // 0x3F0 the hardware forces att = 0x3FF and state = Release.  Nuked tests it
-  // in OPN2_EnvelopeADSR, which runs once per *output sample* on the level left
-  // by the previous EG tick -- so the snap lands on the sample after the tick
-  // that pushed att into [0x3F0, 0x3FF], not on the tick itself.
-  // golden: modelled per sample (not at the top of the next EG tick) because
-  // that is where Nuked-OPN2 puts it; verified sample-exact by the golden
-  // vectors.  Only reached when SSG-EG is off; with SSG-EG on Nuked's eg_off
-  // is `level >= 0x200` instead, which ssg_step() already handles.
+  // "Envelope off": in any non-attack phase, (att & 0x3F0) == 0x3F0 forces
+  // att = 0x3FF and Release.  Evaluated per output sample, so it lands on the
+  // sample after the tick that pushed att into [0x3F0, 0x3FF].  With SSG-EG on
+  // the threshold is 0x200 instead, which ssg_step() handles.
   void envelope_off_step() {
     if (phase_ != EgPhase::Attack && (att_ & 0x3F0) == 0x3F0 &&
         att_ != kMaxAttenuation) {
@@ -338,7 +317,7 @@ private:
     }
   }
 
-  // One EG tick, clock / 432.  EG_SPEC "reference tick loop".
+  // One EG tick, clock / 432.
   void eg_step() {
     // 12-bit free-running counter that skips 0 on overflow.
     counter_ = (counter_ + 1) & 0x0FFF;
@@ -371,8 +350,7 @@ private:
     }
 
     if (ssg_enable_) {
-      // SSG_EG_SPEC 2a: 4x increment, and a hard freeze at 0x200.
-      // Applies to DR, SR and RR alike.
+      // 4x increment, frozen at 0x200.  Applies to DR, SR and RR alike.
       if (att_ < kSsgFoldAttenuation)
         att_ += 4 * inc;
     } else {
