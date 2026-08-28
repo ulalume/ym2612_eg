@@ -91,30 +91,6 @@ cmake --build build
 ctest --test-dir build
 ```
 
-## Golden vectors
-
-`golden/*.json` holds 96 scenarios recorded from Nuked-OPN2 at the register
-level: the AR sweep, the DR x SL grid, the SR/RR sweeps with key-off from every
-phase, KS across three octaves, all eight SSG-EG shapes, retriggering, edge
-anchors, and the rate >= 48 regime. `test/golden_test.cpp` replays each case
-and compares `eg_level` at every sample, `eg_out` at every sample, and
-`eg_state` at every EG tick, with no tolerance.
-
-Where the two models genuinely differ — the increment row rotating at rates
->= 48, `SL = 0` with an instant attack, and Nuked's 16-wide `Decay -> Sustain`
-window under SSG-EG's 4x steps — the rules live in `test/golden_common.hpp` and
-the measurements in [`golden/DISCREPANCIES.md`](golden/DISCREPANCIES.md).
-
-To regenerate:
-
-```sh
-cmake -B build-gen -DCMAKE_BUILD_TYPE=Release -DYM2612_EG_BUILD_GOLDEN_GEN=ON
-cmake --build build-gen --target golden      # rewrites golden/*.json in place
-```
-
-Adding or removing a scenario file needs a `cmake` re-run, since each one
-becomes its own CTest case.
-
 ## License
 
 MIT.
