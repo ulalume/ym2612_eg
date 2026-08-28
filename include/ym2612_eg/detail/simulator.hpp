@@ -146,6 +146,8 @@ public:
     events_ = 0;
     if (ssg_enable_)
       ssg_step();
+    else
+      envelope_off_step();
     if (eg_divider_ == 0)
       eg_step();
     if (++eg_divider_ == kEgClockDivider)
@@ -296,13 +298,39 @@ private:
         ssg_held_ = true;
         events_ |= detail::kEvSsgHold;
       }
-      if (!(ssg_attack_ != ssg_invert_))
+      if (!(ssg_attack_ != ssg_invert_)) {
         att_ = kMaxAttenuation;
+        // golden: the jump to silence is Nuked's generic "envelope off" branch
+        // (OPN2_EnvelopeADSR: nextlevel = 0x3FF *and* nextstate = release), so
+        // the phase becomes Release here too -- EG_SPEC 6 documents the pair.
+        // The inverted-hold modes 3 and 5 take Nuked's hold_up_latch path
+        // instead, which leaves both the level and the state alone.
+        phase_ = EgPhase::Release;
+      }
     }
 
     // 5. keyed off -> hard cut, unconditionally (SSG_EG_SPEC 3.4).
-    if (!keyed_on_)
+    if (!keyed_on_) {
       att_ = kMaxAttenuation;
+      phase_ = EgPhase::Release; // golden: same "envelope off" branch
+    }
+  }
+
+  // Nuked's "envelope off": in any non-attack phase, once (att & 0x3F0) ==
+  // 0x3F0 the hardware forces att = 0x3FF and state = Release.  Nuked tests it
+  // in OPN2_EnvelopeADSR, which runs once per *output sample* on the level left
+  // by the previous EG tick -- so the snap lands on the sample after the tick
+  // that pushed att into [0x3F0, 0x3FF], not on the tick itself.
+  // golden: modelled per sample (not at the top of the next EG tick) because
+  // that is where Nuked-OPN2 puts it; verified sample-exact by the golden
+  // vectors.  Only reached when SSG-EG is off; with SSG-EG on Nuked's eg_off
+  // is `level >= 0x200` instead, which ssg_step() already handles.
+  void envelope_off_step() {
+    if (phase_ != EgPhase::Attack && (att_ & 0x3F0) == 0x3F0 &&
+        att_ != kMaxAttenuation) {
+      att_ = kMaxAttenuation;
+      phase_ = EgPhase::Release;
+    }
   }
 
   // One EG tick, clock / 432.  EG_SPEC "reference tick loop".
@@ -347,14 +375,8 @@ private:
     }
     if (att_ > kMaxAttenuation)
       att_ = kMaxAttenuation;
-
-    // Nuked behavior: in any non-attack phase, once (att & 0x3F0) == 0x3F0 the
-    // hardware forces att = 0x3FF and state = Release in one step.  ymfm just
-    // clamps; we follow Nuked because the golden vectors come from Nuked-OPN2.
-    if ((att_ & 0x3F0) == 0x3F0) {
-      att_ = kMaxAttenuation;
-      phase_ = EgPhase::Release;
-    }
+    // The "envelope off" snap that used to live here now runs once per output
+    // sample in envelope_off_step(); see the comment there.
   }
 
   OperatorParams params_{};
