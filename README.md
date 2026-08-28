@@ -189,3 +189,8 @@ case.
 ## License
 
 MIT.
+
+`tools/golden_gen` fetches and links Nuked-OPN2, which is **LGPL 2.1**. It is
+a development tool, built only behind `YM2612_EG_BUILD_GOLDEN_GEN`, and no part
+of it is distributed with the library or linked into the test suite --
+`golden/*.json` is data recorded through it.

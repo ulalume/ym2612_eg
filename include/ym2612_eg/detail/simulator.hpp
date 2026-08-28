@@ -221,6 +221,11 @@ public:
     }
     if (att_ >= kMaxAttenuation)
       return true;
+    // envelope_off_step() still owes this attenuation its snap to 0x3FF, which
+    // lands on the next output sample even if the phase rate is 0 (reachable
+    // by writing SR = 0 mid-decay).
+    if (!ssg_enable_ && (att_ & 0x3F0) == 0x3F0)
+      return false;
     // A Decay that already satisfies the sustain test moves to Sustain on the
     // next tick, so judge it by the sustain rate.
     int idx = static_cast<int>(phase_);
