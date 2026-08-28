@@ -37,10 +37,11 @@ and the benchmark.
 
 ### Options
 
-| Variable                | Default | Description                     |
-| ----------------------- | ------- | ------------------------------- |
-| `YM2612_EG_BUILD_TESTS` | `OFF`   | Build the CTest suite           |
-| `YM2612_EG_BUILD_BENCH` | `OFF`   | Build the `sample_curve` timing |
+| Variable                     | Default | Description                                       |
+| ---------------------------- | ------- | ------------------------------------------------- |
+| `YM2612_EG_BUILD_TESTS`      | `OFF`   | Build the CTest suite                             |
+| `YM2612_EG_BUILD_BENCH`      | `OFF`   | Build the `sample_curve` timing                   |
+| `YM2612_EG_BUILD_GOLDEN_GEN` | `OFF`   | Build the Nuked-OPN2 golden-vector generator      |
 
 ```sh
 cmake -B build -DCMAKE_BUILD_TYPE=Release -DYM2612_EG_BUILD_TESTS=ON
@@ -135,6 +136,55 @@ SR, all eight SSG shapes, the key-off latch and hard cut, and the decimation
 error bound. The base envelope is additionally cross-checked tick-by-tick
 against a second, independently written EG-tick-driven model over 120
 randomised patches.
+
+On top of that, `golden/*.json` holds 96 scenarios recorded from
+**Nuked-OPN2** at the register level and replayed here sample for sample.
+
+## Golden vectors
+
+`golden/*.json` is ground truth taken from Nuked-OPN2 (`ym3438.c`,
+gate-level): eight scenario files covering the AR sweep, the DR x SL grid,
+the SR/RR sweeps and key-off from every phase, KS across three octaves, all
+eight SSG-EG shapes, retriggering, the edge anchors, and the rate >= 48
+regime. Each case records Nuked's `eg_level`, `eg_state` and `eg_out` as
+change lists, plus the EG-counter phase needed to line the two models up.
+
+`test/golden_test.cpp` replays each case on `EgSimulator` and requires
+
+- `attenuation()` to equal `eg_level` at **every output sample**,
+- `output()` to equal `eg_out` at every sample (allowing for Nuked's
+  one-sample `eg_out` pipeline lag),
+- `phase()` to equal `eg_state` at every EG tick -- Nuked advances one state
+  per output sample, this library takes the whole transition chain at the top
+  of a tick, and the two agree at every tick.
+
+There is no tolerance anywhere. The handful of places where the two models
+genuinely differ -- Nuked's `eg_timer_low_lock` rotating the increment row at
+rates >= 48, `SL = 0` together with the instant attack, and Nuked's 16-wide
+`Decay -> Sustain` equality window under SSG-EG's 4x steps -- are each written
+down as a rule in `test/golden_common.hpp` that the generator and the test
+evaluate independently, and explained in
+[`golden/DISCREPANCIES.md`](golden/DISCREPANCIES.md). A vector cannot ship a
+hand-fitted alignment: the test re-derives it and fails if the file disagrees.
+
+### Regenerating
+
+Nuked-OPN2 is **LGPL 2.1** and this library is MIT, so it is fetched and
+linked by `tools/golden_gen` and nowhere else -- never by the library, never
+by the CTest suite. What the tests consume is the committed JSON, which is
+data.
+
+```sh
+cmake -B build-gen -DCMAKE_BUILD_TYPE=Release -DYM2612_EG_BUILD_GOLDEN_GEN=ON
+cmake --build build-gen --target golden      # rewrites golden/*.json in place
+```
+
+The generator pins a Nuked commit (`tools/golden_gen/CMakeLists.txt`, mirrored
+in `test/golden_common.hpp`), replays every case on `EgSimulator` before
+writing it, and exits non-zero on the first mismatch -- so a committed vector
+is always one that reproduced at generation time. Adding or removing a
+scenario file needs a `cmake` re-run, since each one becomes its own CTest
+case.
 
 ## License
 
