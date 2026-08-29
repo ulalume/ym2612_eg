@@ -451,6 +451,25 @@ void test_a_sample_rate_oscillation_stays_bounded() {
   CHECK(highest - lowest > 256);
 }
 
+// A held patch with SR = 0 parks at its sustain level -- but the Decay ->
+// Sustain transition must be reported before it does, or a caller loses the
+// decay's end and with it the boundary between two phases.
+void test_parking_at_the_sustain_level_still_reports_the_decay() {
+  CurveRequest req;
+  req.op = OperatorParams{31, 10, 0, 7, 4, 0, 0, 0}; // SR = 0 -> holds at SL
+  req.pitch = kC4;
+  req.gate_ms = -1.0;
+  req.max_ms = 5000.0;
+  const CurveResult r = sample_curve(req);
+
+  CHECK(has_marker(r, MarkerKind::DecayEnd));
+  CHECK(has_marker(r, MarkerKind::Park));
+  CHECK(marker_ms(r, MarkerKind::DecayEnd) <= marker_ms(r, MarkerKind::Park));
+  CHECK(std::isfinite(r.park_ms));
+  // The park still follows the decay by a tick, not by a phase.
+  CHECK_ABS(r.park_ms, marker_ms(r, MarkerKind::DecayEnd), 1.0);
+}
+
 } // namespace
 
 int main() {
@@ -458,6 +477,7 @@ int main() {
   RUN_TEST(test_points_and_marker_ordering);
   RUN_TEST(test_park_then_key_off_keeps_release);
   RUN_TEST(test_park_when_held_forever);
+  RUN_TEST(test_parking_at_the_sustain_level_still_reports_the_decay);
   RUN_TEST(test_never_parks_within_max_ms);
   RUN_TEST(test_ssg_loop_detection);
   RUN_TEST(test_ssg_alternate_counts_two_ramps);

@@ -215,12 +215,13 @@ public:
     // the phase rate is 0 (reachable by writing SR = 0 mid-decay).
     if (!ssg_enable_ && (att_ & 0x3F0) == 0x3F0)
       return false;
-    // A Decay that already satisfies the sustain test moves to Sustain on the
-    // next tick, so judge it by the sustain rate.
-    int idx = static_cast<int>(phase_);
+    // A Decay that already satisfies the sustain test still has that
+    // transition ahead of it, and the phase changing is itself a change --
+    // reporting rest here ends a caller's run one tick early and swallows the
+    // Decay -> Sustain event.
     if (phase_ == EgPhase::Decay && att_ >= sustain_att_)
-      idx = static_cast<int>(EgPhase::Sustain);
-    return rate_[idx] == 0;
+      return false;
+    return rate_[static_cast<int>(phase_)] == 0;
   }
 
   double time_ms() const {
