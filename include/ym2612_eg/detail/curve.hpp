@@ -69,14 +69,67 @@ inline constexpr double kDecimationEpsilon = 0.9;
 // A pathological patch (SSG alternate with AR < 31 toggles every sample) can
 // raise an event on every single sample; cap what we record.
 inline constexpr size_t kMaxMarkers = 4096;
+/// Vertex ceiling. An envelope that oscillates at the sample rate -- an SSG-EG
+/// alternate mode with AR < 31 -- has a genuine value on every sample, so
+/// decimation cannot thin it and a ten-second span would carry half a million
+/// vertices. Past this many, the curve is reduced to one bucket per slot
+/// keeping that slot's extremes, which draws the oscillation as a band.
+inline constexpr size_t kMaxPoints = 4096;
+
+/// Reduce an already-decimated curve to at most kMaxPoints vertices, keeping
+/// the loudest and quietest value of each time slot so the envelope's extent
+/// survives even when its individual cycles cannot.
+inline std::vector<CurvePoint> reduce(const std::vector<CurvePoint> &pts) {
+  if (pts.size() <= kMaxPoints)
+    return pts;
+  const double t0 = pts.front().ms;
+  const double span = static_cast<double>(pts.back().ms) - t0;
+  const size_t slots = kMaxPoints / 2;
+  std::vector<CurvePoint> out;
+  out.reserve(kMaxPoints + 2);
+  size_t i = 0;
+  for (size_t slot = 0; slot < slots && i < pts.size(); ++slot) {
+    const double end =
+        span > 0.0 ? t0 + span * static_cast<double>(slot + 1) / slots
+                   : std::numeric_limits<double>::infinity();
+    size_t low = i, high = i;
+    size_t n = 0;
+    while (i < pts.size() &&
+           (static_cast<double>(pts[i].ms) <= end || n == 0)) {
+      if (pts[i].out < pts[low].out)
+        low = i;
+      if (pts[i].out > pts[high].out)
+        high = i;
+      ++i;
+      ++n;
+    }
+    if (low == high) {
+      out.push_back(pts[low]);
+      continue;
+    }
+    out.push_back(pts[low < high ? low : high]);
+    out.push_back(pts[low < high ? high : low]);
+  }
+  if (!out.empty() && out.back().ms != pts.back().ms)
+    out.push_back(pts.back());
+  return out;
+}
 
 // Ramer-Douglas-Peucker over one span, iterative so a 100k-point ramp cannot
 // blow the stack.  Vertical distance, worst of the two channels.
 inline void rdp_span(const std::vector<CurvePoint> &pts, size_t lo, size_t hi,
-                     double eps, std::vector<uint8_t> &keep) {
+                     double eps, std::vector<uint8_t> &keep, uint64_t &budget) {
   std::vector<std::pair<size_t, size_t>> stack;
   stack.emplace_back(lo, hi);
   while (!stack.empty()) {
+    if (budget == 0) {
+      // Out of budget: keep everything still under consideration rather than
+      // flattening it. Refining costs time; not refining costs vertices.
+      for (const std::pair<size_t, size_t> &rest : stack)
+        for (size_t i = rest.first; i <= rest.second && i < keep.size(); ++i)
+          keep[i] = 1;
+      return;
+    }
     const std::pair<size_t, size_t> span = stack.back();
     stack.pop_back();
     const size_t a = span.first;
@@ -87,6 +140,7 @@ inline void rdp_span(const std::vector<CurvePoint> &pts, size_t lo, size_t hi,
     const double dt = static_cast<double>(pts[b].ms) - t0;
     double worst = -1.0;
     size_t worst_i = a;
+    budget -= (budget < b - a) ? budget : (b - a);
     for (size_t i = a + 1; i < b; ++i) {
       const double u = dt > 0.0 ? (static_cast<double>(pts[i].ms) - t0) / dt : 0.0;
       const double po =
@@ -108,6 +162,10 @@ inline void rdp_span(const std::vector<CurvePoint> &pts, size_t lo, size_t hi,
   }
 }
 
+/// Enough refinement for any curve a screen can show; a sample-rate
+/// oscillation would otherwise make this quadratic.
+inline constexpr uint64_t kDecimationBudget = 400000;
+
 inline std::vector<CurvePoint> decimate(const std::vector<CurvePoint> &raw,
                                         std::vector<uint8_t> locked,
                                         double eps) {
@@ -118,11 +176,12 @@ inline std::vector<CurvePoint> decimate(const std::vector<CurvePoint> &raw,
   locked.back() = 1;
 
   std::vector<uint8_t> keep = locked;
+  uint64_t budget = kDecimationBudget;
   size_t anchor = 0;
   for (size_t i = 1; i < raw.size(); ++i) {
     if (!locked[i])
       continue;
-    rdp_span(raw, anchor, i, eps, keep);
+    rdp_span(raw, anchor, i, eps, keep, budget);
     anchor = i;
   }
 
@@ -169,9 +228,7 @@ inline CurveResult sample_curve(const CurveRequest &request) {
   raw.reserve(1024);
   locked.reserve(1024);
 
-  auto push_point = [&](double ms, bool force) {
-    const uint16_t o = sim.output();
-    const uint16_t a = sim.attenuation();
+  auto emit = [&](double ms, uint16_t o, uint16_t a, bool force) {
     const float fms = static_cast<float>(ms);
     if (!raw.empty() && raw.back().out == o && raw.back().att == a) {
       if (!force)
@@ -183,6 +240,10 @@ inline CurveResult sample_curve(const CurveRequest &request) {
     }
     raw.push_back(CurvePoint{fms, o, a});
     locked.push_back(force ? uint8_t{1} : uint8_t{0});
+  };
+
+  auto push_point = [&](double ms, bool force) {
+    emit(ms, sim.output(), sim.attenuation(), force);
   };
 
   auto add_marker = [&](double ms, MarkerKind kind) {
@@ -311,8 +372,8 @@ inline CurveResult sample_curve(const CurveRequest &request) {
   std::stable_sort(res.markers.begin(), res.markers.end(),
                    [](const Marker &a, const Marker &b) { return a.ms < b.ms; });
 
-  res.points = detail::decimate(raw, std::move(locked),
-                                detail::kDecimationEpsilon);
+  res.points = detail::reduce(
+      detail::decimate(raw, std::move(locked), detail::kDecimationEpsilon));
   return res;
 }
 

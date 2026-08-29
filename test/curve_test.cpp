@@ -426,6 +426,31 @@ void test_park_then_key_off_keeps_release() {
   CHECK(r.points.back().att == kMaxAttenuation);
 }
 
+// An SSG-EG alternate mode with AR < 31 inverts on every sample, so the output
+// genuinely has a value per sample and decimation cannot thin it. The vertex
+// count must still be bounded, and the extremes must survive so the band is
+// visible.
+void test_a_sample_rate_oscillation_stays_bounded() {
+  CurveRequest req;
+  req.op = OperatorParams{0, 3, 0, 7, 4, 0, 3, 0x0E}; // AR=0, SSG type 6
+  req.pitch = kC4;
+  req.gate_ms = -1.0;
+  req.max_ms = 12000.0;
+  const CurveResult r = sample_curve(req);
+
+  CHECK(r.points.size() <= detail::kMaxPoints + 2);
+  CHECK(r.points.size() > 16);
+
+  // Both rails of the oscillation are still represented.
+  uint16_t lowest = kMaxAttenuation;
+  uint16_t highest = 0;
+  for (const CurvePoint &p : r.points) {
+    lowest = p.out < lowest ? p.out : lowest;
+    highest = p.out > highest ? p.out : highest;
+  }
+  CHECK(highest - lowest > 256);
+}
+
 } // namespace
 
 int main() {
@@ -443,5 +468,6 @@ int main() {
   RUN_TEST(test_decimation_fidelity);
   RUN_TEST(test_marker_points_are_kept);
   RUN_TEST(test_clock_selection);
+  RUN_TEST(test_a_sample_rate_oscillation_stays_bounded);
   return testing::summary();
 }
