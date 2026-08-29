@@ -110,6 +110,7 @@ public:
     keyed_on_ = true;
     ssg_invert_ = false; // inversion flag cleared on key-on
     ssg_held_ = false;
+    ssg_in_fold_ = false;
     phase_ = EgPhase::Attack;
     // Attenuation is NOT reset; attack resumes from the current level,
     // except the instant-attack case.
@@ -160,6 +161,7 @@ public:
     keyed_on_ = false;
     ssg_invert_ = false;
     ssg_held_ = false;
+    ssg_in_fold_ = false;
     eg_divider_ = 0;
     samples_ = 0;
     events_ = 0;
@@ -258,8 +260,15 @@ private:
   // Runs once per output sample, gated on A >= 0x200.  Step 1 must precede
   // step 4; the rest are order-independent.
   void ssg_step() {
-    if (att_ < kSsgFoldAttenuation)
+    if (att_ < kSsgFoldAttenuation) {
+      ssg_in_fold_ = false;
       return;
+    }
+    // The block below runs on every sample the envelope spends at or above
+    // 0x200, which with AR < 31 is every sample of a whole attack. The events
+    // report the moment it arrives, not each sample it stays.
+    const bool entering = !ssg_in_fold_;
+    ssg_in_fold_ = true;
 
     // 1. alternate -> toggle inversion; alternate+hold -> force it set.
     if (ssg_alternate_) {
@@ -271,7 +280,7 @@ private:
 
     // 2. neither alternate nor hold -> the phase generator is forced to 0.
     //    We do not model the PG; the moment is reported so the UI can mark it.
-    if (!ssg_alternate_ && !ssg_hold_)
+    if (!ssg_alternate_ && !ssg_hold_ && entering)
       events_ |= detail::kEvSsgPhaseReset;
 
     // 3. keyed on and hold clear -> virtual key-on (this is the 0x200 -> 0 snap).
@@ -279,7 +288,8 @@ private:
       phase_ = EgPhase::Attack;
       if (rate_[0] >= 62)
         att_ = 0;
-      events_ |= detail::kEvSsgFold;
+      if (entering)
+        events_ |= detail::kEvSsgFold;
     }
 
     // 4. hold set -> the mode latches here, once.  When the output is *not*
@@ -381,6 +391,7 @@ private:
   bool keyed_on_ = false;
   bool ssg_invert_ = false;
   bool ssg_held_ = false;
+  bool ssg_in_fold_ = false;
   uint64_t samples_ = 0;
   uint32_t events_ = 0;
 };

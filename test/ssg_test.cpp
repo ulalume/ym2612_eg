@@ -414,6 +414,50 @@ void test_sl_below_15_always_under_fold() {
   CHECK(sim.sustain_attenuation() > kSsgFoldAttenuation);
 }
 
+// With AR < 31 the SSG block runs on every sample of a whole attack, because
+// the attack cannot pull the level below 0x200 in one go. The fold is the
+// arrival, not each sample spent there, so the reported loop period is the
+// envelope's cycle rather than one sample.
+void test_fold_is_reported_once_per_cycle() {
+  CurveRequest req;
+  req.op = OperatorParams{14, 18, 14, 0, 9, 0, 0, 0x0C}; // AR=14, SSG type 4
+  req.pitch = NotePitch::from_midi(60);
+  req.gate_ms = -1.0;
+  req.max_ms = 2000.0;
+  const CurveResult r = sample_curve(req);
+
+  size_t folds = 0;
+  for (const Marker &m : r.markers)
+    if (m.kind == MarkerKind::SsgFold)
+      ++folds;
+  CHECK(folds >= 2);
+  // A per-sample fold would report the sample rate itself (~53 kHz).
+  CHECK(r.loop_hz > 1.0);
+  CHECK(r.loop_hz < 100.0);
+
+  // Cross-check against the cycle an independent run measures.
+  EgSimulator eg(req.op, req.pitch);
+  eg.key_on();
+  int crossings = 0;
+  double first = -1.0, last = -1.0;
+  bool below = true;
+  for (int i = 0; i < 53267 * 2; ++i) {
+    eg.step();
+    const bool now = eg.attenuation() < 0x200;
+    if (below && !now) {
+      ++crossings;
+      if (first < 0.0)
+        first = eg.time_ms();
+      else
+        last = eg.time_ms();
+    }
+    below = now;
+  }
+  CHECK(crossings > 2);
+  const double measured = (last - first) / (crossings - 1);
+  CHECK_REL(1000.0 / r.loop_hz, measured, 0.15);
+}
+
 } // namespace
 
 int main() {
@@ -435,5 +479,6 @@ int main() {
   RUN_TEST(test_key_off_is_edge_triggered);
   RUN_TEST(test_sl15_leaves_dr_in_charge);
   RUN_TEST(test_sl_below_15_always_under_fold);
+  RUN_TEST(test_fold_is_reported_once_per_cycle);
   return testing::summary();
 }
