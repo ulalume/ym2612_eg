@@ -83,6 +83,26 @@ inline uint8_t NotePitch::keycode() const {
   return static_cast<uint8_t>(((block & 7u) << 2) | (f11 << 1) | lsb);
 }
 
+// The key scale value, `keycode >> (3 - KS)`: the ONLY route a note takes into
+// an envelope, and so the whole of what a pitch is worth to a caller that
+// caches curves.  Two notes that share it have bit-identical envelopes.
+inline int key_scale_value(const OperatorParams &op, NotePitch pitch) {
+  return pitch.keycode() >> (3 - (op.ks & 3));
+}
+
+// The internal attenuation at which this operator is at its LOUDEST, i.e. the
+// level a key-on starts a release from.
+//
+// Normally 0, the top of the scale.  With SSG-EG enabled and the attack bit
+// set (types 4-7) output() inverts, `(0x200 - A) & 0x3FF`, so the scale runs
+// the other way: 0 is the quietest point the ramp reaches and 0x200 is full
+// volume.  On key-on the inversion flag is clear, so the attack bit alone
+// decides.
+inline uint16_t loudest_attenuation(const OperatorParams &op) {
+  const bool inverted = (op.ssg & 0x08) != 0 && (op.ssg & 0x04) != 0;
+  return inverted ? kSsgFoldAttenuation : uint16_t{0};
+}
+
 class EgSimulator {
 public:
   EgSimulator(const OperatorParams &params, NotePitch pitch,
@@ -240,13 +260,14 @@ private:
   uint32_t step_events() const { return events_; }
 
   void recompute() {
-    ksv_ = pitch_.keycode() >> (3 - (params_.ks & 3));
+    // Qualified: the member below shadows the free function's name.
+    ksv_ = ym2612_eg::key_scale_value(params_, pitch_);
     rate_[0] = detail::effective_rate(params_.ar & 0x1F, ksv_);
     rate_[1] = detail::effective_rate(params_.dr & 0x1F, ksv_);
     rate_[2] = detail::effective_rate(params_.sr & 0x1F, ksv_);
     // Release register is 4-bit: R = 2*RR + 1, so it can never be 0.
     rate_[3] = detail::effective_rate(2 * (params_.rr & 0x0F) + 1, ksv_);
-    sustain_att_ = detail::sustain_attenuation(params_.sl);
+    sustain_att_ = ym2612_eg::sustain_attenuation(params_.sl);
     ssg_enable_ = (params_.ssg & 0x08) != 0;
     ssg_attack_ = (params_.ssg & 0x04) != 0;
     ssg_alternate_ = (params_.ssg & 0x02) != 0;

@@ -91,12 +91,6 @@ inline constexpr int effective_rate(int raw_r, int ksv) {
   return r > 63 ? 63 : r;
 }
 
-// SL=15 becomes 0x3E0 (992), not 480.
-inline constexpr int sustain_attenuation(int sl) {
-  const int sl4 = sl & 0x0F;
-  return (sl4 | ((sl4 + 1) & 0x10)) << 5;
-}
-
 // Increment for this rate at this 12-bit counter value.
 inline constexpr int increment_at(int rate, int counter) {
   const int shift = rate_shift(rate);

@@ -14,6 +14,7 @@ modelled at the chip's own sample rate.
 | Attack | `att += (~att * inc) >> 4`, instant at rate >= 62, frozen at rates 0/1 and 62/63 |
 | Decay / sustain / release | 64x8 increment table, `SL = 15 -> 0x3E0`, transitions at the top of the tick so `SL = 0` skips decay |
 | SSG-EG | Per-sample state machine: 4x increments, freeze at `0x200`, output inversion, virtual key-on, key-off latch and hard cut, all 8 shapes |
+| Durations | Closed-form phase lengths and SSG loop period, `infinity` where a rate never advances |
 | Output | `min((J ? 0x200 - A : A) + TL * 8, 0x3FF)` |
 
 LFO AM, the phase generator and algorithm routing are out of scope; draw them
@@ -45,6 +46,46 @@ for (CurveWarning w : curve.warnings)
 within one attenuation unit of the full trace. Sampling stops once nothing
 more can happen (`park_ms`) or after five SSG loop periods (`loop_hz`).
 
+## How long does it take?
+
+A caller sizing a time axis needs the durations *before* it knows how far to
+simulate, and "how far did you look?" is a place for an answer to change
+discontinuously: a rate of 0 really does hold forever, and a run that gave up
+cannot tell `SR = 0` from `SR = 31`. So the durations are closed forms, and
+`infinity` means the phase never advances.
+
+```cpp
+const PhaseDurations d = phase_durations(req.op, req.pitch);
+d.attack_ms; d.decay_ms; d.sustain_ms;   // sustain level -> silence
+d.sustain_start_ms();                    // attack + decay
+d.lifetime_ms();                         // key-on -> silence
+
+ssg_loop_period_ms(req.op, req.pitch);   // 0 = the mode does not loop
+                                         // inf = a rate the ramp needs stalls
+```
+
+Both take an optional `clock_hz`. The post-attack phases are linear in
+attenuation, so each is one division; the attack recurrence and the SSG ramp
+are walked instead, a few hundred table slots rather than the hundreds of
+thousands of samples the same stretch costs to simulate. `test/timing_test.cpp`
+cross-checks both against `sample_curve()` over a few thousand patches: the
+decay end and the lifetime land within 2%, an SSG loop period within 3.2%
+(0.7% at `AR = 31`). The one weak corner is `SL = 15`, whose sustain phase is
+sixteen attenuation units wide -- a single increment of the decay's overshoot
+is then a large fraction of it.
+
+Three register-derived values come with them, because a caller cannot ask the
+questions above without them:
+
+```cpp
+key_scale_value(op, pitch);   // keycode >> (3 - KS): the only route a note
+                              // takes into an envelope, so two notes sharing
+                              // it have bit-identical curves
+loudest_attenuation(op);      // 0, or 0x200 for the inverted SSG-EG modes:
+                              // where a release starts from
+sustain_attenuation(sl);      // SL -> attenuation; SL = 15 is 0x3E0
+```
+
 To drive one operator directly:
 
 ```cpp
@@ -71,7 +112,7 @@ takes raw register values.
 include(FetchContent)
 FetchContent_Declare(ym2612_eg
   GIT_REPOSITORY https://github.com/ulalume/ym2612_eg.git
-  GIT_TAG v0.1.0)
+  GIT_TAG v0.2.0)
 FetchContent_MakeAvailable(ym2612_eg)
 target_link_libraries(your_target PRIVATE ym2612_eg)
 ```

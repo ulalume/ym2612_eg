@@ -23,6 +23,13 @@ inline constexpr uint16_t kSsgFoldAttenuation = 0x200;
 // Any output attenuation at or above this multiplies to exactly 0 in hardware.
 inline constexpr uint16_t kSilenceAttenuation = 0x340;
 
+// The attenuation SL names, i.e. where the decay stops and the sustain
+// begins.  SL = 15 becomes 0x3E0 (992), not 480.
+inline constexpr int sustain_attenuation(int sl) {
+  const int sl4 = sl & 0x0F;
+  return (sl4 | ((sl4 + 1) & 0x10)) << 5;
+}
+
 inline constexpr double sample_rate_hz(double clock_hz) {
   return clock_hz / kSampleDivider;
 }
