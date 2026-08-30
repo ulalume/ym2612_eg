@@ -40,31 +40,6 @@ mismatches.
 
 ---
 
-## Fixed in the library
-
-### 1. The "envelope off" snap fired one sample early
-
-`(att & 0x3F0) == 0x3F0 → att = 0x3FF, state = Release` (EG_SPEC 6, Nuked only)
-used to run at the bottom of the EG tick, so it fired on the same tick that
-pushed `att` into `[0x3F0, 0x3FF]`. Nuked evaluates it in
-`OPN2_EnvelopeADSR`, which runs **once per output sample** on the level the
-previous tick left behind, so the snap lands on the *next* sample and the
-intermediate value is visible for exactly one sample.
-
-Moved into `EgSimulator::envelope_off_step()`, which runs per sample. Every
-decay/sustain/release tail in the vectors now matches exactly.
-
-### 2. SSG-EG hold-to-silence left the phase alone
-
-Modes 1 (`$09`) and 7 (`$0F`) jump to `0x3FF` at the `0x200` latch, and a keyed
--off SSG operator hard-cuts to `0x3FF`. Both go through the *same* Nuked branch
-as the snap above, which also sets `nextstate = eg_num_release`. The library
-set the level but not the phase. Fixed; the inverted-hold modes 3 (`$0B`) and
-5 (`$0D`) correctly still leave both alone, because Nuked's `hold_up_latch`
-suppresses that branch for them.
-
----
-
 ## Documented model differences
 
 ### 3. Rates ≥ 48: `eg_timer_low_lock` rotates the increment row by one tick

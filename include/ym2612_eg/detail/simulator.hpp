@@ -390,8 +390,6 @@ private:
     }
     if (att_ > kMaxAttenuation)
       att_ = kMaxAttenuation;
-    // The "envelope off" snap that used to live here now runs once per output
-    // sample in envelope_off_step(); see the comment there.
   }
 
   OperatorParams params_{};
