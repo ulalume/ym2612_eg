@@ -86,7 +86,7 @@ takes raw register values.
 include(FetchContent)
 FetchContent_Declare(ym2612_eg
   GIT_REPOSITORY https://github.com/ulalume/ym2612_eg.git
-  GIT_TAG v0.2.0)
+  GIT_TAG v0.2.2)
 FetchContent_MakeAvailable(ym2612_eg)
 target_link_libraries(your_target PRIVATE ym2612_eg)
 ```
@@ -94,11 +94,11 @@ target_link_libraries(your_target PRIVATE ym2612_eg)
 Or add `include/` to your include path. `cmake` is only needed for the tests,
 the benchmark and the golden-vector generator:
 
-| Variable | Default | Builds |
-| -------- | ------- | ------ |
-| `YM2612_EG_BUILD_TESTS` | `OFF` | the CTest suite |
-| `YM2612_EG_BUILD_BENCH` | `OFF` | the `sample_curve` timing |
-| `YM2612_EG_BUILD_GOLDEN_GEN` | `OFF` | the Nuked-OPN2 golden-vector generator |
+| Variable                     | Default | Builds                                 |
+| ---------------------------- | ------- | -------------------------------------- |
+| `YM2612_EG_BUILD_TESTS`      | `OFF`   | the CTest suite                        |
+| `YM2612_EG_BUILD_BENCH`      | `OFF`   | the `sample_curve` timing              |
+| `YM2612_EG_BUILD_GOLDEN_GEN` | `OFF`   | the Nuked-OPN2 golden-vector generator |
 
 ```sh
 cmake -B build -DCMAKE_BUILD_TYPE=Release -DYM2612_EG_BUILD_TESTS=ON
