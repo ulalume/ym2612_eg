@@ -300,6 +300,7 @@ void test_output_inversion_math() {
   EgSimulator sim(op, kRks0);
   sim.key_on();
   CHECK(sim.ssg_inverted());
+  sim.step(); // the key state reaches the envelope one sample later
   for (int i = 0; i < 4000; ++i) {
     const uint16_t a = sim.attenuation();
     CHECK_EQ(sim.output(), static_cast<uint16_t>((0x200 - a) & 0x3FF));
@@ -321,22 +322,37 @@ void test_output_inversion_math() {
 void test_key_off_latches_inverted_level() {
   EgSimulator sim(ssg_patch(15, 0, 15, 0x0A), kRks0); // mode 2
   sim.key_on();
-  ssg_fold_samples(sim, 1, 200000);
-  sim.step(); // now inverted
-  CHECK(sim.ssg_inverted());
-  while (sim.attenuation() < 128)
+  uint64_t n = 0;
+  while (!sim.ssg_inverted() && n < 200000) { // past the first fold
     sim.step();
+    ++n;
+  }
+  CHECK(sim.ssg_inverted());
+  while (sim.attenuation() < 128) {
+    sim.step();
+    ++n;
+  }
+  // Keep the key-off sample and the one after it clear of an EG tick, so no
+  // release increment lands on top of the level the latch leaves.
+  while (n % kEgClockDivider != 1) {
+    sim.step();
+    ++n;
+  }
   const uint16_t internal = sim.attenuation();
   const uint16_t audible = sim.output();
   CHECK_EQ(audible, static_cast<uint16_t>((0x200 - internal) & 0x3FF));
 
   sim.key_off();
   CHECK(!sim.keyed_on());
-  CHECK(!sim.ssg_inverted());
+  // The latch lands on the key-off sample; the flag is masked out on the next.
+  sim.step();
   CHECK(sim.phase() == EgPhase::Release);
   // Release continues from the level that was audible, not the internal one.
   CHECK_EQ(sim.attenuation(), audible);
   CHECK_EQ(sim.output(), audible);
+  sim.step();
+  CHECK(!sim.ssg_inverted());
+  CHECK_EQ(sim.attenuation(), audible);
 }
 
 void test_release_hard_cut_at_0x200() {

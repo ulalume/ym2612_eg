@@ -2,12 +2,12 @@
 
 The vectors in this directory were recorded from **Nuked-OPN2 `ym3438.c`
 @ `335747d78cb0abbc3b55b004e62dad9763140115`** by `tools/golden_gen`, and are
-replayed against `EgSimulator` by `test/golden_test.cpp`. Over the 110
+replayed against `EgSimulator` by `test/golden_test.cpp`. Over the 114
 committed cases the two agree **sample for sample** on `eg_level`, and on
 `eg_state` at every EG tick.
 
-Getting there turned up eight places where the two models are not trivially
-comparable. Two were bugs in this library and are fixed. Six are genuine
+Getting there turned up six places where the two models are not trivially
+comparable. Two were bugs in this library and are fixed. Four are genuine
 model differences; each one is encoded as a *rule* in `test/golden_common.hpp`
 that both the generator and the test evaluate independently, so no vector can
 quietly paper over one.
@@ -155,79 +155,6 @@ The only thing that can flip the inversion mid-trace is the alternate bit
 or alternate is clear — which still covers TL, the 0x3FF clamp, and the
 permanent inversion of modes 4 and 5. The alternating modes are covered on
 `eg_level` and `eg_state` as usual.
-
-### 7. SSG-EG alternate loses a toggle at key-on in Nuked, and never regains it
-
-`OPN2_EnvelopeSSGEG` masks the direction it has just computed with the key
-state as it stood *before* the key-on: `direction &= chip->eg_kon[slot]`, and
-`eg_kon` is only assigned at the end of `OPN2_EnvelopeADSR`, two cycles later.
-So on the first keyed-on sample Nuked's inversion flag is forced clear even
-though the level is in the fold region. This library toggles on that sample.
-
-With an instant attack the level is already 0 there, neither model is in the
-fold, and the flags stay together — which is why the 28 AR = 31 SSG cases in
-`ssg_modes.json`, `retrigger.json`, `edge_anchors.json` and `high_rate.json`
-all match. Below rate 62 the level is still 0x3FF on that sample and the two
-flags separate by one toggle.
-
-For the modes that only *force* the flag (hold set, `$0B` / `$0F`) the next
-sample pulls them back together. For the two that **alternate** it is
-permanent: `$0A` and `$0E`, alternate set and hold clear. While the ramp sits
-at or above 0x200 both flags flip every sample, so this is just the phase of a
-sample-rate square and `output()` still matches Nuked's `eg_out` under its
-one-sample lag. The moment the ramp leaves the fold both flags freeze — on
-opposite values, for the rest of the note.
-
-Measured with `AR=10 DR=10 SR=6 RR=5 SL=7 TL=0 KS=0`, C4, `SSG=$0A`, key-on
-effective at sample 7:
-
-| sample | 7 | 8 | … | 106109 | 106110 | 106111 | … | 113995 |
-|---|---|---|---|---|---|---|---|---|
-| `eg_level` (both) | 1023 | 1023 | | 512 | 479 | 479 | | 58 |
-| our inversion | 1 | 0 | | 1 | **0** | 0 | | **0** |
-| Nuked `eg_ssg_inv` | 0 | 1 | | 0 | 1 | **1** | | **1** |
-| our `output()` | 513 | 1023 | | 0 | **479** | 479 | | **58** |
-| Nuked `eg_out` (lag removed) | 513 | 1023 | | 0 | **33** | 33 | | **454** |
-
-479 against 33 is 42 dB, and it lasts to the end of the note: after the fold
-the virtual key-on restarts the ramp, and this library carries its attenuation
-down from 479 to 58 while Nuked carries it up from 33 to 454.
-
-`eg_level` itself is untouched — the flag reaches it only through the key-off
-latch below — and `output_comparable()` already keeps `out` out of the
-alternating modes' comparison. So a `$0A` / `$0E` case with an attack below
-rate 62 is still compared on `eg_level` and `eg_state`, for as long as it is
-never keyed off — `has_ssg_alternate_keyon_parity_divergence()` rejects the
-key-off, and the `$0A` and `$0E` cases in `ssg_slow_attack.json` end while
-still keyed on.
-
-### 8. Nuked defers the SSG-EG key-off cut to silence
-
-`key_off()` latches the audible (inverted) level in place of the internal one
-and, when SSG-EG leaves that at or above 0x200, cuts straight to 0x3FF on the
-key-off sample. Nuked reaches 0x3FF through the same "envelope off" branch as a
-plain slot, and that branch is gated on `chip->eg_state[slot]` — the state
-*before* the update — not being Attack. A key-off taken from the fold region is
-therefore held for one sample with hold set, and two without, because with hold
-clear `eg_ssg_repeat_latch` re-asserts `kon_event` on the key-off sample and
-pins the state in Attack for it. Nuked emits the latched level meanwhile.
-
-`AR=3 DR=10 SR=6 RR=5 SL=7 TL=0 KS=0`, C4, key-off effective at sample 20002
-with the level at 648:
-
-| sample | 20002 | 20003 | 20004 |
-|---|---|---|---|
-| ours, any mode | 1023 | 1023 | 1023 |
-| Nuked `SSG=$08` (hold clear) | 648 | 648 | 1023 |
-| Nuked `SSG=$09` (hold set) | 648 | 1023 | 1023 |
-
-The inverting modes latch `0x200 - A` first: `AR=0 SSG=$0C`, C4, level pinned
-at 1023, key-off effective at 8002 gives Nuked 513 at 8002 and 8003 and 1023
-at 8004, against 1023 throughout here.
-
-The two coincide when the latched level is already 0x3FF, which is where the
-hold modes park; `has_ssg_keyoff_cut_divergence()` keeps every other key-off
-taken from the fold region out of a vector.
 
 ---
 

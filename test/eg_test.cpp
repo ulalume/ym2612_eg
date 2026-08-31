@@ -465,6 +465,7 @@ void test_attack_freeze_rate_zero() {
   sim.key_on();
   CHECK_EQ(sim.rate_of(EgPhase::Attack), 0);
   CHECK_EQ(sim.attenuation(), 0x3FF);
+  sim.step(); // the key state reaches the envelope one sample later
   CHECK(sim.is_static());
   sim.step(3 * 100000);
   CHECK_EQ(sim.attenuation(), 0x3FF);

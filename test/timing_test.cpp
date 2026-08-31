@@ -112,6 +112,7 @@ void test_the_loudest_attenuation_follows_the_inversion() {
     EgSimulator sim(released, note(kReferenceMidiNote));
     sim.reset(0, want);
     sim.key_on();
+    sim.step(); // the key state reaches the envelope one sample later
     CHECK_EQ(sim.output(), 0); // full volume, whichever end of the scale
   }
   // The shape bits are inert while the enable bit is down.

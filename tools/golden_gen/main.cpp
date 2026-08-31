@@ -247,26 +247,10 @@ Verdict verify(const Case &c, const Trace &t, bool *out_differs) {
   const bool check_out = output_comparable(c.op);
   for (int i = 0; i < c.samples; ++i) {
     while (g < t.gate.size() && t.gate[g].sample == i) {
-      if (t.gate[g].on) {
+      if (t.gate[g].on)
         eg.key_on();
-      } else {
-        const char *bad = nullptr;
-        if (has_ssg_alternate_keyon_parity_divergence(c.op, eg))
-          bad = "SSG-EG alternate without hold under an attack below rate 62: "
-                "the inversion flag is one toggle apart from Nuked's, so the "
-                "key-off latches the complementary level";
-        else if (has_ssg_keyoff_cut_divergence(c.op, eg))
-          bad = "SSG-EG key-off with the latched level at or above 0x200: "
-                "Nuked holds it for another sample or two before cutting to "
-                "0x3FF";
-        if (bad) {
-          v.ok = false;
-          v.why = std::string(bad) + " (sample " + std::to_string(i) +
-                  "); see golden/DISCREPANCIES.md";
-          return v;
-        }
+      else
         eg.key_off();
-      }
       ++g;
     }
     eg.step();
@@ -548,13 +532,8 @@ Scenario ssg_slow_attack() {
   s.title = "SSG-EG under a slow attack";
   s.description = "SSG-EG with AR 0/3/10, so the whole attack sits at or above "
                   "the 0x200 fold. Every case runs past the first fold that "
-                  "follows its attack. The alternating modes without hold "
-                  "($0A and $0E) are never keyed off; see "
-                  "golden/DISCREPANCIES.md.";
-  // Modes $0A and $0E hold the inversion flag one toggle away from Nuked's for
-  // the whole of a sub-62 attack, and only a key-off can carry that into
-  // eg_level, so those cases end while still keyed on.
-  const std::vector<Gate> on_only = {{align_gate(6), true}};
+                  "follows its attack, and every case is keyed off while the "
+                  "inversion flag is live.";
 
   // The attack alone spans ~222700 samples at AR=3 and ~18600 at AR=10, and
   // the climb back to the fold a further ~86800; `samples` has to cover both
@@ -562,26 +541,32 @@ Scenario ssg_slow_attack() {
   s.cases.push_back({"AR=3 SSG=$08", patch(3, 10, 6, 5, 7, 0, 0, 8), note(60),
                      330000, hold(6, 318000)});
   s.cases.push_back({"AR=3 SSG=$0A", patch(3, 10, 6, 5, 7, 0, 0, 10), note(60),
-                     330000, on_only});
+                     330000, hold(6, 318000)});
   s.cases.push_back({"AR=10 SSG=$08", patch(10, 10, 6, 5, 7, 0, 0, 8), note(60),
                      126000, hold(6, 114000)});
   s.cases.push_back({"AR=10 SSG=$0A", patch(10, 10, 6, 5, 7, 0, 0, 10),
-                     note(60), 126000, on_only});
+                     note(60), 126000, hold(6, 114000)});
   // Rate 0 never advances, so the level stays pinned above the fold for the
-  // whole note while the alternate bit flips the inversion every sample.
+  // whole note while the alternate bit flips the inversion every sample: the
+  // key-off is taken from the fold region and from either parity.
   for (int ssg : {10, 14})
+    for (int off : {8002, 8005}) // three samples apart, so opposite parities
+      s.cases.push_back({"AR=0 SSG=$" + hex2(ssg) + " off@" + num(off),
+                         patch(0, 10, 6, 5, 7, 0, 0, ssg), note(60), 12000,
+                         hold(6, off)});
+  // The two inverting modes with no fold logic of their own, keyed off from a
+  // level the latch turns into 0x200 - A.
+  for (int ssg : {12, 13})
     s.cases.push_back({"AR=0 SSG=$" + hex2(ssg),
                        patch(0, 10, 6, 5, 7, 0, 0, ssg), note(60), 12000,
-                       on_only});
+                       hold(6, 8002)});
   // SL=15 sits above the fold, so the decay runs straight into it: the first
   // fold lands at sample 19638 and the modes without hold take a second one at
   // 36723, well inside the trace.
-  for (int ssg = 8; ssg < 16; ++ssg) {
-    const bool alternating = (ssg & 0x02) && !(ssg & 0x01);
+  for (int ssg = 8; ssg < 16; ++ssg)
     s.cases.push_back({"SSG=$" + hex2(ssg) + " AR=10 fold cycle",
                        patch(10, 20, 10, 5, 15, 0, 0, ssg), note(60), 60000,
-                       alternating ? on_only : hold(6, 50000)});
-  }
+                       hold(6, 50000)});
   return s;
 }
 

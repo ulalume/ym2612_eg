@@ -138,46 +138,6 @@ inline bool has_ssg_sustain_window_divergence(const OperatorParams &op,
   return false;
 }
 
-// SSG-EG modes 2 and 6 ($0A / $0E), alternate set and hold clear.  Nuked masks
-// the direction it has just toggled with the key state as it stood *before* the
-// key-on (`direction &= eg_kon`), so its inversion flag is still clear on the
-// first keyed-on sample; this library toggles on that sample.  An instant
-// attack (rate >= 62) zeroes the level on that same sample, so neither model is
-// in the fold region and the two stay together -- below rate 62 the level is
-// still 0x3FF there and the flags separate by one toggle, permanently.  While
-// the ramp sits at or above 0x200 that is only the phase of a sample-rate
-// square, but the moment it leaves the fold both flags freeze, on opposite
-// values, for the rest of the note.  output() is already not compared for the
-// alternating modes, so the only route from the flag into eg_level is the
-// key-off latch -- such a case is comparable as long as it is never keyed off.
-inline bool has_ssg_alternate_keyon_parity_divergence(const OperatorParams &op,
-                                                      const EgSimulator &eg) {
-  return (op.ssg & 0x08) && (op.ssg & 0x02) && !(op.ssg & 0x01) &&
-         eg.rate_of(EgPhase::Attack) < 62;
-}
-
-// Nuked cuts an SSG-EG slot to silence through the same "envelope off" branch
-// as a plain one, and that branch is gated on the state the slot held *before*
-// the update.  A key-off whose latched level is at or above 0x200 therefore
-// does not cut on the key-off sample: the state machine has to walk out of
-// Attack first, which costs one sample with hold set and two without, because
-// with hold clear the repeat latch also re-asserts kon_event on the key-off
-// sample itself.  Nuked emits the latched level meanwhile; this library cuts to
-// 0x3FF at once.  The two coincide only when the latched level is already
-// 0x3FF, so any other level at or above the fold keeps the key-off out of a
-// vector.
-inline bool has_ssg_keyoff_cut_divergence(const OperatorParams &op,
-                                          const EgSimulator &eg) {
-  if (!(op.ssg & 0x08))
-    return false;
-  const int att = eg.attenuation();
-  // key_off() latches the audible (inverted) level in place of the internal
-  // one, exactly as Nuked's koff_event does.
-  const int latched =
-      eg.ssg_inverted() ? ((kSsgFoldAttenuation - att) & 0x3FF) : att;
-  return latched >= kSsgFoldAttenuation && latched != kMaxAttenuation;
-}
-
 // Nuked reads eg_out one pipeline stage ahead of the level it belongs to:
 // OPN2_EnvelopeSSGEG runs at cycle `slot`, OPN2_EnvelopeGenerate at slot+1 and
 // OPN2_EnvelopeADSR only at slot+2, so eg_out pairs a level with the inversion

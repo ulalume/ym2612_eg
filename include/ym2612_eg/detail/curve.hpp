@@ -330,8 +330,8 @@ inline CurveResult sample_curve(const CurveRequest &request) {
       const double ms = static_cast<double>(i) * ms_per_sample;
       sim.key_off();
       add_marker(ms, MarkerKind::KeyOff);
-      // Key-off can move the level on its own (the SSG inversion latch), so
-      // record the new value at the key-off instant.
+      // The SSG inversion latch lands on the key-off sample, so the last
+      // level of the held note has to be kept before it is stepped over.
       push_point(ms, true);
       key_off_done = true;
       // Key-off puts the envelope in motion again (release), so re-arm the

@@ -1,6 +1,6 @@
 # Golden vectors
 
-110 cases recorded from Nuked-OPN2 at the register level: the AR sweep, the
+114 cases recorded from Nuked-OPN2 at the register level: the AR sweep, the
 DR x SL grid, the SR/RR sweeps with key-off from every phase, KS across three
 octaves, all eight SSG-EG shapes at an instant attack and again under a slow
 one, retriggering, edge anchors, and the rate >= 48 regime. Each case stores
@@ -13,12 +13,10 @@ layout in its `format` field.
 EG tick, with no tolerance. Each scenario file is its own CTest case.
 
 Where the two models genuinely differ — the increment row rotating at
-rates >= 48, `SL = 0` with an instant attack, Nuked's 16-wide
-`Decay -> Sustain` window under SSG-EG's 4x steps, the SSG-EG inversion flag
-losing a toggle at key-on in Nuked, and Nuked deferring the SSG-EG cut to
-silence on key-off — the rules live in `test/golden_common.hpp`, evaluated
-independently by the generator and the test, and the measurements are in
-[`DISCREPANCIES.md`](DISCREPANCIES.md).
+rates >= 48, `SL = 0` with an instant attack, and Nuked's 16-wide
+`Decay -> Sustain` window under SSG-EG's 4x steps — the rules live in
+`test/golden_common.hpp`, evaluated independently by the generator and the
+test, and the measurements are in [`DISCREPANCIES.md`](DISCREPANCIES.md).
 
 ## Regenerating
 

@@ -128,12 +128,13 @@ public:
     recompute();
   }
 
-  // Edge-triggered, like a $28 write.
+  // Edge-triggered, like a $28 write.  A write takes one output sample to
+  // reach the envelope: until the next step() the SSG-EG block still acts on
+  // the key state it had before.
   void key_on() {
     if (keyed_on_)
       return;
     keyed_on_ = true;
-    ssg_invert_ = false; // inversion flag cleared on key-on
     ssg_held_ = false;
     ssg_in_fold_ = false;
     phase_ = EgPhase::Attack;
@@ -146,11 +147,6 @@ public:
   void key_off() {
     if (!keyed_on_)
       return;
-    // The audible (inverted) level is latched in place, so release continues
-    // from what was heard, not from the internal level.
-    if (ssg_enable_ && (ssg_attack_ != ssg_invert_))
-      att_ = (0x200 - att_) & 0x3FF;
-    ssg_invert_ = false;
     keyed_on_ = false;
     phase_ = EgPhase::Release;
   }
@@ -166,6 +162,10 @@ public:
       envelope_off_step();
     if (eg_divider_ == 0)
       eg_step();
+    // The key state and the phase are both latched at the end of the update,
+    // so the next sample acts on what this one started with.
+    keyed_on_at_start_ = keyed_on_;
+    phase_at_start_ = phase_;
     if (++eg_divider_ == kEgClockDivider)
       eg_divider_ = 0;
     ++samples_;
@@ -181,7 +181,15 @@ public:
   // next sample can already change something; detail::kUnboundedSkip when
   // only an external event can.
   uint32_t skippable_samples() const {
+    // A key write has not reached the envelope yet, and the sample that lets
+    // it through is not like the ones around it.
+    if (keyed_on_ != keyed_on_at_start_)
+      return 0;
     if (ssg_enable_) {
+      // The key state masks the direction flag out on the sample after a
+      // key-off, whatever the level is doing.
+      if (ssg_invert_ && !keyed_on_at_start_)
+        return 0;
       if (att_ >= kSsgFoldAttenuation && !ssg_fold_idle())
         return 0;
     } else if (phase_ != EgPhase::Attack && (att_ & 0x3F0) == 0x3F0 &&
@@ -201,7 +209,7 @@ public:
   // there the two repeat.
   uint32_t alternating_samples(uint16_t &first, uint16_t &second) const {
     if (!ssg_enable_ || !ssg_alternate_ || ssg_hold_ || !keyed_on_ ||
-        att_ < kSsgFoldAttenuation)
+        !keyed_on_at_start_ || att_ < kSsgFoldAttenuation)
       return 0;
     // Entering the fold raises events, and the virtual key-on has to have
     // already put the phase where it then keeps it.  At rate >= 62 that same
@@ -228,7 +236,7 @@ public:
     // the flag set.
     if (ssg_enable_ && att_ < kSsgFoldAttenuation)
       ssg_in_fold_ = false;
-    else if (ssg_enable_ && ssg_alternate_ && !ssg_hold_)
+    else if (ssg_enable_ && ssg_alternate_ && !ssg_hold_ && keyed_on_at_start_)
       ssg_invert_ = ssg_invert_ != ((samples & 1u) != 0);
 
     const uint32_t to_tick =
@@ -254,7 +262,9 @@ public:
     counter_ = counter_phase & 0x0FFF;
     att_ = start_att > kMaxAttenuation ? kMaxAttenuation : start_att;
     phase_ = EgPhase::Release;
+    phase_at_start_ = EgPhase::Release;
     keyed_on_ = false;
+    keyed_on_at_start_ = false;
     ssg_invert_ = false;
     ssg_held_ = false;
     ssg_in_fold_ = false;
@@ -265,9 +275,9 @@ public:
 
   uint16_t attenuation() const { return static_cast<uint16_t>(att_); }
 
-  // Inversion (keyed-on only) then TL, clamped.
+  // Inversion (only once a key-on has reached the envelope) then TL, clamped.
   uint16_t output() const {
-    return output_with(ssg_enable_ && keyed_on_ &&
+    return output_with(ssg_enable_ && keyed_on_at_start_ &&
                        (ssg_attack_ != ssg_invert_));
   }
 
@@ -282,6 +292,10 @@ public:
   // True when nothing can change without an external event (a register write
   // or a key on/off).  Used to cut simulation short.
   bool is_static() const {
+    // A key write still has a sample to travel before the envelope sees it,
+    // and the direction flag it leaves behind is masked out a sample later.
+    if (keyed_on_ != keyed_on_at_start_ || (ssg_enable_ && ssg_invert_ && !keyed_on_at_start_))
+      return false;
     if (phase_ == EgPhase::Attack) {
       if (att_ == 0)
         return false; // -> Decay on the next EG tick
@@ -293,10 +307,10 @@ public:
       return rate_[0] < 2 || rate_[0] >= 62;
     }
     if (ssg_enable_ && att_ >= kSsgFoldAttenuation) {
-      // Keyed off: the hard cut to 0x3FF happens on the next sample, and once
-      // it has happened nothing else can move.
+      // Keyed off: the cut to 0x3FF still has the walk out of Attack in front
+      // of it, and once both are behind nothing else can move.
       if (!keyed_on_)
-        return att_ >= kMaxAttenuation;
+        return att_ >= kMaxAttenuation && phase_ == EgPhase::Release;
       // Hold clear -> virtual key-on restarts the ramp every cycle.
       // Hold set   -> static only once the mode has actually latched; the
       // sample that first lands on 0x200 still has the latch ahead of it.
@@ -361,7 +375,7 @@ private:
       return false;
     // Alternate flips the inversion flag on every single sample, unless hold
     // pins it set and it has already got there.
-    if (ssg_alternate_ && !(ssg_hold_ && ssg_invert_))
+    if (ssg_alternate_ && keyed_on_at_start_ && !(ssg_hold_ && ssg_invert_))
       return false;
     // The virtual key-on re-enters attack, and at rate >= 62 zeroes the level.
     if (keyed_on_ && !ssg_hold_ &&
@@ -444,74 +458,94 @@ private:
     return 0;
   }
 
-  // Runs once per output sample, gated on A >= 0x200.  Step 1 must precede
-  // step 4; the rest are order-independent.
+  // Runs once per output sample, before the envelope update.  The latches it
+  // raises are consumed by the same sample; the key state and the phase it
+  // reads are the ones this sample started with, so a key write that has not
+  // been through a step() yet does not reach any of them.
   void ssg_step() {
-    if (att_ < kSsgFoldAttenuation) {
+    const bool in_fold = att_ >= kSsgFoldAttenuation;
+    // Below the fold with the key state settled and the direction flag already
+    // masked, every branch below is a no-op.
+    if (!in_fold && keyed_on_ == keyed_on_at_start_ && (keyed_on_at_start_ || !ssg_invert_)) {
       ssg_in_fold_ = false;
+      if (!keyed_on_)
+        phase_ = EgPhase::Release;
       return;
     }
-    // The block below runs on every sample the envelope spends at or above
-    // 0x200, which with AR < 31 is every sample of a whole attack. The events
-    // report the moment it arrives, not each sample it stays.
-    const bool entering = !ssg_in_fold_;
-    ssg_in_fold_ = true;
+    // The fold region is every sample the envelope spends at or above 0x200,
+    // which with AR < 31 is every sample of a whole attack.  The events report
+    // the moment it arrives, not each sample it stays.
+    const bool entering = in_fold && !ssg_in_fold_;
+    ssg_in_fold_ = in_fold;
 
-    // 1. alternate -> toggle inversion; alternate+hold -> force it set.
-    if (ssg_alternate_) {
-      const bool before = ssg_invert_;
-      ssg_invert_ = ssg_hold_ ? true : !ssg_invert_;
-      if (ssg_invert_ != before)
-        events_ |= detail::kEvSsgInvert;
+    bool repeat = false;
+    bool direction = ssg_invert_;
+    if (in_fold) {
+      // Hold clear -> the ramp repeats, i.e. a key-on is re-asserted here.
+      repeat = !ssg_hold_;
+      // Alternate -> toggle inversion; alternate+hold -> force it set.
+      if (ssg_alternate_)
+        direction = ssg_hold_ ? true : !direction;
+      // Neither alternate nor hold -> the phase generator is forced to 0.  We
+      // do not model the PG; the moment is reported so the UI can mark it.
+      if (!ssg_alternate_ && !ssg_hold_ && entering)
+        events_ |= detail::kEvSsgPhaseReset;
     }
+    // Modes 3 and 5 (hold set, attack and alternate differing) freeze at 0x200,
+    // i.e. at full output volume, instead of cutting to silence below.
+    const bool hold_up =
+        keyed_on_ && ssg_hold_ && (ssg_attack_ != ssg_alternate_);
+    direction = direction && keyed_on_at_start_;
+    if (direction != ssg_invert_)
+      events_ |= detail::kEvSsgInvert;
+    ssg_invert_ = direction;
 
-    // 2. neither alternate nor hold -> the phase generator is forced to 0.
-    //    We do not model the PG; the moment is reported so the UI can mark it.
-    if (!ssg_alternate_ && !ssg_hold_ && entering)
-      events_ |= detail::kEvSsgPhaseReset;
+    const bool kon_event = (keyed_on_ && !keyed_on_at_start_) || (keyed_on_at_start_ && repeat);
+    const bool koff_event = keyed_on_at_start_ && !keyed_on_;
 
-    // 3. keyed on and hold clear -> virtual key-on (this is the 0x200 -> 0 snap).
-    if (keyed_on_ && !ssg_hold_) {
+    // The audible (inverted) level is latched in place, so release continues
+    // from what was heard, not from the internal level.
+    if (koff_event && (ssg_attack_ != direction))
+      att_ = (kSsgFoldAttenuation - att_) & 0x3FF;
+    const bool eg_off = att_ >= kSsgFoldAttenuation;
+
+    if (kon_event) {
+      // The virtual key-on: this is the 0x200 -> 0 snap.
       phase_ = EgPhase::Attack;
       if (rate_[0] >= 62)
         att_ = 0;
-      if (entering)
+      if (entering && keyed_on_ && !ssg_hold_)
         events_ |= detail::kEvSsgFold;
-    }
-
-    // 4. hold set -> the mode latches here, once.  When the output is *not*
-    //    inverted the level jumps to silence; the two inverted-hold modes
-    //    (3 and 5) instead freeze at 0x200, i.e. full output volume.
-    if (ssg_hold_ && phase_ != EgPhase::Attack) {
-      if (!ssg_held_) {
-        ssg_held_ = true;
-        events_ |= detail::kEvSsgHold;
-      }
-      // The jump to silence is the same "envelope off" branch as below, so it
-      // sets the phase as well.  Modes 3 and 5 keep both level and phase.
-      if (!(ssg_attack_ != ssg_invert_)) {
-        att_ = kMaxAttenuation;
-        phase_ = EgPhase::Release;
-      }
-    }
-
-    // 5. keyed off -> hard cut, unconditionally.
-    if (!keyed_on_) {
-      att_ = kMaxAttenuation;
+    } else if (!keyed_on_) {
       phase_ = EgPhase::Release;
     }
+
+    // Hold set -> the mode latches here, once.
+    if (in_fold && ssg_hold_ && phase_at_start_ != EgPhase::Attack &&
+        !ssg_held_) {
+      ssg_held_ = true;
+      events_ |= detail::kEvSsgHold;
+    }
+
+    envelope_off(kon_event, hold_up, eg_off);
   }
 
-  // "Envelope off": in any non-attack phase, (att & 0x3F0) == 0x3F0 forces
-  // att = 0x3FF and Release.  Evaluated per output sample, so it lands on the
-  // sample after the tick that pushed att into [0x3F0, 0x3FF].  With SSG-EG on
-  // the threshold is 0x200 instead, which ssg_step() handles.
+  // "Envelope off": with the slot out of Attack and no key-on re-asserted, a
+  // level at the threshold forces att = 0x3FF and Release.  Evaluated per
+  // output sample, so it lands on the sample after the tick that pushed att
+  // there -- and the phase it tests is the one the sample started with, so a
+  // slot that has yet to leave Attack is held for a sample first.
+  void envelope_off(bool kon_event, bool hold_up, bool eg_off) {
+    if (kon_event || hold_up || phase_at_start_ == EgPhase::Attack || !eg_off)
+      return;
+    att_ = kMaxAttenuation;
+    phase_ = EgPhase::Release;
+  }
+
+  // Without SSG-EG the threshold is the top row of the scale instead of 0x200.
   void envelope_off_step() {
-    if (phase_ != EgPhase::Attack && (att_ & 0x3F0) == 0x3F0 &&
-        att_ != kMaxAttenuation) {
-      att_ = kMaxAttenuation;
-      phase_ = EgPhase::Release;
-    }
+    envelope_off(keyed_on_ && !keyed_on_at_start_, false,
+                 (att_ & 0x3F0) == 0x3F0 && att_ != kMaxAttenuation);
   }
 
   // One EG tick, clock / 432.
@@ -541,7 +575,7 @@ private:
     if (phase_ == EgPhase::Attack) {
       // Exponential, and the shift must be arithmetic: ~att is negative.
       static_assert((-16 >> 4) == -1, "arithmetic right shift required");
-      if (rate < 62 && inc != 0)
+      if (rate < 62 && inc != 0 && keyed_on_)
         att_ += (~att_ * inc) >> 4;
       return;
     }
@@ -573,7 +607,9 @@ private:
   int counter_ = 0;
   int eg_divider_ = 0;
   EgPhase phase_ = EgPhase::Release;
+  EgPhase phase_at_start_ = EgPhase::Release;
   bool keyed_on_ = false;
+  bool keyed_on_at_start_ = false;
   bool ssg_invert_ = false;
   bool ssg_held_ = false;
   bool ssg_in_fold_ = false;
