@@ -247,10 +247,26 @@ Verdict verify(const Case &c, const Trace &t, bool *out_differs) {
   const bool check_out = output_comparable(c.op);
   for (int i = 0; i < c.samples; ++i) {
     while (g < t.gate.size() && t.gate[g].sample == i) {
-      if (t.gate[g].on)
+      if (t.gate[g].on) {
         eg.key_on();
-      else
+      } else {
+        const char *bad = nullptr;
+        if (has_ssg_alternate_keyon_parity_divergence(c.op, eg))
+          bad = "SSG-EG alternate without hold under an attack below rate 62: "
+                "the inversion flag is one toggle apart from Nuked's, so the "
+                "key-off latches the complementary level";
+        else if (has_ssg_keyoff_cut_divergence(c.op, eg))
+          bad = "SSG-EG key-off with the latched level at or above 0x200: "
+                "Nuked holds it for another sample or two before cutting to "
+                "0x3FF";
+        if (bad) {
+          v.ok = false;
+          v.why = std::string(bad) + " (sample " + std::to_string(i) +
+                  "); see golden/DISCREPANCIES.md";
+          return v;
+        }
         eg.key_off();
+      }
       ++g;
     }
     eg.step();
@@ -395,7 +411,7 @@ bool emit(const Scenario &s, const std::string &dir) {
   }
   std::fwrite(j.data(), 1, j.size(), f);
   std::fclose(f);
-  std::printf("  %-18s %2zu cases, %7zu bytes\n", (s.file + ".json").c_str(),
+  std::printf("  %-20s %2zu cases, %7zu bytes\n", (s.file + ".json").c_str(),
               s.cases.size(), j.size());
   return true;
 }
@@ -523,7 +539,53 @@ Scenario ssg_modes() {
   return s;
 }
 
-// 6. Retrigger.
+// 6. SSG-EG with AR below 31.  The attack then starts from 0x3FF, which is
+//    above the fold level, so the SSG block acts on every sample of the attack
+//    itself; only the instant attack skips that region entirely.
+Scenario ssg_slow_attack() {
+  Scenario s;
+  s.file = "ssg_slow_attack";
+  s.title = "SSG-EG under a slow attack";
+  s.description = "SSG-EG with AR 0/3/10, so the whole attack sits at or above "
+                  "the 0x200 fold. Every case runs past the first fold that "
+                  "follows its attack. The alternating modes without hold "
+                  "($0A and $0E) are never keyed off; see "
+                  "golden/DISCREPANCIES.md.";
+  // Modes $0A and $0E hold the inversion flag one toggle away from Nuked's for
+  // the whole of a sub-62 attack, and only a key-off can carry that into
+  // eg_level, so those cases end while still keyed on.
+  const std::vector<Gate> on_only = {{align_gate(6), true}};
+
+  // The attack alone spans ~222700 samples at AR=3 and ~18600 at AR=10, and
+  // the climb back to the fold a further ~86800; `samples` has to cover both
+  // for the trace to reach the fold at all.
+  s.cases.push_back({"AR=3 SSG=$08", patch(3, 10, 6, 5, 7, 0, 0, 8), note(60),
+                     330000, hold(6, 318000)});
+  s.cases.push_back({"AR=3 SSG=$0A", patch(3, 10, 6, 5, 7, 0, 0, 10), note(60),
+                     330000, on_only});
+  s.cases.push_back({"AR=10 SSG=$08", patch(10, 10, 6, 5, 7, 0, 0, 8), note(60),
+                     126000, hold(6, 114000)});
+  s.cases.push_back({"AR=10 SSG=$0A", patch(10, 10, 6, 5, 7, 0, 0, 10),
+                     note(60), 126000, on_only});
+  // Rate 0 never advances, so the level stays pinned above the fold for the
+  // whole note while the alternate bit flips the inversion every sample.
+  for (int ssg : {10, 14})
+    s.cases.push_back({"AR=0 SSG=$" + hex2(ssg),
+                       patch(0, 10, 6, 5, 7, 0, 0, ssg), note(60), 12000,
+                       on_only});
+  // SL=15 sits above the fold, so the decay runs straight into it: the first
+  // fold lands at sample 19638 and the modes without hold take a second one at
+  // 36723, well inside the trace.
+  for (int ssg = 8; ssg < 16; ++ssg) {
+    const bool alternating = (ssg & 0x02) && !(ssg & 0x01);
+    s.cases.push_back({"SSG=$" + hex2(ssg) + " AR=10 fold cycle",
+                       patch(10, 20, 10, 5, 15, 0, 0, ssg), note(60), 60000,
+                       alternating ? on_only : hold(6, 50000)});
+  }
+  return s;
+}
+
+// 7. Retrigger.
 Scenario retrigger() {
   Scenario s;
   s.file = "retrigger";
@@ -557,7 +619,7 @@ Scenario retrigger() {
   return s;
 }
 
-// 7. Edge anchors.
+// 8. Edge anchors.
 Scenario edge_anchors() {
   Scenario s;
   s.file = "edge_anchors";
@@ -588,7 +650,7 @@ Scenario edge_anchors() {
   return s;
 }
 
-// 8. The rate >= 48 regime, where Nuked's latched timer bits rotate the
+// 9. The rate >= 48 regime, where Nuked's latched timer bits rotate the
 //    increment row by one EG tick.  Every case here keeps all of its
 //    non-constant rows on the same side of that rotation, so the comparison
 //    stays exact once the documented counter shift is applied.
@@ -643,9 +705,11 @@ int main(int argc, char **argv) {
   const std::string dir = argv[1];
   std::printf("golden vectors from Nuked-OPN2 @ %s\n", kNukedCommit);
 
-  const Scenario scenarios[] = {ar_sweep(),  dr_sl_grid(), sr_rr_sweep(),
-                                ks_pitch(),  ssg_modes(),  retrigger(),
-                                edge_anchors(), high_rate()};
+  const Scenario scenarios[] = {ar_sweep(),        dr_sl_grid(),
+                                sr_rr_sweep(),     ks_pitch(),
+                                ssg_modes(),       ssg_slow_attack(),
+                                retrigger(),       edge_anchors(),
+                                high_rate()};
   bool ok = true;
   for (const Scenario &s : scenarios)
     ok &= emit(s, dir);

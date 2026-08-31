@@ -130,10 +130,26 @@ void run_case(const jsonlite::Value &c) {
   size_t g = 0;
   for (int i = 0; i < samples; ++i) {
     while (g + 1 < gate.size() && static_cast<int>(gate[g]) == i) {
-      if (gate[g + 1] != 0)
+      if (gate[g + 1] != 0) {
         eg.key_on();
-      else
+      } else {
+        // Two divergences only a key-off can expose, both evaluated on the
+        // envelope as it stands going into it.
+        const char *bad = nullptr;
+        if (has_ssg_alternate_keyon_parity_divergence(op, eg))
+          bad = "SSG-EG alternate without hold under an attack below rate 62";
+        else if (has_ssg_keyoff_cut_divergence(op, eg))
+          bad = "SSG-EG key-off with the latched level at or above 0x200";
+        if (bad) {
+          testing::fail(__FILE__, __LINE__,
+                        g_file + " / " + name + ": " + bad +
+                            " is a documented divergence and must not appear "
+                            "in a golden vector (key-off at sample " +
+                            std::to_string(i) + ")");
+          return;
+        }
         eg.key_off();
+      }
       g += 2;
     }
     eg.step();
