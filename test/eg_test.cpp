@@ -546,6 +546,87 @@ void test_counter_phase_reset() {
   CHECK_EQ(c.attenuation(), 512);
 }
 
+// A skip is only ever allowed to stand in for the same number of step()
+// calls: nothing observable may move across the samples it names, and the
+// state it lands on -- including the counter, the divider and the SSG latches
+// that only show up later -- must be the state stepping would have reached.
+void test_skip_matches_stepping() {
+  struct Obs {
+    uint16_t att, out;
+    uint8_t phase;
+    bool on, inverted, at_rest;
+    bool operator==(const Obs &o) const {
+      return att == o.att && out == o.out && phase == o.phase && on == o.on &&
+             inverted == o.inverted && at_rest == o.at_rest;
+    }
+  };
+  const auto look = [](const EgSimulator &s) {
+    return Obs{s.attenuation(), s.output(), static_cast<uint8_t>(s.phase()),
+               s.keyed_on(), s.ssg_inverted(), s.is_static()};
+  };
+
+  const uint8_t kR[6] = {0, 1, 6, 13, 24, 31};
+  const uint16_t kStart[4] = {0, 0x1FF, 0x200, 0x3FF};
+  const uint64_t kSpan = 20000;
+  size_t claims = 0;
+  size_t skipped = 0;
+  bool ok = true;
+  for (int ssg = 0; ssg < 16 && ok; ++ssg)
+    for (size_t r = 0; r < 6 && ok; ++r) {
+      OperatorParams op;
+      op.ar = kR[r];
+      op.dr = kR[(r + 2) % 6];
+      op.sr = kR[(r + 4) % 6];
+      op.rr = static_cast<uint8_t>(kR[(r + 1) % 6] / 2);
+      op.sl = static_cast<uint8_t>((r * 5) % 16);
+      op.tl = static_cast<uint8_t>((r * 23) % 128);
+      op.ks = static_cast<uint8_t>(r % 4);
+      op.ssg = static_cast<uint8_t>(ssg);
+      const uint64_t gate = (r % 3 == 0) ? kSpan : 7000;
+      EgSimulator sim(op, kC4);
+      sim.reset(0, kStart[r % 4]);
+      sim.key_on();
+      for (uint64_t i = 0; i < kSpan && ok;) {
+        if (i == gate)
+          sim.key_off();
+        uint64_t room = kSpan - i;
+        if (i < gate && gate - i < room)
+          room = gate - i;
+        const uint64_t n = std::min<uint64_t>(sim.skippable_samples(), room);
+        if (n == 0) {
+          sim.step();
+          ++i;
+          continue;
+        }
+        EgSimulator stepped = sim, jumped = sim;
+        const Obs before = look(sim);
+        for (uint64_t k = 0; k < n && ok; ++k) {
+          stepped.step();
+          ok = look(stepped) == before;
+        }
+        jumped.skip(static_cast<uint32_t>(n));
+        ok = ok && look(jumped) == look(stepped) &&
+             jumped.time_ms() == stepped.time_ms();
+        // The counter and the divider are invisible until they gate the next
+        // update, so the two runs have to stay together afterwards too.
+        if (ok && (claims % 16) == 0)
+          for (int k = 0; k < 200 && ok; ++k) {
+            stepped.step();
+            jumped.step();
+            ok = look(jumped) == look(stepped);
+          }
+        ++claims;
+        skipped += static_cast<size_t>(n);
+        sim.skip(static_cast<uint32_t>(n));
+        i += n;
+      }
+    }
+  CHECK(ok);
+  // The sweep has to actually exercise the thing.
+  CHECK(claims > 1000);
+  CHECK(skipped > 100000);
+}
+
 // ---------------------------------------------------------------- section 2
 
 void test_tl_and_units() {
@@ -687,6 +768,7 @@ int main() {
   RUN_TEST(test_key_edges_and_retrigger);
   RUN_TEST(test_key_off_from_any_phase);
   RUN_TEST(test_counter_phase_reset);
+  RUN_TEST(test_skip_matches_stepping);
   RUN_TEST(test_tl_and_units);
   RUN_TEST(test_from_midi_matches_megatoy);
   RUN_TEST(test_cross_check_against_reference);

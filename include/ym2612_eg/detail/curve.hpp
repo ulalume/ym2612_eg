@@ -262,6 +262,23 @@ inline CurveResult sample_curve(const CurveRequest &request) {
   bool parked = false;
 
   for (uint64_t i = 0; i < max_samples; ++i) {
+    // Across a stretch the simulator cannot move through, every sample repeats
+    // the last one: no event, no vertex the dedup would keep, no change of
+    // silence or park state.  Cross it whole.  The two samples that are not
+    // part of such a stretch are the one a still-unrecorded park lands on and
+    // the one the key-off lands on.
+    if (parked || !sim.is_static()) {
+      uint64_t room = max_samples - i;
+      if (!key_off_done)
+        room = i < gate_sample ? std::min(room, gate_sample - i) : uint64_t{0};
+      const uint64_t skip = std::min<uint64_t>(sim.skippable_samples(), room);
+      if (skip >= 2) {
+        sim.skip(static_cast<uint32_t>(skip));
+        i += skip - 1;
+        continue;
+      }
+    }
+
     if (!key_off_done && i >= gate_sample) {
       const double ms = static_cast<double>(i) * ms_per_sample;
       sim.key_off();

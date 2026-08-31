@@ -48,6 +48,11 @@ namespace detail {
 inline constexpr uint16_t kMegatoyFnum[12] = {322, 341, 361, 383, 406, 430,
                                               455, 482, 511, 541, 574, 608};
 
+// What EgSimulator::skippable_samples() reports when the envelope can only be
+// moved again by an external event.  Far past any axis a caller can ask for,
+// and small enough to keep the sample arithmetic inside 32 bits.
+inline constexpr uint32_t kUnboundedSkip = 1u << 30;
+
 // Events raised by a single EgSimulator::step(); consumed by sample_curve().
 enum EventBits : uint32_t {
   kEvAttackEnd = 1u << 0,
@@ -171,6 +176,76 @@ public:
       step();
   }
 
+  // How many output samples may pass with nothing observable happening: no
+  // event, and no move in attenuation, phase or SSG state.  0 when the very
+  // next sample can already change something; detail::kUnboundedSkip when
+  // only an external event can.
+  uint32_t skippable_samples() const {
+    if (ssg_enable_) {
+      if (att_ >= kSsgFoldAttenuation && !ssg_fold_idle())
+        return 0;
+    } else if (phase_ != EgPhase::Attack && (att_ & 0x3F0) == 0x3F0 &&
+               att_ != kMaxAttenuation) {
+      // envelope_off_step() snaps to silence on the next output sample.
+      return 0;
+    }
+
+    // An EG tick lands on the samples whose divider reads 0 on entry.
+    const uint32_t to_tick =
+        static_cast<uint32_t>((kEgClockDivider - eg_divider_) %
+                              kEgClockDivider);
+
+    // A transition test that already holds fires on that tick whatever the
+    // rate does, and the phase changing is itself a change.
+    if ((phase_ == EgPhase::Attack && att_ == 0) ||
+        (phase_ == EgPhase::Decay && att_ >= sustain_att_))
+      return to_tick;
+
+    const int rate = rate_[static_cast<int>(phase_)];
+    // Where the increment cannot land, no tick moves anything: the attack
+    // update is guarded by `rate < 62`, the SSG-EG one by the fold level, and
+    // the plain one saturates.
+    const bool frozen =
+        phase_ == EgPhase::Attack
+            ? rate >= 62
+            : (ssg_enable_ ? att_ >= kSsgFoldAttenuation
+                           : att_ >= kMaxAttenuation);
+    if (frozen)
+      return detail::kUnboundedSkip;
+
+    const int ticks = ticks_to_increment(rate);
+    if (ticks == 0)
+      return detail::kUnboundedSkip; // rate 0/1: the whole table row is zero
+    return to_tick + static_cast<uint32_t>(ticks - 1) * kEgClockDivider;
+  }
+
+  // Advance `samples` output samples at once.  Defined only for a count at or
+  // below skippable_samples(); past that the states in between are not all
+  // alike and have to be walked.
+  void skip(uint32_t samples) {
+    if (samples == 0)
+      return;
+    events_ = 0;
+    // ssg_step() clears the fold latch on every sample spent below the fold.
+    if (ssg_enable_ && att_ < kSsgFoldAttenuation)
+      ssg_in_fold_ = false;
+
+    const uint32_t to_tick =
+        static_cast<uint32_t>((kEgClockDivider - eg_divider_) %
+                              kEgClockDivider);
+    if (samples > to_tick) {
+      const uint64_t ticks =
+          (samples - to_tick + kEgClockDivider - 1) / kEgClockDivider;
+      // The counter skips 0, so it walks 1..4095 with a period of 4095.
+      const uint64_t base = static_cast<uint64_t>((counter_ + 4094) % 4095);
+      counter_ = static_cast<int>((base + ticks) % 4095) + 1;
+    }
+    eg_divider_ =
+        static_cast<int>((static_cast<uint32_t>(eg_divider_) + samples) %
+                         kEgClockDivider);
+    samples_ += samples;
+  }
+
   // counter_phase presets the 12-bit EG counter, which is shared by all 24
   // operators and not reset by key-on, so its phase jitters the first update
   // by up to one period.  start_att presets the attenuation for a retrigger.
@@ -277,6 +352,56 @@ private:
   // The SSG block keeps firing, so something keeps changing.
   bool ssg_churning() const {
     return ssg_enable_ && att_ >= kSsgFoldAttenuation && !ssg_hold_;
+  }
+
+  // True when ssg_step() at or above the fold level has nothing left to do:
+  // every latch already set, every jump already taken, every event already
+  // raised.  Only meaningful with SSG-EG on and att_ >= kSsgFoldAttenuation.
+  bool ssg_fold_idle() const {
+    // The fold is entered once, and the entry is what raises the events.
+    if (!ssg_in_fold_)
+      return false;
+    // Alternate flips the inversion flag on every single sample.
+    if (ssg_alternate_)
+      return false;
+    // The virtual key-on re-enters attack, and at rate >= 62 zeroes the level.
+    if (keyed_on_ && !ssg_hold_ &&
+        (phase_ != EgPhase::Attack || rate_[0] >= 62))
+      return false;
+    // Hold: the mode latch, and for the non-inverted modes the jump to
+    // silence, are both already behind us.
+    if (ssg_hold_ && phase_ != EgPhase::Attack) {
+      if (!ssg_held_)
+        return false;
+      if (ssg_attack_ == ssg_invert_ &&
+          (att_ != kMaxAttenuation || phase_ != EgPhase::Release))
+        return false;
+    }
+    // Keyed off, the hard cut runs unconditionally.
+    if (!keyed_on_ && (att_ != kMaxAttenuation || phase_ != EgPhase::Release))
+      return false;
+    return true;
+  }
+
+  // EG ticks from now until the first one whose table increment is non-zero;
+  // 0 when the rate's row is all zero, so that no tick ever increments.
+  int ticks_to_increment(int rate) const {
+    const int shift = detail::rate_shift(rate);
+    const int stride = 1 << shift;
+    // The counter value the next tick will hold.
+    const int start = (counter_ < 1 || counter_ >= 0x0FFF) ? 1 : counter_ + 1;
+    // Only counters with the low `shift` bits clear reach the table at all.
+    int c = (start + stride - 1) & ~(stride - 1);
+    if (c > 0x0FFF)
+      c = stride;
+    for (int n = 0x0FFF / stride; n > 0; --n) {
+      if (detail::kIncTable[rate][(c >> shift) & 7] != 0)
+        return c >= start ? c - start + 1 : 0x1000 - start + c;
+      c += stride;
+      if (c > 0x0FFF)
+        c = stride;
+    }
+    return 0;
   }
 
   // Runs once per output sample, gated on A >= 0x200.  Step 1 must precede
