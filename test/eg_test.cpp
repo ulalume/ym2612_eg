@@ -627,6 +627,79 @@ void test_skip_matches_stepping() {
   CHECK(skipped > 100000);
 }
 
+// The two levels an alternate fold reports have to be the levels the next
+// samples really carry, they have to hold for the whole run it names, and
+// crossing the run has to leave the inversion flag on the parity a flip per
+// sample would have left it on.
+void test_alternating_run_matches_stepping() {
+  const uint16_t kStart[5] = {0x100, 0x1FF, 0x200, 0x2A0, 0x3FF};
+  size_t claims = 0, crossed = 0;
+  bool ok = true;
+  for (int ssg = 8; ssg < 16 && ok; ++ssg)
+    for (int ar = 0; ar < 32 && ok; ++ar)
+      for (int ks = 0; ks < 4 && ok; ++ks) {
+        OperatorParams op;
+        op.ar = static_cast<uint8_t>(ar);
+        op.dr = static_cast<uint8_t>((ar * 7) % 32);
+        op.sr = static_cast<uint8_t>((ar * 5) % 32);
+        op.rr = static_cast<uint8_t>(ar % 16);
+        op.sl = static_cast<uint8_t>((ar * 3) % 16);
+        op.tl = static_cast<uint8_t>((ar * 11) % 128);
+        op.ks = static_cast<uint8_t>(ks);
+        op.ssg = static_cast<uint8_t>(ssg);
+        const uint64_t kSpan = 30000;
+        const uint64_t gate = (ar % 3 == 0) ? kSpan : 11000;
+        EgSimulator sim(op, kC4);
+        sim.reset(0, kStart[static_cast<size_t>(ar) % 5]);
+        sim.key_on();
+        for (uint64_t i = 0; i < kSpan && ok;) {
+          if (i == gate)
+            sim.key_off();
+          uint64_t room = kSpan - i;
+          if (i < gate && gate - i < room)
+            room = gate - i;
+          uint16_t first = 0, second = 0;
+          const uint64_t n =
+              std::min<uint64_t>(sim.alternating_samples(first, second), room);
+          if (n == 0) {
+            sim.step();
+            ++i;
+            continue;
+          }
+          EgSimulator stepped = sim, jumped = sim;
+          const uint16_t att0 = sim.attenuation();
+          const EgPhase ph0 = sim.phase();
+          for (uint64_t k = 0; k < n && ok; ++k) {
+            stepped.step();
+            ok = stepped.output() == ((k & 1) ? second : first) &&
+                 stepped.attenuation() == att0 && stepped.phase() == ph0;
+          }
+          jumped.skip(static_cast<uint32_t>(n));
+          ok = ok && jumped.output() == stepped.output() &&
+               jumped.attenuation() == stepped.attenuation() &&
+               jumped.ssg_inverted() == stepped.ssg_inverted() &&
+               jumped.phase() == stepped.phase() &&
+               jumped.time_ms() == stepped.time_ms();
+          for (int k = 0; k < 200 && ok; ++k) {
+            stepped.step();
+            jumped.step();
+            ok = jumped.output() == stepped.output() &&
+                 jumped.attenuation() == stepped.attenuation() &&
+                 jumped.ssg_inverted() == stepped.ssg_inverted();
+          }
+          ++claims;
+          crossed += static_cast<size_t>(n);
+          sim.skip(static_cast<uint32_t>(n));
+          i += n;
+        }
+      }
+  CHECK(ok);
+  // Only the alternate modes without hold reach it, so the sweep has to find
+  // it there and nowhere else.
+  CHECK(claims > 200);
+  CHECK(crossed > 20000);
+}
+
 // ---------------------------------------------------------------- section 2
 
 void test_tl_and_units() {
@@ -769,6 +842,7 @@ int main() {
   RUN_TEST(test_key_off_from_any_phase);
   RUN_TEST(test_counter_phase_reset);
   RUN_TEST(test_skip_matches_stepping);
+  RUN_TEST(test_alternating_run_matches_stepping);
   RUN_TEST(test_tl_and_units);
   RUN_TEST(test_from_midi_matches_megatoy);
   RUN_TEST(test_cross_check_against_reference);

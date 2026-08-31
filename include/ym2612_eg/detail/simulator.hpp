@@ -190,45 +190,46 @@ public:
       return 0;
     }
 
-    // An EG tick lands on the samples whose divider reads 0 on entry.
-    const uint32_t to_tick =
-        static_cast<uint32_t>((kEgClockDivider - eg_divider_) %
-                              kEgClockDivider);
+    return samples_to_eg_move();
+  }
 
-    // A transition test that already holds fires on that tick whatever the
-    // rate does, and the phase changing is itself a change.
-    if ((phase_ == EgPhase::Attack && att_ == 0) ||
-        (phase_ == EgPhase::Decay && att_ >= sustain_att_))
-      return to_tick;
-
-    const int rate = rate_[static_cast<int>(phase_)];
-    // Where the increment cannot land, no tick moves anything: the attack
-    // update is guarded by `rate < 62`, the SSG-EG one by the fold level, and
-    // the plain one saturates.
-    const bool frozen =
-        phase_ == EgPhase::Attack
-            ? rate >= 62
-            : (ssg_enable_ ? att_ >= kSsgFoldAttenuation
-                           : att_ >= kMaxAttenuation);
-    if (frozen)
-      return detail::kUnboundedSkip;
-
-    const int ticks = ticks_to_increment(rate);
-    if (ticks == 0)
-      return detail::kUnboundedSkip; // rate 0/1: the whole table row is zero
-    return to_tick + static_cast<uint32_t>(ticks - 1) * kEgClockDivider;
+  // The SSG-EG alternate fold flips the inversion flag once per output sample,
+  // so while the attenuation stands still the output squares between two
+  // levels at the sample rate: a band, not a line.  Reports how many samples
+  // that lasts, 0 when the envelope is not in it.  `first` takes the level of
+  // the next output sample and `second` the level of the one after; from
+  // there the two repeat.
+  uint32_t alternating_samples(uint16_t &first, uint16_t &second) const {
+    if (!ssg_enable_ || !ssg_alternate_ || ssg_hold_ || !keyed_on_ ||
+        att_ < kSsgFoldAttenuation)
+      return 0;
+    // Entering the fold raises events, and the virtual key-on has to have
+    // already put the phase where it then keeps it.  At rate >= 62 that same
+    // branch zeroes the level instead of leaving it folded.
+    if (!ssg_in_fold_ || phase_ != EgPhase::Attack || rate_[0] >= 62)
+      return 0;
+    const uint32_t n = samples_to_eg_move();
+    if (n == 0)
+      return 0;
+    first = output_with(ssg_attack_ == ssg_invert_);
+    second = output_with(ssg_attack_ != ssg_invert_);
+    return n;
   }
 
   // Advance `samples` output samples at once.  Defined only for a count at or
-  // below skippable_samples(); past that the states in between are not all
-  // alike and have to be walked.
+  // below skippable_samples() or alternating_samples(); past that the states
+  // in between are not all alike and have to be walked.
   void skip(uint32_t samples) {
     if (samples == 0)
       return;
     events_ = 0;
-    // ssg_step() clears the fold latch on every sample spent below the fold.
+    // ssg_step() clears the fold latch on every sample spent below the fold,
+    // and above it flips the inversion flag once per sample unless hold pins
+    // the flag set.
     if (ssg_enable_ && att_ < kSsgFoldAttenuation)
       ssg_in_fold_ = false;
+    else if (ssg_enable_ && ssg_alternate_ && !ssg_hold_)
+      ssg_invert_ = ssg_invert_ != ((samples & 1u) != 0);
 
     const uint32_t to_tick =
         static_cast<uint32_t>((kEgClockDivider - eg_divider_) %
@@ -266,11 +267,8 @@ public:
 
   // Inversion (keyed-on only) then TL, clamped.
   uint16_t output() const {
-    int a = att_;
-    if (ssg_enable_ && keyed_on_ && (ssg_attack_ != ssg_invert_))
-      a = (0x200 - a) & 0x3FF;
-    const int o = a + (static_cast<int>(params_.tl & 0x7F) << 3);
-    return static_cast<uint16_t>(o > kMaxAttenuation ? kMaxAttenuation : o);
+    return output_with(ssg_enable_ && keyed_on_ &&
+                       (ssg_attack_ != ssg_invert_));
   }
 
   EgPhase phase() const { return phase_; }
@@ -361,8 +359,9 @@ private:
     // The fold is entered once, and the entry is what raises the events.
     if (!ssg_in_fold_)
       return false;
-    // Alternate flips the inversion flag on every single sample.
-    if (ssg_alternate_)
+    // Alternate flips the inversion flag on every single sample, unless hold
+    // pins it set and it has already got there.
+    if (ssg_alternate_ && !(ssg_hold_ && ssg_invert_))
       return false;
     // The virtual key-on re-enters attack, and at rate >= 62 zeroes the level.
     if (keyed_on_ && !ssg_hold_ &&
@@ -381,6 +380,47 @@ private:
     if (!keyed_on_ && (att_ != kMaxAttenuation || phase_ != EgPhase::Release))
       return false;
     return true;
+  }
+
+  // Output samples until an EG tick can move the attenuation or the phase;
+  // detail::kUnboundedSkip when none ever will.
+  uint32_t samples_to_eg_move() const {
+    // An EG tick lands on the samples whose divider reads 0 on entry.
+    const uint32_t to_tick =
+        static_cast<uint32_t>((kEgClockDivider - eg_divider_) %
+                              kEgClockDivider);
+
+    // A transition test that already holds fires on that tick whatever the
+    // rate does, and the phase changing is itself a change.
+    if ((phase_ == EgPhase::Attack && att_ == 0) ||
+        (phase_ == EgPhase::Decay && att_ >= sustain_att_))
+      return to_tick;
+
+    const int rate = rate_[static_cast<int>(phase_)];
+    // Where the increment cannot land, no tick moves anything: the attack
+    // update is guarded by `rate < 62`, the SSG-EG one by the fold level, and
+    // the plain one saturates.
+    const bool frozen =
+        phase_ == EgPhase::Attack
+            ? rate >= 62
+            : (ssg_enable_ ? att_ >= kSsgFoldAttenuation
+                           : att_ >= kMaxAttenuation);
+    if (frozen)
+      return detail::kUnboundedSkip;
+
+    const int ticks = ticks_to_increment(rate);
+    if (ticks == 0)
+      return detail::kUnboundedSkip; // rate 0/1: the whole table row is zero
+    return to_tick + static_cast<uint32_t>(ticks - 1) * kEgClockDivider;
+  }
+
+  // The output the current level carries at a given inversion.
+  uint16_t output_with(bool inverted) const {
+    int a = att_;
+    if (inverted)
+      a = (0x200 - a) & 0x3FF;
+    const int o = a + (static_cast<int>(params_.tl & 0x7F) << 3);
+    return static_cast<uint16_t>(o > kMaxAttenuation ? kMaxAttenuation : o);
   }
 
   // EG ticks from now until the first one whose table increment is non-zero;

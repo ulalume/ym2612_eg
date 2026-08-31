@@ -75,6 +75,10 @@ inline constexpr size_t kMaxMarkers = 4096;
 /// vertices. Past this many, the curve is reduced to one bucket per slot
 /// keeping that slot's extremes, which draws the oscillation as a band.
 inline constexpr size_t kMaxPoints = 4096;
+/// Teeth an SSG-EG alternate band is drawn with, counted over the axis it has
+/// covered so far.  reduce() keeps the extremes of each of kMaxPoints / 2 time
+/// slots, so four teeth to a slot leave every slot holding both levels.
+inline constexpr uint64_t kAlternatingTeeth = 4 * (kMaxPoints / 2);
 
 /// Reduce an already-decimated curve to at most kMaxPoints vertices, keeping
 /// the loudest and quietest value of each time slot so the envelope's extent
@@ -257,6 +261,18 @@ inline CurveResult sample_curve(const CurveRequest &request) {
 
   double silence_start_ms = sim.output() >= kSilenceAttenuation ? 0.0 : -1.0;
   size_t silence_index = 0;
+
+  // The run into silence has to be unbroken, so any louder sample restarts it.
+  auto track_silence = [&](double ms, uint16_t out) {
+    if (out >= kSilenceAttenuation) {
+      if (silence_start_ms < 0.0) {
+        silence_start_ms = ms;
+        silence_index = raw.size() - 1;
+      }
+    } else {
+      silence_start_ms = -1.0;
+    }
+  };
   std::vector<uint64_t> fold_samples;
   bool key_off_done = gate_forever;
   bool parked = false;
@@ -277,6 +293,37 @@ inline CurveResult sample_curve(const CurveRequest &request) {
         i += skip - 1;
         continue;
       }
+
+      // The alternate fold squares the output between two levels at the sample
+      // rate, so the picture is a band and a vertex per sample only redraws
+      // its two edges.  Teeth spread over the axis so far carry the same band;
+      // the stride is odd so that consecutive teeth keep alternating, and the
+      // run's first and last samples are always drawn so the curve joins what
+      // comes before and after unchanged.
+      uint16_t first = 0, second = 0;
+      const uint64_t band =
+          std::min<uint64_t>(sim.alternating_samples(first, second), room);
+      if (band >= 2) {
+        uint64_t stride = (i + band) / detail::kAlternatingTeeth;
+        // A run too short for that stride would come out as a single tooth,
+        // and one tooth is a line rather than a band.
+        const uint64_t own = band / 4;
+        stride = (stride < own ? stride : own) | 1;
+        const uint16_t att = sim.attenuation();
+        for (uint64_t k = 0;; k += stride) {
+          if (k > band - 1)
+            k = band - 1;
+          const double ms = static_cast<double>(i + k + 1) * 1000.0 / fs;
+          const uint16_t out = (k & 1) ? second : first;
+          emit(ms, out, att, add_marker(ms, MarkerKind::SsgInvert));
+          track_silence(ms, out);
+          if (k == band - 1)
+            break;
+        }
+        sim.skip(static_cast<uint32_t>(band));
+        i += band - 1;
+        continue;
+      }
     }
 
     if (!key_off_done && i >= gate_sample) {
@@ -291,14 +338,7 @@ inline CurveResult sample_curve(const CurveRequest &request) {
       // park detector; without this a curve that parked during sustain hold
       // would end here and lose its whole release segment.
       parked = false;
-      if (sim.output() >= kSilenceAttenuation) {
-        if (silence_start_ms < 0.0) {
-          silence_start_ms = ms;
-          silence_index = raw.size() - 1;
-        }
-      } else {
-        silence_start_ms = -1.0;
-      }
+      track_silence(ms, sim.output());
     }
 
     sim.step();
@@ -323,15 +363,7 @@ inline CurveResult sample_curve(const CurveRequest &request) {
         marked |= add_marker(ms, MarkerKind::SsgPhaseReset);
     }
     push_point(ms, marked);
-
-    if (sim.output() >= kSilenceAttenuation) {
-      if (silence_start_ms < 0.0) {
-        silence_start_ms = ms;
-        silence_index = raw.size() - 1;
-      }
-    } else {
-      silence_start_ms = -1.0;
-    }
+    track_silence(ms, sim.output());
 
     if (!parked && sim.is_static()) {
       parked = true;
