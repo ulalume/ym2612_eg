@@ -80,6 +80,49 @@ phase and an optional starting attenuation for retriggers.
 `NotePitch::from_midi()` follows megatoy's note table; `NotePitch{fnum, block}`
 takes raw register values.
 
+## Graph
+
+`ym2612_eg::graph` is the policy a drawn envelope needs on top of all that:
+how wide the time axis should be, the two traces to put on it, and where a
+sounding voice sits on them.
+
+```cpp
+using namespace ym2612_eg::graph;
+
+const EnvelopeCurve c = build_envelope_curve(req.op, req.pitch);
+c.span_ms;         // the time axis, in ms; both traces are simulated across it
+c.held;            // attack, decay and sustain, key never released
+c.release;         // a release from full volume, starting at t = 0
+c.attack_end_ms;   // ... and c.decay_end_ms, c.ssg_folds: where the line breaks
+c.peak_out;        // ... and c.sustain_out: levels to draw guides at
+c.warning;         // one line, or nullptr
+
+grid_step_ms(c.span_ms);   // a round label interval, 3-6 divisions
+
+// One voice: ms since key-on, and since key-off (negative while it is held).
+const VoiceCursor v = cursor_for_voice(c, 120.0, -1.0, c.span_ms);
+v.ms;               // where on the axis it is
+v.held_to_ms;       // how much of the held trace it has been through
+v.release_from_ms;  // where its release joins the drawn one
+v.silent_for_ms;    // 0 until it is inaudible; fade it out on this
+```
+
+The two traces share the axis and nothing else. Chaining them would mean
+inventing a key-off instant, which cuts the sustain at an arbitrary level, so
+the held trace is simulated with the key never released — the only way `SR`
+reads truthfully — and the release runs on its own from full volume.
+
+The axis is the envelope's own length ([NOTE.md](NOTE.md)), so every rate moves
+it and moves it one way. Pass `min_span_ms` to draw a second note's curve on
+the first one's axis rather than extrapolating it past its own window.
+
+`EnvelopeCurveCache` holds one operator's curve and rebuilds it when a register
+that shapes it changes, spacing expensive rebuilds by what the last one cost
+(`RebuildThrottle`, whose clock a test can replace). `VoiceCurveCache` keys the
+sounding notes on `key_scale_value()` instead of on the note, so a chord inside
+one octave shares a single curve and most note-ons simulate nothing; it builds
+at most `build_budget` curves per call and defers the rest.
+
 ## CMake
 
 ```cmake

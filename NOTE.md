@@ -56,6 +56,38 @@ it is pinned by `test_a_full_sustain_level_leaves_a_sixteen_unit_tail`. A
 caller that compresses the lifetime (as a time axis usually must) sees roughly
 half of it.
 
+## How wide the time axis gets
+
+`graph::choose_held_ms()` decides it from the closed forms and nothing else, so
+the width is a continuous function of every rate: there is no horizon for a slow
+envelope to cross, and no marker that has to have been seen for `SL` or `SR` to
+matter.
+
+- An envelope that finishes is drawn whole. The axis is `lifetime_ms()`, to the
+  last millisecond — not a compressed version of it.
+- A sustain that never ends has no length to be an axis. It draws a flat line,
+  and a flat line says the same thing at any width, so it takes `kFlatHoldShare`
+  of the graph and the attack and decay own the rest.
+- `kMaxHeldMs` caps an envelope that does finish, but it never cuts the attack
+  or the decay — they are the shape being read — so the width is floored at
+  `sustain_start_ms()`. A rate of 0 makes that floor infinite, which is not a
+  width, so `kMaxSpanMs` bounds it in turn.
+- An SSG loop is sized from `ssg_loop_period_ms()` instead, about
+  `kSsgLoopPeriods` of them. A loop is the one thing allowed past `kMaxHeldMs`,
+  up to `kLoopMaxAxisMs`: a graph that cannot fit one period of a loop shows
+  nothing about the loop.
+
+`build_envelope_curve()` then widens the axis to hold the release as well —
+unless the held trace loops, when the loop keeps its own scale
+(`kSsgSpanBudget`) and the release runs off the right edge rather than packing
+the cycles into a block.
+
+The one discontinuity left is deliberate. `SR = 0` is a few hundred
+milliseconds of flat hold; `SR = 1` is a sustain that really does end, after
+109 s on the worked example, so the ceiling takes it and the axis jumps
+thirtyfold for one register step. Every other step is monotone and moves the
+axis by less than a factor of two.
+
 ## Cost
 
 `sample_curve()` costs about 0.4 ms per second of simulated span, whatever the
