@@ -96,13 +96,11 @@ inline int key_scale_value(const OperatorParams &op, NotePitch pitch) {
 }
 
 // The internal attenuation at which this operator is at its LOUDEST, i.e. the
-// level a key-on starts a release from.
-//
-// Normally 0, the top of the scale.  With SSG-EG enabled and the attack bit
-// set (types 4-7) output() inverts, `(0x200 - A) & 0x3FF`, so the scale runs
-// the other way: 0 is the quietest point the ramp reaches and 0x200 is full
-// volume.  On key-on the inversion flag is clear, so the attack bit alone
-// decides.
+// level a key-on starts a release from. Normally 0, the top of the scale.
+// With SSG-EG enabled and the attack bit set (types 4-7) output() inverts,
+// `(0x200 - A) & 0x3FF`, so the scale runs the other way: 0 is the quietest
+// point the ramp reaches and 0x200 is full volume. On key-on the inversion
+// flag is clear, so the attack bit alone decides.
 inline uint16_t loudest_attenuation(const OperatorParams &op) {
   const bool inverted = (op.ssg & 0x08) != 0 && (op.ssg & 0x04) != 0;
   return inverted ? kSsgFoldAttenuation : uint16_t{0};
@@ -202,11 +200,10 @@ public:
   }
 
   // The SSG-EG alternate fold flips the inversion flag once per output sample,
-  // so while the attenuation stands still the output squares between two
-  // levels at the sample rate: a band, not a line.  Reports how many samples
-  // that lasts, 0 when the envelope is not in it.  `first` takes the level of
-  // the next output sample and `second` the level of the one after; from
-  // there the two repeat.
+  // so while attenuation stands still the output squares between two levels
+  // at the sample rate -- a band, not a line. Returns how many samples that
+  // lasts, 0 when not in it; `first`/`second` are the next two output levels,
+  // which then repeat.
   uint32_t alternating_samples(uint16_t &first, uint16_t &second) const {
     if (!ssg_enable_ || !ssg_alternate_ || ssg_hold_ || !keyed_on_ ||
         !keyed_on_at_start_ || att_ < kSsgFoldAttenuation)
@@ -323,9 +320,8 @@ public:
     if (!ssg_enable_ && (att_ & 0x3F0) == 0x3F0)
       return false;
     // A Decay that already satisfies the sustain test still has that
-    // transition ahead of it, and the phase changing is itself a change --
-    // reporting rest here ends a caller's run one tick early and swallows the
-    // Decay -> Sustain event.
+    // transition ahead of it: reporting rest here would end a caller's run
+    // one tick early and swallow the Decay -> Sustain event.
     if (phase_ == EgPhase::Decay && att_ >= sustain_att_)
       return false;
     return rate_[static_cast<int>(phase_)] == 0;

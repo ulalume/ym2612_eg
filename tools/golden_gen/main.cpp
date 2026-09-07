@@ -225,13 +225,13 @@ Verdict verify(const Case &c, const Trace &t, bool *out_differs) {
   if (has_sl0_instant_attack_divergence(eg)) {
     v.ok = false;
     v.why = "SL=0 with instant attack: Nuked spends the first EG tick on the "
-            "second state transition (see golden/DISCREPANCIES.md)";
+            "second state transition";
     return v;
   }
   if (has_ssg_sustain_window_divergence(c.op, eg)) {
     v.ok = false;
     v.why = "SSG-EG with a decay step > 15 can jump Nuked's 16-wide "
-            "Decay->Sustain equality window (see golden/DISCREPANCIES.md)";
+            "Decay->Sustain equality window";
     return v;
   }
   if (shift != 0 && counter_wraps(t.counter_phase, c.samples)) {
@@ -647,7 +647,7 @@ Scenario high_rate() {
                   "library follows the published table, Nuked latches the "
                   "timer's low bits one tick late, so these are compared with "
                   "the documented one-EG-tick counter shift -- exactly, not "
-                  "with a tolerance. See golden/DISCREPANCIES.md.";
+                  "with a tolerance.";
   // ksv = 2 at C4/KS=0, so every rate is 0 or 2 mod 4: the 2 mod 4 rows all
   // want the same -1 shift and the 0 mod 4 rows are constant.
   s.cases.push_back({"AR=28 (rate 58)", patch(28, 26, 24, 15, 4, 0, 0, 0),

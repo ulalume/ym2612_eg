@@ -1,19 +1,11 @@
 #pragma once
 
 // Closed-form answers about an envelope's shape: how long each phase of a
-// key-held note lasts, and how fast an SSG-EG loop runs.
-//
-// EgSimulator can answer both by being stepped until it stops moving, and
-// that is what verifies these; but a caller sizing a graph needs the answer
-// before it knows how far to simulate, and "how far did you look?" is a place
-// for an answer to change discontinuously.  A rate of 0 really does hold
-// forever, and saying so -- rather than reporting whatever a probe saw before
-// it gave up -- is the difference between SR = 0 and SR = 31.
-//
-// The post-attack phases are linear in attenuation, so each is one division.
-// The attack is not, so its recurrence is iterated: a couple of hundred table
-// slots, against the hundreds of thousands of samples the same stretch costs
-// to simulate.
+// key-held note lasts, and how fast an SSG-EG loop runs. A rate of 0 really
+// does hold forever, and says so exactly -- rather than reporting whatever a
+// probe saw before giving up -- which is the difference between SR = 0 and
+// SR = 31. The post-attack phases are linear in attenuation, so each is one
+// division; the attack is not, so its recurrence is iterated instead.
 
 #include "constants.hpp"
 #include "simulator.hpp"
@@ -39,7 +31,6 @@ inline int row_sum(int rate) {
 inline bool rate_advances(int rate) { return row_sum(rate) != 0; }
 
 /// The attenuation one EG tick adds, on average, at this effective rate.
-///
 /// increment_at() indexes kIncTable with three bits of the free-running EG
 /// counter taken from above rate_shift(), so across one turn of those bits
 /// each of the eight entries lands exactly once and their mean is the true
@@ -68,16 +59,13 @@ inline double linear_phase_ms(int rate, int from_att, int to_att, bool ssg,
   return ticks * 1000.0 / eg_hz;
 }
 
-/// How long the attack after a key-on takes, in ms.
-///
-/// The attack is the one phase that is not linear: it multiplies what is
-/// left, `att += (~att * inc) >> 4`, so there is no closed form and the
-/// recurrence is run instead.  It converges from 0x3FF in a couple of hundred
-/// table slots whatever the rate.
-///
-/// The attack an SSG-EG fold starts is a different one -- it resumes from
-/// 0x200, and its length depends on where the climb before it left the shared
-/// counter -- so ssg_ramp_ms() walks its own rather than calling this.
+/// How long the attack after a key-on takes, in ms. The attack is the one
+/// phase that is not linear: it multiplies what is left,
+/// `att += (~att * inc) >> 4`, so there is no closed form and the recurrence
+/// is run instead. The attack an SSG-EG fold starts is different -- it
+/// resumes from 0x200, and its length depends on where the climb before it
+/// left the shared counter -- so ssg_ramp_ms() walks its own rather than
+/// calling this.
 inline double attack_ms(int rate, double eg_hz) {
   // key_on() snaps these straight to att = 0; eg_step() guards on `rate < 62`.
   if (rate >= 62) {
@@ -136,29 +124,16 @@ struct EgWalk {
 /**
  * How long one SSG-EG ramp takes, in ms: the attack that follows a fold, then
  * the attenuation climbing back to the fold at 0x200 -- through the decay
- * rate as far as the sustain level and the sustain rate the rest of the way,
- * at SSG-EG's quadrupled increments.  Infinite when a rate the ramp needs
- * never advances, because then there is no next fold.
+ * rate to the sustain level and the sustain rate the rest of the way, at
+ * SSG-EG's quadrupled increments. Infinite when a rate the ramp needs never
+ * advances, because then there is no next fold.
  *
- * Walked slot by slot rather than divided like linear_phase_ms(), for two
- * reasons a division cannot reach:
- *
- *   - the decay does not stop *at* the sustain level, it stops at the first
- *     increment past it, and the sustain then has that much less of the scale
- *     left to cross.  Over a whole lifetime that overshoot is a rounding
- *     error, which is why phase_durations() may divide; over one loop ramp,
- *     where the sustain can be sixty attenuation units wide with SR far
- *     slower than DR, it moves the period by a sixth.
- *   - where the overshoot falls depends on the counter, and the counter is
- *     not reset by a fold.  So the loop settles into a cycle: each ramp hands
- *     the next one the counter phase it ended on, and after a ramp or two the
- *     same lengths come round again -- sometimes one length repeating,
- *     sometimes a pair alternating a fraction of a percent apart.  The first
- *     ramps are walked and thrown away to reach it, and the rest averaged,
- *     which is what sample_curve() does with its fold intervals.
- *
- * A couple of thousand iterations, against the tens of millions of samples
- * the same handful of ramps cost to simulate.
+ * Walked slot by slot rather than divided like linear_phase_ms(): the decay
+ * overshoots the sustain level by up to one increment, negligible over a
+ * whole lifetime but enough to shift a single ramp's length noticeably. The
+ * overshoot also depends on the counter, which a fold does not reset, so ramp
+ * lengths settle into a short repeating cycle rather than one value -- the
+ * first ramps are walked and discarded to reach it, and the rest averaged.
  */
 inline double ssg_ramp_ms(int ar, int dr, int sr, int sustain_att,
                           double eg_hz) {
@@ -215,13 +190,10 @@ inline double ssg_ramp_ms(int ar, int dr, int sr, int sustain_att,
 
 } // namespace detail
 
-/**
- * How long each phase of a key-held envelope lasts, in ms.
- *
- * A phase whose effective rate never advances lasts forever and says so, and
- * infinity is contagious through the sums below -- which is right: a phase
- * that never ends means the ones after it never start.
- */
+/// How long each phase of a key-held envelope lasts, in ms. A phase whose
+/// effective rate never advances lasts forever and says so, and infinity is
+/// contagious through the sums below -- which is right: a phase that never
+/// ends means the ones after it never start.
 struct PhaseDurations {
   double attack_ms = 0.0;
   /// Full volume down to the sustain level.  Zero when SL = 0, which the chip
@@ -265,18 +237,15 @@ inline PhaseDurations phase_durations(const OperatorParams &op, NotePitch pitch,
 /**
  * The visible period of an SSG-EG loop at `pitch`, in ms.
  *
- * Zero when the patch is not a looping mode at all -- SSG-EG off, or a hold
- * mode, which latches instead of folding: nothing is stalled, the shape
- * simply has no period.  Infinite when it is a looping mode whose ramp never
- * finishes, because a phase of it never advances: DR = 0 below the sustain
- * level, SR = 0 above it, or AR = 0 after the fold.  The envelope then never
- * folds again, which is not a slow loop but no loop -- exactly the case
+ * Zero when the patch is not a looping mode -- SSG-EG off, or a hold mode,
+ * which latches instead of folding. Infinite when it is a looping mode whose
+ * ramp never finishes because a phase never advances (DR = 0 below the
+ * sustain level, SR = 0 above it, or AR = 0 after the fold) -- the case
  * sample_curve() names SsgNeverLoops.
  *
- * One ramp is the internal attenuation climbing from 0 to the fold at 0x200,
- * plus the attack that follows each fold.  The alternating modes (bit 1 of
- * the SSG register) invert on every fold, so it takes two ramps to get back
- * to the shape the eye reads as one period.
+ * One ramp is the attenuation climbing from 0 to the fold at 0x200 plus the
+ * attack that follows; the alternating modes (bit 1 of the SSG register)
+ * invert on every fold, so two ramps make one visible period.
  */
 inline double ssg_loop_period_ms(const OperatorParams &op, NotePitch pitch,
                                  double clock_hz = kNtscClockHz) {

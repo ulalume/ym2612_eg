@@ -1,19 +1,11 @@
 #pragma once
 
 // Drawing policy over the simulator: one operator's registers turned into two
-// millisecond-accurate traces, the time axis wide enough to read them on,
-// where a sounding voice sits on that axis, and how often either may be
-// rebuilt.
-//
-// The two traces are independent, on one elapsed-time axis. Chaining them
-// would mean inventing a key-off instant, which cuts the sustain short at an
-// arbitrary time and then starts the release from whatever level that fiction
-// produced. So the held envelope is simulated with the key never released,
-// which is the only way SR reads truthfully (SR = 0 holds flat, SR > 0
-// crawls), and the release is simulated on its own from full volume.
-//
-// Nothing here draws: it is millisecond and attenuation arithmetic, and the
-// caller owns the pixels.
+// millisecond-accurate traces on one elapsed-time axis, where a sounding voice
+// sits on that axis, and how often either may be rebuilt. The two traces are
+// independent: the held envelope is simulated with the key never released,
+// the only way SR reads truthfully (SR = 0 holds flat, SR > 0 crawls); the
+// release is simulated on its own from full volume.
 
 #include "detail/constants.hpp"
 #include "detail/curve.hpp"
@@ -32,18 +24,9 @@
 
 namespace ym2612_eg::graph {
 
-/**
- * How wide the time axis may get, in ms. The one home for the question.
- *
- * kMinSpanMs is the narrowest axis worth drawing whatever the content says.
- * kMaxHeldMs is the widest an envelope that finishes is drawn at; kMinHeldMs
- * is the narrowest a loop is, since a loop carries its own time scale and an
- * audio-rate one widened to it would be a solid block of cycles.
- *
- * A loop is the one thing allowed past the ceiling, because a graph of a loop
- * that cannot fit one period shows nothing about the loop. kLoopVisiblePeriods
- * of a period stays on the axis however slow it is, up to kLoopMaxAxisMs.
- */
+/// How wide the time axis may get, in ms: kMinSpanMs is the narrowest axis
+/// worth drawing whatever the content says, kMinHeldMs the narrowest a loop is
+/// given, kMaxHeldMs the widest an envelope that finishes is drawn at.
 inline constexpr double kMinSpanMs = 25.0;
 inline constexpr double kMinHeldMs = 50.0;
 inline constexpr double kMaxHeldMs = 10000.0;
@@ -58,14 +41,11 @@ inline constexpr double kLoopMaxAxisMs = 20000.0;
 
 /// Roughly this many SSG loop periods are drawn.
 inline constexpr double kSsgLoopPeriods = 3.5;
-/// How much of a looping graph the release may claim. Past this the loop the
-/// release is compared against stops being readable, so the axis keeps the
-/// loop's scale and the release runs off the right edge instead.
+/// How much of a looping graph the release may claim; past this the axis keeps
+/// the loop's scale and the release runs off the right edge instead.
 inline constexpr double kSsgSpanBudget = 2.0;
 /// How long a release is simulated for. RR = 0 never reaches silence at all,
-/// so there has to be a ceiling; sampling stops the moment the envelope is at
-/// rest, so it only costs anything for the handful of release rates that
-/// genuinely run for seconds.
+/// so there has to be a ceiling.
 inline constexpr double kMaxReleaseMs = 10000.0;
 
 /// The first marker of `kind` on a trace, in ms, or negative when it has none.
@@ -78,7 +58,7 @@ inline double first_marker_ms(const CurveResult &curve, MarkerKind kind) {
   return -1.0;
 }
 
-/// Whether two register sets draw the same curve. Every field of the envelope,
+/// Whether two register sets draw the same curve: every field of the envelope,
 /// so the caches rebuild on a change of any of them and on nothing else.
 inline bool same_envelope(const OperatorParams &lhs, const OperatorParams &rhs) {
   return lhs.ar == rhs.ar && lhs.dr == rhs.dr && lhs.sr == rhs.sr &&
@@ -86,73 +66,41 @@ inline bool same_envelope(const OperatorParams &lhs, const OperatorParams &rhs) 
          lhs.ks == rhs.ks && lhs.ssg == rhs.ssg;
 }
 
-/// The release is simulated on its own terms: sampling stops at silence, so a
-/// generous ceiling costs nothing on a fast one, and tying it to the held
-/// window would let AR and DR change how long a release is drawn.
+/// The release's budget is its own: tying it to the held window would let AR
+/// and DR change how long a release is drawn.
 inline double release_max_ms() { return kMaxReleaseMs; }
 
-/**
- * The axis width the held envelope deserves: the end of its sustain.
- *
- * An envelope that finishes is drawn whole, to the last millisecond -- the
- * axis is the envelope's own length and nothing else. Two things bend it.
- *
- * A sustain that never ends has no length to give. It draws a flat line, and a
- * flat line says the same thing at any width, so it takes kFlatHoldShare of
- * the graph and the attack and decay own the rest.
- *
- * kMaxHeldMs is the widest an envelope that does finish is drawn at; past it
- * the far end of the sustain is off the right edge. The attack and the decay
- * are never cut by it, though -- they are the shape being read -- so the width
- * is floored at the instant the sustain begins, and only kMaxSpanMs stops that.
- */
+/// The axis width the held envelope deserves: the end of its sustain, floored
+/// at the instant the sustain begins so the attack and decay are never cut,
+/// and bounded by kMaxSpanMs.
 inline double window_for_timeline_ms(const PhaseDurations &phases) {
   const double sustain_start = phases.attack_ms + phases.decay_ms;
-  // A sustain that never ends draws a flat line, and a flat line says the same
-  // thing at any width. It gets a fixed share of the graph rather than a share
-  // of the axis it would otherwise decide -- which is why this case is a rule
-  // of its own rather than a limit on the one below.
+  // A sustain that never ends has no length to be the axis. It draws a flat
+  // line, which says the same thing at any width, so it takes a fixed share of
+  // the graph rather than a share of the axis it would otherwise decide.
   const double whole = std::isfinite(phases.sustain_ms)
                            ? sustain_start + phases.sustain_ms
                            : sustain_start / (1.0 - kFlatHoldShare);
-  // The ceiling never cuts the attack and decay: they are the shape being read,
-  // and an envelope whose attack alone outlasts the ceiling would otherwise be
-  // drawn without its own beginning. kMaxSpanMs is where that concession runs
-  // out -- a phase that never advances at all lasts forever, and forever is not
-  // a width -- so the floor is itself bounded by the widest axis there is.
+  // The ceiling never cuts the attack and decay, and kMaxSpanMs is where that
+  // concession runs out: a phase that never advances lasts forever, and
+  // forever is not a width.
   const double floor_ms = std::clamp(sustain_start, kMinHeldMs, kMaxSpanMs);
   return std::clamp(whole, floor_ms, kMaxSpanMs);
 }
 
-/**
- * How much of the held envelope is worth seeing at `pitch`, in ms.
- *
- * An SSG loop is sized from its period -- about kSsgLoopPeriods of them, which
- * reads as a loop without turning into a hatch pattern. Everything else is the
- * envelope's own phase durations put through window_for_timeline_ms().
- *
- * Both are closed forms over the registers, and that is the point: the width
- * is a continuous function of every rate, with no horizon for a slow envelope
- * to cross and no marker that has to have been seen for SL or SR to matter.
- *
- * A scale, not a length: the axis width is chosen from it and the envelope is
- * then drawn across the whole of that axis. Nothing here is a key-off.
- */
+/// How much of the held envelope is worth seeing at `pitch`, in ms: about
+/// kSsgLoopPeriods periods of an SSG loop, or otherwise the envelope's own
+/// phase durations via window_for_timeline_ms(). A scale, not a length: the
+/// envelope is drawn across the whole axis chosen from it. Nothing here is a
+/// key-off.
 inline double choose_held_ms(const OperatorParams &op, NotePitch pitch) {
   const double period = ssg_loop_period_ms(op, pitch);
-  // An infinite period is a ramp with a phase that never advances, which is
-  // not a slow loop but no loop: the fold never comes, and what the graph has
-  // to show is the phase that stalled. The policy below is the right one for
-  // it, exactly as it is for a patch with SSG-EG switched off.
+  // An infinite period is not a slow loop but no loop: the fold never comes,
+  // and what the graph has to show is the phase that stalled.
   if (period > 0.0 && std::isfinite(period)) {
     const double held = kSsgLoopPeriods * period;
-    // A loop carries its own time scale. Widening an audio-rate loop to
-    // kMinHeldMs would pack it into a solid block of cycles instead of showing
-    // its shape, so the periods are the floor.
-    //
-    // The ceiling gives way for a slow loop rather than the other way round: a
-    // graph of a loop that cannot fit one period of it shows nothing about the
-    // loop, and for these patches the loop is the whole content.
+    // A loop carries its own time scale, so the periods are the floor; and the
+    // ceiling gives way for a loop too slow to fit one period on it.
     const double ceiling = std::min(
         std::max(kMaxHeldMs, kLoopVisiblePeriods * period), kLoopMaxAxisMs);
     return std::clamp(held, std::min(kMinHeldMs, held), ceiling);
@@ -173,19 +121,16 @@ inline double silence_or_never(const CurveResult &curve) {
 }
 
 /// The slope the trace would be continued along past its last point, in
-/// attenuation units per ms. Zero when the envelope came to rest, and zero
-/// when the whole trace sits at one level: both are continued flat.
+/// attenuation units per ms; zero when it came to rest or sits at one level.
 inline double tail_slope(const CurveResult &curve, bool at_rest) {
   const auto &points = curve.points;
   if (at_rest || points.size() < 2) {
     return 0.0;
   }
   const CurvePoint &last = points.back();
-  // sample_curve() closes every polyline with a point at the end of the
-  // simulated span, which can repeat the level already there -- a final edge
-  // that is both very short and perfectly flat. Extrapolating a whole graph
-  // width from that would draw a flat line across an envelope that is plainly
-  // still moving, so measure from the last point at a different level instead.
+  // sample_curve() closes every polyline at the end of the simulated span,
+  // which can repeat the level already there -- a final edge both very short
+  // and perfectly flat -- so measure from the last point at a different level.
   std::size_t base = points.size() - 1;
   while (base > 0 && points[base - 1].out == last.out) {
     --base;
@@ -210,15 +155,10 @@ inline double grid_step_ms(double span_ms) {
   return detail::kGridSteps[std::size(detail::kGridSteps) - 1];
 }
 
-/**
- * The one warning worth showing, or nullptr. Only one patch defect earns a
- * line: an SSG-EG mode driven by an attack rate the hardware convention says
- * should be 31. Everything else the simulator flags is already visible in the
- * shape of the curve.
- */
+/// The one warning worth showing, or nullptr: an SSG-EG mode driven by an
+/// attack rate the hardware convention says should be 31. Everything else the
+/// simulator flags is already visible in the shape of the curve.
 inline const char *warning_line(const CurveResult &curve) {
-  // A ladder with one rung: putting a line back is a rung, ordered most broken
-  // first, and CurveWarning carries them all.
   for (const CurveWarning w : curve.warnings) {
     if (w == CurveWarning::SsgArBelow31) {
       return "AR<31: non-standard SSG-EG";
@@ -234,33 +174,27 @@ struct EnvelopeCurve {
   /// A release from full volume, starting at t = 0: drawn as a filled area.
   CurveResult release;
 
-  /// The width of the time axis the curve was simulated for -- the target the
-  /// drawing animates towards, not necessarily the width drawn this frame.
+  /// The width of the time axis the curve was simulated for.
   double span_ms = 0.0;
   double held_ms = 0.0; ///< the window the axis width was chosen from
-  /// Where the release polyline actually ends, which is where it reached
-  /// silence unless its budget ran out first; the axis is sized from it.
+  /// Where the release polyline ends: silence, unless its budget ran out
+  /// first. The axis is sized from it.
   double release_content_ms = 0.0;
 
-  /// The held envelope came to rest -- an SR = 0 hold, a frozen attack, a
-  /// sustain that reached silence -- so simulating it further would only
+  /// The held envelope came to rest, so simulating it further would only
   /// repeat one level.
   bool held_parked = false;
   /// The release was still falling when its budget ran out.
   bool release_truncated = false;
 
   /// The slope, in attenuation units per ms, a trace that stops before the
-  /// right-hand edge is continued along -- zero when it came to rest, which
-  /// continues it flat. A slope is exact rather than a guess: every
-  /// post-attack segment is linear in attenuation. It is a property of the
-  /// curve, so it is measured once here rather than by scanning back from the
-  /// last vertex every frame.
+  /// right-hand edge is continued along -- zero when it came to rest or sits
+  /// at one level. Exact: every post-attack segment is linear in attenuation.
   double held_tail_slope = 0.0;
   double release_tail_slope = 0.0;
 
   /// The first instant each trace is at or below the hardware mute floor and
-  /// stays there -- the Silence marker, lifted out so a live cursor does not
-  /// rescan the markers every frame. Infinite when the trace never gets there.
+  /// stays there. Infinite when the trace never gets there.
   double held_silence_ms = std::numeric_limits<double>::infinity();
   double release_silence_ms = std::numeric_limits<double>::infinity();
 
@@ -270,10 +204,6 @@ struct EnvelopeCurve {
   double decay_end_ms = -1.0;
 
   /// Every instant the held trace folds, in order -- an SSG-EG loop's teeth.
-  /// Lifted out of the markers because a live cursor needs the first and last
-  /// fold inside the axis on every voice of every operator of every frame, and
-  /// a loop dense enough to saturate the marker ceiling carries four thousand
-  /// of them.
   std::vector<float> ssg_folds;
 
   uint16_t peak_out = 0;    ///< output attenuation at full volume (TL * 8)
@@ -282,56 +212,37 @@ struct EnvelopeCurve {
   const char *warning = nullptr;
 };
 
-/**
- * Two passes over the simulator, and both of them are drawn: a release from
- * full volume, which shares only the time axis with the other; and -- once the
- * window policy and the release have decided how wide the axis is -- the held
- * trace, simulated across the whole of it so a loop keeps looping to the right
- * edge.
- *
- * Nothing else is simulated. How long each phase takes, how fast a loop runs
- * and which warning the patch earns are all closed forms over the registers:
- * phase_durations(), ssg_loop_period_ms(), warning_line().
- *
- * `min_span_ms` is the axis the curve will actually be DRAWN on, which for a
- * voice overlay is another curve's rather than its own; the held trace is
- * simulated across at least that much. Otherwise an overlay would have to be
- * extrapolated onto the part of the axis its own window policy did not reach,
- * and a sawtooth continued along the slope of its last ramp is not a sawtooth.
- *
- * A pure function of the operator and the note. Moving the axis smoothly is
- * the drawing's job, not this one's.
- */
+/// Two passes over the simulator: a release from full volume, which shares
+/// only the time axis with the other; and -- once the window policy and the
+/// release have decided how wide the axis is -- the held trace, simulated
+/// across the whole of it so a loop keeps looping to the right edge.
+/// `min_span_ms` is the axis the curve will actually be DRAWN on, which for a
+/// voice overlay is another curve's rather than its own; the held trace is
+/// simulated across at least that much, because a sawtooth extrapolated along
+/// the slope of its last ramp is not a sawtooth. A pure function of the
+/// operator and the note.
 inline EnvelopeCurve build_envelope_curve(const OperatorParams &op,
                                           NotePitch pitch,
                                           double min_span_ms = 0.0) {
   EnvelopeCurve out;
 
-  // 1. What the axis has to hold, from the registers alone. Nothing is
-  //    simulated to find it: every phase of the held envelope is answered in
-  //    closed form, and an SSG loop's period with it.
+  // 1. What the axis has to hold, in closed form over the registers alone.
   const double period_ms = ssg_loop_period_ms(op, pitch);
   const bool loops = period_ms > 0.0 && std::isfinite(period_ms);
   out.held_ms = choose_held_ms(op, pitch);
 
-  // 2. The release, on its own: keyed on at full volume and released on sample
-  //    zero. gate_ms = 0 routes it through the chip's real key-off rules --
-  //    the SSG inversion latch, the 4x increments, the hard cut at 0x200 --
-  //    which is why an SSG-EG patch's release is so much shorter than the same
-  //    patch without it. It shares nothing with the held trace but the axis.
+  // 2. The release, on its own: keyed on at full volume and released at once,
+  //    which routes it through the chip's real key-off rules -- the SSG
+  //    inversion latch, the 4x increments, the hard cut at 0x200. The gate is
+  //    a sample rather than zero because a key write takes a sample to reach
+  //    the envelope; released on sample zero the note never starts.
   //
   //    "Full volume" is one step short of loudest_attenuation(), not 0: with
   //    an inverted SSG-EG mode 0 is the quiet end of the ramp, and the loudest
   //    attenuation is the fold level itself, which an operator only ever
-  //    passes through -- reaching it re-triggers, and a hold mode latches
-  //    there. AR is zeroed for this run alone -- sample_curve() calls
-  //    key_on(), which snaps an instant attack straight to att = 0 and would
-  //    throw the start level away, and the release rate does not depend on AR.
-  //    The AttackFrozen warning that comes back with it is never read:
-  //    warning_line() is asked about the registers, not about any run.
-  //
-  //    The gate is short rather than zero because a key write takes a sample
-  //    to reach the envelope; released on sample zero the note never starts.
+  //    passes through. AR is zeroed for this run alone -- key_on() snaps an
+  //    instant attack straight to att = 0 and would throw the start level
+  //    away, and the release rate does not depend on AR.
   CurveRequest release;
   release.op = op;
   release.op.ar = 0;
@@ -342,8 +253,8 @@ inline EnvelopeCurve build_envelope_curve(const OperatorParams &op,
   release.start_att = loudest > 0 ? static_cast<uint16_t>(loudest - 1) : 0;
   out.release = sample_curve(release);
   // The key reaches the envelope one sample after the write, so the samples
-  // before that carry a level the note never sounds at. Drop them and put the
-  // first sounding one at the origin the trace is drawn from.
+  // before that carry a level the note never sounds at: drop them and put the
+  // first sounding one at the origin.
   {
     const float settled =
         static_cast<float>(1000.0 / sample_rate_hz(kNtscClockHz));
@@ -371,36 +282,19 @@ inline EnvelopeCurve build_envelope_curve(const OperatorParams &op,
   // 3. The axis has to hold both traces -- but neither may crush the other. A
   //    loop keeps its own scale, and a release much longer than the held
   //    envelope is allowed to run off the right edge rather than flatten the
-  //    part being edited.
-  //
-  //    The width is simply the content it has to hold, at full precision: a
-  //    slider drag does not make the axis breathe because the drawing animates
-  //    towards it, not because the answer has been rounded off.
-  // A loop keeps its own scale -- its release is beside the point next to the
-  // cycles. Everything else takes the longer of the two: a release is as much
-  // the envelope as the sustain is, and cutting it short to protect the held
-  // part would answer "how long does this note ring" with a shrug.
+  //    part being edited. The width is the content itself, at full precision.
   double content = std::max(out.held_ms, out.release_content_ms);
   if (loops && out.held_ms > 0.0) {
     content = std::min(content, out.held_ms * kSsgSpanBudget);
   }
   out.span_ms = std::max(content, kMinSpanMs);
 
-  // 4. The held trace itself, simulated across the WHOLE axis rather than only
-  //    as far as the window policy asked for. Still no key-off, so SR = 0
-  //    holds flat and SR > 0 shows its real slow decay rather than a level
-  //    some invented gate stopped it at.
-  //
-  //    A looping patch is the reason this runs to the edge instead of being
-  //    extrapolated there: a sawtooth continued along the slope of its last
-  //    ramp is not a sawtooth. But gate_ms < 0 means more to sample_curve()
-  //    than "never released" -- it also licenses it to stop as soon as there
-  //    is nothing new to see, which for a loop is after five periods, leaving
-  //    the trace in mid-air. So a loop is given a key-off just past the end of
-  //    the window instead: none of it falls inside the graph, and no early exit
-  //    either. Everything else keeps the held-forever run, whose early exit is
-  //    at the park -- where the envelope really has come to rest and the flat
-  //    tail below is exact.
+  // 4. The held trace, simulated across the WHOLE axis rather than only as far
+  //    as the window policy asked for. Still no key-off, so SR = 0 holds flat
+  //    and SR > 0 shows its real decay. gate_ms < 0 means more to
+  //    sample_curve() than "never released": it also stops early once a loop
+  //    has repeated five periods, leaving the trace in mid-air -- so a loop
+  //    gets a key-off just past the end of the window instead, off the graph.
   CurveRequest request;
   request.op = op;
   request.pitch = pitch;
@@ -408,7 +302,7 @@ inline EnvelopeCurve build_envelope_curve(const OperatorParams &op,
   request.gate_ms = loops ? request.max_ms + 1.0 : -1.0;
   out.held = sample_curve(request);
   // A finite park is exactly "the trace ended because there was nothing left
-  // to draw" -- continue it flat rather than along a slope of zero noise.
+  // to draw" -- continue it flat.
   out.held_parked = std::isfinite(out.held.park_ms);
 
   out.attack_end_ms = first_marker_ms(out.held, MarkerKind::AttackEnd);
@@ -421,9 +315,7 @@ inline EnvelopeCurve build_envelope_curve(const OperatorParams &op,
     }
   }
 
-  // Silence is only raised once the trace has come to rest, which is the
-  // question a fading cursor asks: is this voice finished, or just quiet on
-  // its way somewhere?
+  // Silence is only raised once the trace has come to rest.
   out.held_silence_ms = detail::silence_or_never(out.held);
   out.release_silence_ms = detail::silence_or_never(out.release);
 
@@ -459,8 +351,7 @@ inline double curve_out_at_ms(const CurveResult &curve, double ms) {
     return points.back().out;
   }
   // Binary search rather than a walk: an SSG trace reduced to one bucket per
-  // slot carries thousands of points, and this runs once per voice per
-  // operator per frame.
+  // slot carries thousands of points, and this runs once per voice per frame.
   std::size_t lo = 0;
   std::size_t hi = points.size() - 1;
   while (hi - lo > 1) {
@@ -482,19 +373,12 @@ inline double curve_out_at_ms(const CurveResult &curve, double ms) {
          (static_cast<double>(points[hi].out) - points[lo].out) * u;
 }
 
-/**
- * Where on a release trace a release from attenuation `out` begins.
- *
- * The release is linear in attenuation, so a note let go at level L follows
- * precisely the trace that is already on screen -- entered later. Finding that
- * entry point is therefore exact, and there is no second release curve to
- * build per voice: the first instant the trace reaches `out` IS where the
- * voice joins it.
- *
- * Takes the trace rather than the whole curve, so the same question can be put
- * to a release the simulator really ran and the two answers compared without a
- * second copy of the interpolation to disagree with.
- */
+/// Where on a release trace a release from attenuation `out` begins: the
+/// release is linear in attenuation, so a note let go at level L follows
+/// precisely the trace already on screen, entered later -- the first instant
+/// the trace reaches `out` IS where the voice joins it. Takes the trace rather
+/// than the whole curve, so the same question can be put to a release the
+/// simulator really ran.
 inline double release_entry_ms(const CurveResult &release, double out) {
   const auto &points = release.points;
   if (points.empty()) {
@@ -503,10 +387,8 @@ inline double release_entry_ms(const CurveResult &release, double out) {
   if (out <= points.front().out) {
     return points.front().ms;
   }
-  // A linear scan, because a release trace is a straight ramp in attenuation
-  // and RDP decimates it to a handful of vertices. Interpolating inside the
-  // crossing edge is therefore exact rather than approximate: the polyline IS
-  // the line.
+  // A release trace is a straight ramp in attenuation and RDP decimates it to
+  // a handful of vertices, so interpolating inside the crossing edge is exact.
   for (std::size_t i = 1; i < points.size(); ++i) {
     const double a0 = points[i - 1].out;
     const double a1 = points[i].out;
@@ -525,9 +407,8 @@ inline double release_entry_ms(const CurveResult &release, double out) {
 
 /// Where a sounding voice is on its own envelope.
 struct VoiceCursor {
-  /// x on the graph's time axis, in ms. Past the end of the axis for a voice
-  /// that has outrun it -- such a cursor is not drawn rather than being pinned
-  /// to the edge.
+  /// x on the graph's time axis, in ms; past the end of the axis for a voice
+  /// that has outrun it, which is not drawn rather than pinned to the edge.
   double ms = 0.0;
   /// The voice is past key-off and riding the release trace.
   bool released = false;
@@ -538,32 +419,24 @@ struct VoiceCursor {
   /// Negative while the key is still down.
   double release_from_ms = -1.0;
   /// Where on the graph that release is drawn from: the instant the key came
-  /// up, on the held trace's own time axis. The release keeps the shape it has
-  /// on the release trace but is drawn from here, so the cursor carries
-  /// straight on instead of jumping across the graph. Negative while held.
+  /// up, on the held trace's own time axis. Negative while held.
   double release_origin_ms = -1.0;
-  /// How much of the held trace this voice has actually been through: a note
-  /// draws the road it has travelled, not the road ahead. It only ever grows,
-  /// and stops growing at key-off -- a loop that has already come round once
-  /// has been through all of it, so it keeps the whole thing.
+  /// How much of the held trace this voice has actually been through. It only
+  /// ever grows, and stops growing at key-off.
   double held_to_ms = 0.0;
 };
 
-/**
- * Fold the elapsed time into the loop the axis draws.
- *
- * Returns `elapsed_ms` unchanged unless the held trace loops and the cursor
- * has run past the last whole period on the axis. The first fold anchors the
- * phase: everything before it is the attack the loop only performs once.
- */
+/// Fold the elapsed time into the loop the axis draws. Returns `elapsed_ms`
+/// unchanged unless the held trace loops and the cursor has run past the last
+/// whole period on the axis. The first fold anchors the phase: everything
+/// before it is the attack the loop only performs once.
 inline double wrapped_into_loop_ms(const EnvelopeCurve &curve, double elapsed_ms,
                                    double axis_span_ms) {
   if (!(curve.held.loop_hz > 0.0) || !(axis_span_ms > 0.0) ||
       curve.ssg_folds.empty()) {
     return elapsed_ms;
   }
-  // The folds are in order, so the last one on the axis is a search rather
-  // than a sweep of every marker the curve carries.
+  // The folds are in order, so the last one on the axis is a search.
   const auto past_edge = std::upper_bound(
       curve.ssg_folds.begin(), curve.ssg_folds.end(), axis_span_ms,
       [](double edge, float fold) { return edge < fold; });
@@ -580,17 +453,13 @@ inline double wrapped_into_loop_ms(const EnvelopeCurve &curve, double elapsed_ms
   return first_fold + std::fmod(elapsed_ms - first_fold, window);
 }
 
-/**
- * The cursor for one voice, given how long ago its key went down and (if it
- * has) come up. `since_key_off_ms` is negative while the key is still held.
- *
- * Two rules decide everything:
- *
- *   - the cursor advances only while the envelope is CHANGING, so an SR = 0
- *     patch's cursor waits at the park rather than sliding along a flat line;
- *   - on key-off it moves to the release trace, at the point where that trace
- *     is already at the level the voice actually had, and advances from there.
- */
+/// The cursor for one voice, given how long ago its key went down and (if it
+/// has) come up. `since_key_off_ms` is negative while the key is still held.
+///   - the cursor advances only while the envelope is CHANGING, so an SR = 0
+///     patch's cursor waits at the park rather than sliding along a flat line;
+///   - on key-off it moves to the release trace, at the point where that
+///     trace is already at the level the voice actually had, and advances
+///     from there.
 inline VoiceCursor cursor_for_voice(const EnvelopeCurve &curve,
                                     double since_key_on_ms,
                                     double since_key_off_ms,
@@ -621,9 +490,7 @@ inline VoiceCursor cursor_for_voice(const EnvelopeCurve &curve,
         std::min(std::max(held_ms - released_for, 0.0), park_ms);
     // The AUDIBLE level, not the internal one: on key-off an inverted SSG-EG
     // mode latches what was being heard into the attenuation, so a release
-    // continues from the level the ear was on. Matching the internal value
-    // would enter the trace wherever that number happens to sit -- which for
-    // an inverted mode is somewhere else entirely.
+    // continues from the level the ear was on.
     const double out = curve_out_at_ms(curve.held, at_key_off_ms);
     // The release from that level is not a new curve: it is the drawn one,
     // entered at the point where it is already at that level.
@@ -644,10 +511,8 @@ inline VoiceCursor cursor_for_voice(const EnvelopeCurve &curve,
   }
 
   if (!cursor.released) {
-    // A loop never parks -- the note goes round and round for as long as it is
-    // held -- so the cursor goes round with it rather than stopping at the
-    // right-hand edge while the sound carries on. It wraps over the whole
-    // periods the axis holds, so it sweeps the drawn cycles and starts again.
+    // A loop never parks, so the cursor wraps with it instead of stopping at
+    // the right-hand edge while the sound carries on.
     on_trace_ms = wrapped_into_loop_ms(curve, on_trace_ms, axis_span_ms);
   }
 
@@ -664,43 +529,29 @@ inline VoiceCursor cursor_for_voice(const EnvelopeCurve &curve,
   return cursor;
 }
 
-/**
- * The curves of the notes being played, keyed on (registers, ksv) rather than
- * on the note: an operator's envelope depends on the note ONLY through
- * `ksv = keycode >> (3 - KS)`, so with KS = 0 the whole keyboard has four
- * distinct entries and a chord inside one octave shares a single one.
- *
- * At most six entries, because at most six voices can sound; the least
- * recently asked-for is evicted. Entries are held by value in a fixed array,
- * so a reference handed out stays valid across later get() calls.
- */
+/// The curves of the notes being played, keyed on (registers, ksv) rather
+/// than on the note: an operator's envelope depends on the note ONLY through
+/// `ksv = keycode >> (3 - KS)`, so with KS = 0 the whole keyboard has four
+/// distinct entries and a chord inside one octave shares a single one. At
+/// most six entries, because at most six voices can sound; the least
+/// recently asked-for is evicted. Entries are held by value in a fixed array,
+/// so a reference handed out stays valid across later get() calls.
 class VoiceCurveCache {
 public:
   static constexpr std::size_t kMaxEntries = 6;
 
-  /**
-   * The curve for `op` at `pitch`, drawn on `reference`'s axis, where
-   * `reference` is the curve of the same registers at `reference_pitch`.
-   *
-   * Returns `reference` itself when the two share a key-scale value, and the
-   * cached entry when there is one -- neither costs a simulation, which is
-   * why a note-on is usually free. The whole cache is dropped when the
-   * registers or the reference change, because every entry would have been
-   * stale anyway.
-   *
-   * When a curve does have to be built, one is taken out of `build_budget`;
-   * with none left this returns nullptr and the caller leaves that voice for
-   * the next frame. Simulating the slowest envelope the chip can produce takes
-   * about twelve milliseconds, so an arpeggio across four operators would
-   * otherwise drop several frames at once. A voice that waits a frame or two
-   * for its curve is invisible; a stutter is not.
-   */
+  /// The curve for `op` at `pitch`, drawn on `reference`'s axis, where
+  /// `reference` is the curve of the same registers at `reference_pitch`.
+  /// Returns `reference` itself when the two share a key-scale value, or a
+  /// cached entry when there is one -- neither costs a simulation. The whole
+  /// cache is dropped when the registers or the reference change. Building a
+  /// curve costs one unit of `build_budget`; with none left this returns
+  /// nullptr and the caller leaves that voice for the next frame.
   const EnvelopeCurve *get(const OperatorParams &op, NotePitch pitch,
                            const EnvelopeCurve &reference,
                            NotePitch reference_pitch, int &build_budget);
 
-  /// Curves actually simulated, and entries held. Whether a cache caches is
-  /// not visible in its answers, so it is reported here instead.
+  /// Curves actually simulated, and entries held.
   int rebuild_count() const { return rebuilds_; }
   std::size_t size() const { return used_; }
 
@@ -743,9 +594,8 @@ inline const EnvelopeCurve *VoiceCurveCache::get(const OperatorParams &op,
 
   const int ksv = key_scale_value(op, pitch);
   // The note reaches the envelope only through ksv, so a voice that shares the
-  // reference note's is drawn by the curve already on screen. With KS = 0 --
-  // what most patches use -- that is a whole two octaves either side of the
-  // reference, which is why a note-on usually costs nothing at all.
+  // reference note's is drawn by the curve already on screen. With KS = 0 that
+  // is a whole two octaves either side of the reference.
   if (ksv == key_scale_value(op, reference_pitch)) {
     return &reference;
   }
@@ -785,46 +635,20 @@ inline const EnvelopeCurve *VoiceCurveCache::get(const OperatorParams &op,
 
 // ------------------------------------------------- how often to rebuild
 
-/**
- * How much of a frame one operator's graph may spend rebuilding its curve,
- * and the frame that budget is per.
- *
- * A rebuild costs whatever the patch costs to simulate, and the patches are
- * not close to each other. Over a sweep of 18 900 of them the median curve
- * takes 0.7 ms and the slowest fifteen, and the two populations are separated
- * by an obvious valley: 288 patches land between 1.5 and 2.0 ms against 3 991
- * below 0.1 ms and 2 577 between 3.5 and 4.0. An ordinary ADSR patch measures
- * 0.9-1.1 ms and an SSG-EG one 4.0 ms, one on each side of it.
- *
- * The budget is that valley, so the common case is not throttled at all -- it
- * would have to become half again as slow before it were. Four operators can
- * be dragged at once, so four rebuilds can land on one frame: the budget is
- * per operator, and four of them is 6 ms of a 16.7 ms frame. That is the
- * ceiling the whole graph is held to while a value is moving, and an ordinary
- * patch -- 3.6 ms a frame for four operators -- is already inside it.
- */
+/// How much of a frame one operator's graph may spend rebuilding its curve,
+/// and the frame that budget is per: enough that an ordinary patch is never
+/// throttled, and little enough to bound four SSG-EG patches dragged at once.
 inline constexpr double kRebuildBudgetMs = 1.5;
 inline constexpr double kRebuildBudgetPeriodMs = 1000.0 / 60.0;
-/**
- * ... and the longest the graph may lag the registers however expensive the
- * curve is. 13.5 ms of work is where the budget's own spacing reaches this,
- * and only a handful of patches in the sweep cost that much: below it the
- * ceiling never binds at all, and above it the graph would stop looking slow
- * and start looking frozen.
- */
+/// ... and the longest the graph may lag the registers however expensive the
+/// curve is: below this the throttle just makes a drag feel less smooth,
+/// above it the graph would look frozen rather than slow.
 inline constexpr double kMaxRebuildDeferMs = 150.0;
 
-/**
- * Whether a rebuild is allowed to happen yet, from what the last one cost.
- *
- * A rebuild that fits the budget is simply done every frame -- the interval it
- * earns is shorter than a frame, so the test never refuses one. An expensive
- * one is spaced out in proportion to what it costs, which is the whole policy:
- * a curve that takes k times the budget waits k frames, so every patch spends
- * the same share of the machine however slow it is to simulate. Nothing here
- * knows about a frame; it is told the time and what the work cost, and answers
- * when the next one may run.
- */
+/// Whether a rebuild is allowed to happen yet, from what the last one cost: a
+/// curve that takes k times the budget is spaced k frames apart, so every
+/// patch spends the same share of the machine however slow it is to
+/// simulate. Nothing here knows about a frame, only the time and the cost.
 class RebuildThrottle {
 public:
   /// How long a rebuild costing `cost_ms` earns itself before the next one.
@@ -881,22 +705,11 @@ inline double steady_now_ms() {
   return std::chrono::duration<double, std::milli>(since_epoch).count();
 }
 
-/**
- * Remembers one operator's curve and rebuilds it only when the registers that
- * shape it (or the note) actually change.
- *
- * A drag changes them every frame, though, and then the compare says "rebuild"
- * every frame too. For an ordinary patch that is what should happen and what
- * still does. For the expensive ones it is not affordable, so a rebuild the
- * throttle has not licensed yet is skipped and last frame's curve handed back
- * again -- exactly what the graph already shows between frames, and what the
- * cursors and the voice overlays are already drawn against.
- *
- * The one thing that must never be deferred is the value the drag ends on. So
- * a request the cache saw on the previous frame as well is built whatever the
- * throttle says: a value that has stopped moving is the user's answer, and it
- * is on screen exactly one frame later.
- */
+/// Remembers one operator's curve and rebuilds it only when the registers (or
+/// the note) actually change. While dragging, a rebuild the throttle has not
+/// licensed yet is skipped and last frame's curve handed back instead --
+/// except the value a drag ends on is always built the frame after it stops
+/// moving, whatever the throttle says.
 class EnvelopeCurveCache {
 public:
   const EnvelopeCurve &get(const OperatorParams &op, NotePitch pitch);

@@ -7,8 +7,6 @@
 // values it used into the JSON, and the test recomputes them from the case
 // parameters and refuses to run if they disagree.  A vector can therefore never
 // smuggle in a hand-fitted alignment.
-//
-// See golden/DISCREPANCIES.md for the measurements these rules come from.
 
 #include <ym2612_eg/ym2612_eg.hpp>
 
@@ -54,9 +52,9 @@ inline bool row_is_constant(int rate) {
 // EG_SPEC 4 [DIFF].  For rate >= 48 Nuked does not use the published 64x8
 // table: it computes the increment from eg_stephi[rate & 3][eg_timer_low_lock],
 // and eg_timer_low_lock is a pipeline-latched copy of the timer.  Measured
-// against full Nuked traces for every rate 44..63 (golden/DISCREPANCIES.md),
-// the result is exactly a one-EG-tick rotation of the table row, in a direction
-// that depends only on rate % 4:
+// against full Nuked traces for every rate 44..63, the result is exactly a
+// one-EG-tick rotation of the table row, in a direction that depends only on
+// rate % 4:
 //
 //   row constant   -> no constraint at all
 //   rate < 48      -> agrees with the table exactly, so the shift must be 0
@@ -111,7 +109,7 @@ inline int counter_shift_for_case(const EgSimulator &eg, bool *mixed) {
 // instant attack (rate >= 62 forces att = 0 at key-on): SL = 0 then needs both
 // transitions and Nuked loses one increment, leaving it exactly one EG tick
 // behind us for the rest of the note.  Such cases are excluded from the
-// vectors; see golden/DISCREPANCIES.md.
+// vectors.
 inline bool has_sl0_instant_attack_divergence(const EgSimulator &eg) {
   return eg.rate_of(EgPhase::Attack) >= 62 && eg.sustain_attenuation() == 0;
 }

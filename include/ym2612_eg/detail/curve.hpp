@@ -279,10 +279,9 @@ inline CurveResult sample_curve(const CurveRequest &request) {
 
   for (uint64_t i = 0; i < max_samples; ++i) {
     // Across a stretch the simulator cannot move through, every sample repeats
-    // the last one: no event, no vertex the dedup would keep, no change of
-    // silence or park state.  Cross it whole.  The two samples that are not
-    // part of such a stretch are the one a still-unrecorded park lands on and
-    // the one the key-off lands on.
+    // the last one -- no event, no vertex, no change of silence or park state
+    // -- so it can be crossed whole. The exceptions are the sample an
+    // unrecorded park lands on and the one key-off lands on.
     if (parked || !sim.is_static()) {
       uint64_t room = max_samples - i;
       if (!key_off_done)
@@ -294,12 +293,11 @@ inline CurveResult sample_curve(const CurveRequest &request) {
         continue;
       }
 
-      // The alternate fold squares the output between two levels at the sample
-      // rate, so the picture is a band and a vertex per sample only redraws
-      // its two edges.  Teeth spread over the axis so far carry the same band;
-      // the stride is odd so that consecutive teeth keep alternating, and the
-      // run's first and last samples are always drawn so the curve joins what
-      // comes before and after unchanged.
+      // The alternate fold squares the output between two levels at the
+      // sample rate, so a vertex per sample only redraws two edges of a band.
+      // Teeth spread over the axis carry the same band; the stride is odd so
+      // consecutive teeth keep alternating, and the run's first and last
+      // samples are always drawn so the curve joins cleanly.
       uint16_t first = 0, second = 0;
       const uint64_t band =
           std::min<uint64_t>(sim.alternating_samples(first, second), room);

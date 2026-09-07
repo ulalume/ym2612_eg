@@ -6,7 +6,7 @@
 //
 //   ym2612_eg_golden_test <path-to-vector.json>
 //
-// Comparison policy (see golden/DISCREPANCIES.md for the evidence):
+// Comparison policy:
 //   * eg_level vs attenuation()  -- exact, at every output sample.
 //   * eg_out   vs output()       -- exact, at every sample, allowing for
 //                                   Nuked's one-sample eg_out pipeline lag,
@@ -96,7 +96,7 @@ void run_case(const jsonlite::Value &c) {
   ++testing::g_checks;
 
   // Combinations this library is known to disagree with must never reach a
-  // vector; golden/DISCREPANCIES.md explains each one.
+  // vector.
   const char *excluded = nullptr;
   if (has_sl0_instant_attack_divergence(eg))
     excluded = "SL=0 with instant attack";
