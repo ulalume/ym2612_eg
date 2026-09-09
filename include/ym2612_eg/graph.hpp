@@ -5,7 +5,9 @@
 // sits on that axis, and how often either may be rebuilt. The two traces are
 // independent: the held envelope is simulated with the key never released,
 // the only way SR reads truthfully (SR = 0 holds flat, SR > 0 crawls); the
-// release is simulated on its own from full volume.
+// release is simulated on its own from full volume. The solvers at the end
+// run the other way, from a phase length back to the register value that
+// comes closest to it, which is what a dragged handle needs.
 
 #include "detail/constants.hpp"
 #include "detail/curve.hpp"
@@ -774,6 +776,145 @@ inline const EnvelopeCurve &EnvelopeCurveCache::get(const OperatorParams &op,
   ++rebuilds_;
   throttle_.note_rebuild(now_ms, now_ms_() - now_ms);
   return curve_;
+}
+
+// ------------------------------------------------- from a shape to a value
+
+namespace detail {
+
+/// Half an EG tick, in ms: the shortest length the closed forms tell apart.
+/// A phase they report as zero is not instantaneous but over within one tick,
+/// and a ratio match needs a positive length to stand in for it.
+inline constexpr double kInstantMs = 500.0 / eg_rate_hz(kNtscClockHz);
+
+/// The candidate in `slowest`..`fastest` whose phase lasts closest to
+/// `target_ms` in RATIO, `duration` being that phase's length in ms for one
+/// candidate. A time axis reads logarithmically, so matching the linear
+/// difference instead would put the whole fast end of the range out of a
+/// drag's reach. Candidates whose phase never advances are skipped, and when
+/// none advances the answer is the slowest; ties go to the slower value, so
+/// dragging a handle outward does not stick.
+template <typename Duration>
+uint8_t nearest_rate(int slowest, int fastest, double target_ms,
+                     Duration duration) {
+  if (!(target_ms > 0.0) || !std::isfinite(target_ms)) {
+    return static_cast<uint8_t>(fastest);
+  }
+  const auto log_length = [](double ms) {
+    return std::log(std::max(ms, kInstantMs));
+  };
+  const double log_target = log_length(target_ms);
+  int best = slowest;
+  double best_distance = std::numeric_limits<double>::infinity();
+  for (int candidate = slowest; candidate <= fastest; ++candidate) {
+    const double ms = duration(candidate);
+    if (!std::isfinite(ms)) {
+      continue;
+    }
+    const double distance = std::fabs(log_length(ms) - log_target);
+    if (distance < best_distance) {
+      best_distance = distance;
+      best = candidate;
+    }
+  }
+  return static_cast<uint8_t>(best);
+}
+
+/// How long a release from full volume takes to reach silence, in ms. It is
+/// the one phase PhaseDurations does not carry -- a held key never gets
+/// there -- and like the sustain it is linear in attenuation, up to the level
+/// at which the chip cuts the output dead. An inverted SSG-EG release is the
+/// same length: key-off mirrors the level about the fold, so it climbs the
+/// same distance.
+inline double release_ms(const OperatorParams &op, NotePitch pitch) {
+  const bool ssg = (op.ssg & 0x08) != 0;
+  const int end_att = ssg ? static_cast<int>(kSsgFoldAttenuation) : 0x3F0;
+  const int rate = ym2612_eg::detail::effective_rate(
+      2 * (op.rr & 0x0F) + 1, key_scale_value(op, pitch));
+  return ym2612_eg::detail::linear_phase_ms(rate, 0, end_att, ssg,
+                                            eg_rate_hz(kNtscClockHz));
+}
+
+} // namespace detail
+
+/// The register value whose phase lasts closest to `target_ms` at `pitch`,
+/// every other register left as `op` has it. `target_ms` is the length of
+/// that phase alone, not a position on the time axis: the attack, the decay
+/// down to the sustain level, the sustain from there to silence, and a
+/// release from full volume to silence.
+///
+/// AR, DR and SR are searched over 1..31 and never answer 0, which is not a
+/// slow rate but a phase that never advances -- whether a drag means that is
+/// the caller's decision, not the library's. RR is 4 bits and its effective
+/// rate is 2*RR+1, so every one of 0..15 finishes.
+inline uint8_t solve_attack_rate(const OperatorParams &op, NotePitch pitch,
+                                 double target_ms) {
+  OperatorParams probe = op;
+  return detail::nearest_rate(1, 31, target_ms, [&](int rate) {
+    probe.ar = static_cast<uint8_t>(rate);
+    return phase_durations(probe, pitch).attack_ms;
+  });
+}
+
+inline uint8_t solve_decay_rate(const OperatorParams &op, NotePitch pitch,
+                                double target_ms) {
+  OperatorParams probe = op;
+  return detail::nearest_rate(1, 31, target_ms, [&](int rate) {
+    probe.dr = static_cast<uint8_t>(rate);
+    return phase_durations(probe, pitch).decay_ms;
+  });
+}
+
+inline uint8_t solve_sustain_rate(const OperatorParams &op, NotePitch pitch,
+                                  double target_ms) {
+  OperatorParams probe = op;
+  return detail::nearest_rate(1, 31, target_ms, [&](int rate) {
+    probe.sr = static_cast<uint8_t>(rate);
+    return phase_durations(probe, pitch).sustain_ms;
+  });
+}
+
+inline uint8_t solve_release_rate(const OperatorParams &op, NotePitch pitch,
+                                  double target_ms) {
+  OperatorParams probe = op;
+  return detail::nearest_rate(0, 15, target_ms, [&](int rate) {
+    probe.rr = static_cast<uint8_t>(rate);
+    return detail::release_ms(probe, pitch);
+  });
+}
+
+/// The total level nearest `out_attenuation`: TL is the top 7 bits of the
+/// 10-bit attenuation, so one step is 8 units. Anything off the scale, NaN
+/// included, clamps.
+inline uint8_t solve_total_level(double out_attenuation) {
+  const double steps = out_attenuation / 8.0;
+  if (!(steps > 0.0)) {
+    return 0;
+  }
+  if (!(steps < 127.0)) {
+    return 127;
+  }
+  return static_cast<uint8_t>(std::lround(steps));
+}
+
+/// The sustain level whose attenuation, TL included, is nearest
+/// `out_attenuation`. The levels are 32 units apart except SL = 15, which is
+/// 0x3E0 rather than 480; ties go to the louder level.
+inline uint8_t solve_sustain_level(const OperatorParams &op,
+                                   double out_attenuation) {
+  const double tl_att = static_cast<double>(op.tl & 0x7F) * 8.0;
+  int best = 0;
+  double best_distance = std::numeric_limits<double>::infinity();
+  for (int sl = 0; sl < 16; ++sl) {
+    const double distance =
+        std::fabs(static_cast<double>(sustain_attenuation(sl)) + tl_att -
+                  out_attenuation);
+    if (distance < best_distance) {
+      best_distance = distance;
+      best = sl;
+    }
+  }
+  return static_cast<uint8_t>(best);
 }
 
 } // namespace ym2612_eg::graph

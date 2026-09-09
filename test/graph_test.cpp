@@ -1614,6 +1614,395 @@ void test_key_scaling_follows_the_note() {
   CHECK(flat_high > flat_low * 0.5);
 }
 
+// ----------------------------------------------------------- the solvers
+
+/// The four phases a rate solver inverts, so a test can put the same question
+/// to all of them.
+enum class Phase { Attack, Decay, Sustain, Release };
+
+const Phase kPhases[] = {Phase::Attack, Phase::Decay, Phase::Sustain,
+                         Phase::Release};
+
+const char *phase_name(Phase phase) {
+  switch (phase) {
+  case Phase::Attack:
+    return "attack";
+  case Phase::Decay:
+    return "decay";
+  case Phase::Sustain:
+    return "sustain";
+  case Phase::Release:
+    break;
+  }
+  return "release";
+}
+
+int slowest_rate(Phase phase) { return phase == Phase::Release ? 0 : 1; }
+int fastest_rate(Phase phase) { return phase == Phase::Release ? 15 : 31; }
+
+/// The forward direction: how long that phase lasts with `value` in place.
+double phase_ms(Phase phase, const OperatorParams &op, NotePitch pitch,
+                int value) {
+  OperatorParams probe = op;
+  switch (phase) {
+  case Phase::Attack:
+    probe.ar = static_cast<uint8_t>(value);
+    return phase_durations(probe, pitch).attack_ms;
+  case Phase::Decay:
+    probe.dr = static_cast<uint8_t>(value);
+    return phase_durations(probe, pitch).decay_ms;
+  case Phase::Sustain:
+    probe.sr = static_cast<uint8_t>(value);
+    return phase_durations(probe, pitch).sustain_ms;
+  case Phase::Release:
+    break;
+  }
+  probe.rr = static_cast<uint8_t>(value);
+  return ym2612_eg::graph::detail::release_ms(probe, pitch);
+}
+
+int solve_rate(Phase phase, const OperatorParams &op, NotePitch pitch,
+               double target_ms) {
+  switch (phase) {
+  case Phase::Attack:
+    return solve_attack_rate(op, pitch, target_ms);
+  case Phase::Decay:
+    return solve_decay_rate(op, pitch, target_ms);
+  case Phase::Sustain:
+    return solve_sustain_rate(op, pitch, target_ms);
+  case Phase::Release:
+    break;
+  }
+  return solve_release_rate(op, pitch, target_ms);
+}
+
+/// The patches every solver test is put through: both key-scaling extremes,
+/// three octaves, the sustain level at both ends and in the middle, a
+/// non-zero total level, and SSG-EG both off and on (which moves where the
+/// sustain and the release stop, and quadruples their increments).
+std::vector<OperatorParams> solver_patches() {
+  std::vector<OperatorParams> patches;
+  for (int ks = 0; ks < 4; ++ks) {
+    for (int sl : {0, 4, 15}) {
+      for (int tl : {0, 40}) {
+        for (int ssg : {0x00, 0x08}) {
+          OperatorParams op = adsr(25, 12, sl, 6, 8, ks);
+          op.tl = static_cast<uint8_t>(tl);
+          op.ssg = static_cast<uint8_t>(ssg);
+          patches.push_back(op);
+        }
+      }
+    }
+  }
+  return patches;
+}
+
+const NotePitch kSolverNotes[] = {NotePitch::from_midi(36),
+                                  NotePitch::from_midi(60),
+                                  NotePitch::from_midi(84)};
+
+/// Pins the round trip: the duration a register value produces solves back to
+/// a value that produces that same duration. Where two values quantise to one
+/// duration -- which the increment table does wherever the effective rate
+/// saturates -- either is a correct answer, so the durations are compared
+/// rather than the values.
+void test_every_rate_solves_back_to_the_value_it_came_from() {
+  for (const OperatorParams &op : solver_patches()) {
+    for (const NotePitch &pitch : kSolverNotes) {
+      for (Phase phase : kPhases) {
+        for (int v = slowest_rate(phase); v <= fastest_rate(phase); ++v) {
+          const double want = phase_ms(phase, op, pitch, v);
+          const int got = solve_rate(phase, op, pitch, want);
+          CHECK(got >= slowest_rate(phase));
+          CHECK(got <= fastest_rate(phase));
+          if (phase_ms(phase, op, pitch, got) != want) {
+            std::cerr << "\n    (" << phase_name(phase)
+                      << " ks=" << static_cast<int>(op.ks)
+                      << " sl=" << static_cast<int>(op.sl)
+                      << " ssg=" << static_cast<int>(op.ssg) << " value " << v
+                      << " -> " << got << ")";
+            CHECK(false);
+          }
+        }
+      }
+    }
+  }
+}
+
+/// Pins that the axis and the register move together: dragging a handle to
+/// the right, i.e. asking for a longer phase, never answers with a faster
+/// rate.
+void test_a_longer_target_never_asks_for_a_faster_rate() {
+  for (const OperatorParams &op : solver_patches()) {
+    for (const NotePitch &pitch : kSolverNotes) {
+      for (Phase phase : kPhases) {
+        int previous = fastest_rate(phase) + 1;
+        for (int step = 0; step <= 400; ++step) {
+          // 0.001 ms to 100 s, the whole reachable range and then some.
+          const double target_ms = 0.001 * std::pow(10.0, step * 8.0 / 400.0);
+          const int got = solve_rate(phase, op, pitch, target_ms);
+          CHECK(got <= previous);
+          previous = got;
+        }
+      }
+    }
+  }
+}
+
+/// Pins that a rate solver never answers with the value that means "never":
+/// AR, DR and SR of 0 are a phase that does not advance, which is the
+/// caller's decision to make rather than something a drag can land on.
+void test_a_rate_solver_never_answers_the_rate_that_never_advances() {
+  const double targets[] = {0.0,
+                            -1.0,
+                            1e-6,
+                            1.0,
+                            250.0,
+                            1e6,
+                            std::numeric_limits<double>::infinity(),
+                            std::numeric_limits<double>::quiet_NaN()};
+  for (const OperatorParams &op : solver_patches()) {
+    for (double target : targets) {
+      CHECK(solve_attack_rate(op, kMiddleC, target) >= 1);
+      CHECK(solve_decay_rate(op, kMiddleC, target) >= 1);
+      CHECK(solve_sustain_rate(op, kMiddleC, target) >= 1);
+      CHECK(solve_attack_rate(op, kMiddleC, target) <= 31);
+      CHECK(solve_decay_rate(op, kMiddleC, target) <= 31);
+      CHECK(solve_sustain_rate(op, kMiddleC, target) <= 31);
+      CHECK(solve_release_rate(op, kMiddleC, target) <= 15);
+    }
+  }
+}
+
+/// Pins both ends of the range: a target longer than the slowest rate can
+/// manage is the slowest rate, a target shorter than the fastest is the
+/// fastest -- or, where several values share that shortest duration, one of
+/// them.
+void test_a_target_off_either_end_lands_on_the_end() {
+  for (const OperatorParams &op : solver_patches()) {
+    for (const NotePitch &pitch : kSolverNotes) {
+      for (Phase phase : kPhases) {
+        const int slowest = slowest_rate(phase);
+        const int fastest = fastest_rate(phase);
+        CHECK(solve_rate(phase, op, pitch, 1e9) == slowest);
+        const int quick = solve_rate(phase, op, pitch, 1e-9);
+        CHECK(phase_ms(phase, op, pitch, quick) ==
+              phase_ms(phase, op, pitch, fastest));
+      }
+    }
+  }
+}
+
+/// Pins that a target which is not a length of time asks for the fastest
+/// rate. Zero, negative, infinite and NaN all arrive from a drag that has
+/// gone off the axis; none of them is a reason to answer slowly.
+void test_a_target_that_is_not_a_time_asks_for_the_fastest() {
+  const double targets[] = {0.0, -0.0, -12.5,
+                            std::numeric_limits<double>::infinity(),
+                            -std::numeric_limits<double>::infinity(),
+                            std::numeric_limits<double>::quiet_NaN()};
+  const OperatorParams op = worked_example();
+  for (double target : targets) {
+    CHECK_EQ(solve_attack_rate(op, kMiddleC, target), 31);
+    CHECK_EQ(solve_decay_rate(op, kMiddleC, target), 31);
+    CHECK_EQ(solve_sustain_rate(op, kMiddleC, target), 31);
+    CHECK_EQ(solve_release_rate(op, kMiddleC, target), 15);
+  }
+}
+
+/// Pins the metric: no other value sits closer to the target in RATIO, which
+/// is what a logarithmic time axis makes "closest" mean.
+void test_no_other_rate_is_nearer_the_target_in_ratio() {
+  for (const OperatorParams &op : solver_patches()) {
+    for (Phase phase : kPhases) {
+      for (int step = 0; step <= 60; ++step) {
+        const double target_ms = 0.05 * std::pow(10.0, step * 6.0 / 60.0);
+        const int got = solve_rate(phase, op, kMiddleC, target_ms);
+        const double got_ms = phase_ms(phase, op, kMiddleC, got);
+        if (!(got_ms > 0.0)) {
+          continue; // a phase of no length has no ratio to the target
+        }
+        const double chosen = std::fabs(std::log(got_ms / target_ms));
+        for (int v = slowest_rate(phase); v <= fastest_rate(phase); ++v) {
+          const double ms = phase_ms(phase, op, kMiddleC, v);
+          if (ms > 0.0) {
+            CHECK(std::fabs(std::log(ms / target_ms)) >= chosen - 1e-12);
+          }
+        }
+      }
+    }
+  }
+}
+
+/// Pins where the release stops. A release and a sustain with SL = 0 cover
+/// exactly the same ground -- full volume to the level the chip cuts the
+/// output at, 0x3F0 or SSG-EG's fold at 0x200 -- so at the same effective
+/// rate, which RR reaches as 2*RR+1, they are the same length to the bit.
+void test_a_release_covers_the_same_ground_as_a_sustain() {
+  for (int ks = 0; ks < 4; ++ks) {
+    for (int ssg : {0x00, 0x08}) {
+      for (const NotePitch &pitch : kSolverNotes) {
+        for (int rr = 0; rr < 8; ++rr) {
+          OperatorParams op = adsr(25, 12, 0, 2 * rr + 1, rr, ks);
+          op.ssg = static_cast<uint8_t>(ssg);
+          CHECK(ym2612_eg::graph::detail::release_ms(op, pitch) ==
+                phase_durations(op, pitch).sustain_ms);
+        }
+      }
+    }
+  }
+}
+
+/// Pins the closed form the release solver inverts against the release the
+/// graph actually draws. They differ only by where the shared counter
+/// happened to be when the key came up -- an increment either way, which on
+/// the shortest SSG-EG releases is a percent or two of the whole -- and by
+/// what the polyline's own resolution can carry.
+void test_the_release_length_matches_the_release_that_is_drawn() {
+  const double eg_tick_ms = 1000.0 / eg_rate_hz(kNtscClockHz);
+  for (int ks = 0; ks < 4; ++ks) {
+    for (int ssg : {0x00, 0x08, 0x0C}) {
+      for (const NotePitch &pitch : kSolverNotes) {
+        for (int rr = 0; rr < 16; ++rr) {
+          OperatorParams op = adsr(25, 12, 4, 6, rr, ks);
+          op.ssg = static_cast<uint8_t>(ssg);
+          const EnvelopeCurve curve = build_envelope_curve(op, pitch);
+          // Only the releases that finish inside their budget: one cut off at
+          // the ceiling has no length of its own to compare.
+          if (curve.release_content_ms >= release_max_ms() * 0.99) {
+            continue;
+          }
+          CHECK_ABS(ym2612_eg::graph::detail::release_ms(op, pitch),
+                    curve.release_content_ms,
+                    std::max(0.02 * curve.release_content_ms,
+                             1.5 * eg_tick_ms));
+        }
+      }
+    }
+  }
+}
+
+/// Pins which way a tie falls. The effective rate saturates at 63, so at
+/// KS = 0 on a low note DR and SR of 30 and 31 decay at exactly the same
+/// speed; the slower value wins, which is what keeps dragging a handle
+/// outward from sticking to the end of the range.
+void test_a_tie_goes_to_the_slower_rate() {
+  const OperatorParams op = adsr(25, 12, 4, 6, 8, 0);
+  const NotePitch low = NotePitch::from_midi(12);
+  CHECK_EQ(key_scale_value(op, low), 0);
+
+  const double decay = phase_ms(Phase::Decay, op, low, 31);
+  CHECK(phase_ms(Phase::Decay, op, low, 30) == decay);
+  CHECK_EQ(solve_decay_rate(op, low, decay), 30);
+
+  const double sustain = phase_ms(Phase::Sustain, op, low, 31);
+  CHECK(phase_ms(Phase::Sustain, op, low, 30) == sustain);
+  CHECK_EQ(solve_sustain_rate(op, low, sustain), 30);
+}
+
+/// Pins that no value is shadowed: sweeping a handle across the axis lands on
+/// every rate whose phase length is its own, and only those -- the range is
+/// divided between them rather than spent on a few.
+void test_dragging_across_the_axis_reaches_every_rate() {
+  const OperatorParams op = adsr(25, 12, 4, 6, 8, 0);
+  for (Phase phase : kPhases) {
+    const int slowest = slowest_rate(phase);
+    const int fastest = fastest_rate(phase);
+    const double longest = phase_ms(phase, op, kMiddleC, slowest);
+    bool seen[32] = {false};
+    int distinct = 0;
+    for (int step = 0; step <= 2000; ++step) {
+      // The whole reachable range, walked evenly on a log axis.
+      const double target_ms = longest * std::pow(1e-6, step / 2000.0);
+      const int got = solve_rate(phase, op, kMiddleC, target_ms);
+      if (!seen[got]) {
+        seen[got] = true;
+        ++distinct;
+      }
+    }
+    // Every value except those whose duration another value already shares.
+    int reachable = 0;
+    for (int v = slowest; v <= fastest; ++v) {
+      const double ms = phase_ms(phase, op, kMiddleC, v);
+      if (v == slowest || ms != phase_ms(phase, op, kMiddleC, v - 1)) {
+        ++reachable;
+      }
+    }
+    // At most a couple of values are lost to a shared duration, so this is a
+    // claim about nearly the whole range rather than about a handful of it.
+    CHECK(reachable >= fastest - slowest - 1);
+    CHECK(distinct == reachable);
+  }
+}
+
+/// Pins that the note and the key-scaling reach the answer: the same target
+/// asks for a different rate once the effective rate moves under it.
+void test_the_note_and_the_key_scaling_change_which_rate_a_time_means() {
+  OperatorParams scaled = adsr(25, 12, 4, 6, 8, 3);
+  const NotePitch low = NotePitch::from_midi(36);
+  const NotePitch high = NotePitch::from_midi(96);
+  CHECK(solve_decay_rate(scaled, low, 200.0) !=
+        solve_decay_rate(scaled, high, 200.0));
+  CHECK(solve_release_rate(scaled, low, 200.0) !=
+        solve_release_rate(scaled, high, 200.0));
+
+  OperatorParams unscaled = scaled;
+  unscaled.ks = 0;
+  CHECK(solve_decay_rate(scaled, high, 200.0) !=
+        solve_decay_rate(unscaled, high, 200.0));
+
+  // ... and with KS = 0 the same note still shifts the answer, because the
+  // key scale value is the keycode's top bits rather than nothing at all.
+  CHECK(solve_decay_rate(unscaled, NotePitch::from_midi(0), 200.0) !=
+        solve_decay_rate(unscaled, NotePitch::from_midi(120), 200.0));
+}
+
+/// Pins TL as the top 7 bits of the 10-bit attenuation: one step is 8 units,
+/// halves round away from zero, and anything off the scale clamps.
+void test_total_level_rounds_to_the_nearest_step() {
+  for (int tl = 0; tl < 128; ++tl) {
+    CHECK_EQ(solve_total_level(tl * 8.0), tl);
+    CHECK_EQ(solve_total_level(tl * 8.0 + 3.0), tl);
+  }
+  CHECK_EQ(solve_total_level(4.0), 1);   // the midpoint rounds up
+  CHECK_EQ(solve_total_level(3.9), 0);
+  CHECK_EQ(solve_total_level(12.0), 2);
+  CHECK_EQ(solve_total_level(-0.0), 0);
+  CHECK_EQ(solve_total_level(-500.0), 0);
+  CHECK_EQ(solve_total_level(1023.0), 127);
+  CHECK_EQ(solve_total_level(1e9), 127);
+  CHECK_EQ(solve_total_level(std::numeric_limits<double>::infinity()), 127);
+  CHECK_EQ(solve_total_level(-std::numeric_limits<double>::infinity()), 0);
+  CHECK_EQ(solve_total_level(std::numeric_limits<double>::quiet_NaN()), 0);
+}
+
+/// Pins SL against the levels it really has -- 32 units apart, except SL = 15
+/// at 0x3E0 -- measured from wherever TL has put the operator's ceiling.
+void test_sustain_level_rounds_to_the_nearest_level() {
+  OperatorParams op = worked_example();
+  op.tl = 0;
+  for (int sl = 0; sl < 16; ++sl) {
+    CHECK_EQ(solve_sustain_level(op, sustain_attenuation(sl)), sl);
+  }
+  CHECK_EQ(solve_sustain_level(op, 100.0), 3);  // 96 vs 128
+  CHECK_EQ(solve_sustain_level(op, 112.0), 3);  // the midpoint stays louder
+  CHECK_EQ(solve_sustain_level(op, 113.0), 4);
+  CHECK_EQ(solve_sustain_level(op, 720.0), 14); // 448 vs 992
+  CHECK_EQ(solve_sustain_level(op, 721.0), 15);
+  CHECK_EQ(solve_sustain_level(op, -1000.0), 0);
+  CHECK_EQ(solve_sustain_level(op, 1e9), 15);
+  CHECK_EQ(solve_sustain_level(op, std::numeric_limits<double>::quiet_NaN()),
+           0);
+
+  // TL raises the whole scale: the same attenuation now names a louder SL.
+  op.tl = 8; // 64 units
+  for (int sl = 0; sl < 16; ++sl) {
+    CHECK_EQ(solve_sustain_level(op, sustain_attenuation(sl) + 64.0), sl);
+  }
+  CHECK_EQ(solve_sustain_level(op, 160.0), 3); // 96 + 64
+  CHECK_EQ(solve_sustain_level(op, 0.0), 0);
+}
+
 } // namespace
 
 int main() {
@@ -1684,6 +2073,20 @@ int main() {
   RUN_TEST(test_a_voice_curve_covers_the_axis_it_is_drawn_on);
   RUN_TEST(test_a_register_change_drops_every_voice_curve);
   RUN_TEST(test_key_scaling_follows_the_note);
+
+  RUN_TEST(test_every_rate_solves_back_to_the_value_it_came_from);
+  RUN_TEST(test_a_longer_target_never_asks_for_a_faster_rate);
+  RUN_TEST(test_a_rate_solver_never_answers_the_rate_that_never_advances);
+  RUN_TEST(test_a_target_off_either_end_lands_on_the_end);
+  RUN_TEST(test_a_target_that_is_not_a_time_asks_for_the_fastest);
+  RUN_TEST(test_no_other_rate_is_nearer_the_target_in_ratio);
+  RUN_TEST(test_a_tie_goes_to_the_slower_rate);
+  RUN_TEST(test_a_release_covers_the_same_ground_as_a_sustain);
+  RUN_TEST(test_the_release_length_matches_the_release_that_is_drawn);
+  RUN_TEST(test_dragging_across_the_axis_reaches_every_rate);
+  RUN_TEST(test_the_note_and_the_key_scaling_change_which_rate_a_time_means);
+  RUN_TEST(test_total_level_rounds_to_the_nearest_step);
+  RUN_TEST(test_sustain_level_rounds_to_the_nearest_level);
 
   return testing::summary();
 }
