@@ -380,36 +380,57 @@ inline double curve_out_at_ms(const CurveResult &curve, double ms) {
          (static_cast<double>(points[hi].out) - points[lo].out) * u;
 }
 
-/// Where on a release trace a release from attenuation `out` begins: the
-/// release is linear in attenuation, so a note let go at level L follows
-/// precisely the trace already on screen, entered later -- the first instant
-/// the trace reaches `out` IS where the voice joins it. Takes the trace rather
-/// than the whole curve, so the same question can be put to a release the
-/// simulator really ran.
-inline double release_entry_ms(const CurveResult &release, double out) {
-  const auto &points = release.points;
-  if (points.empty()) {
-    return 0.0;
+/// The first instant in [from_ms, to_ms] at which `trace` is drawn at or past
+/// `level`, or `to_ms` if it never is. Each phase is monotone and RDP leaves a
+/// straight edge between vertices, so interpolating inside the crossing edge
+/// is exact. This is where the drawn line arrives at a level the registers put
+/// somewhere else: TL lifts the whole envelope, and the output saturates
+/// before the attenuation does.
+inline double first_time_at_level(const CurveResult &trace, double level,
+                                  double from_ms, double to_ms) {
+  const auto &points = trace.points;
+  if (points.empty() || from_ms >= to_ms) {
+    return to_ms;
   }
-  if (out <= points.front().out) {
-    return points.front().ms;
+  if (curve_out_at_ms(trace, from_ms) >= level) {
+    return from_ms;
   }
-  // A release trace is a straight ramp in attenuation and RDP decimates it to
-  // a handful of vertices, so interpolating inside the crossing edge is exact.
   for (std::size_t i = 1; i < points.size(); ++i) {
-    const double a0 = points[i - 1].out;
-    const double a1 = points[i].out;
-    if (a1 < out) {
+    const double ms0 = points[i - 1].ms;
+    const double ms1 = points[i].ms;
+    if (ms1 <= from_ms) {
       continue;
     }
-    if (a1 <= a0) {
-      return points[i].ms; // a step, not a ramp: it arrives at this instant
+    if (ms0 >= to_ms) {
+      break;
     }
-    const double u = std::clamp((out - a0) / (a1 - a0), 0.0, 1.0);
-    return points[i - 1].ms +
-           (static_cast<double>(points[i].ms) - points[i - 1].ms) * u;
+    const double a0 = points[i - 1].out;
+    const double a1 = points[i].out;
+    if (a1 < level) {
+      continue;
+    }
+    double at = ms1; // a step, not a ramp: it arrives at this instant
+    if (a1 > a0) {
+      const double u = std::clamp((level - a0) / (a1 - a0), 0.0, 1.0);
+      at = ms0 + (ms1 - ms0) * u;
+    }
+    return std::clamp(at, from_ms, to_ms);
   }
-  return points.back().ms;
+  return to_ms;
+}
+
+/// Where a voice let go at `out` joins the release trace. The release is
+/// linear in attenuation, so a note let go at level L follows precisely the
+/// trace already on screen, entered later -- the first instant the trace
+/// reaches `out` IS where the voice joins it. Takes the trace rather than the
+/// whole curve, so the same question can be put to a release the simulator
+/// really ran.
+inline double release_entry_ms(const CurveResult &release, double out) {
+  if (release.points.empty()) {
+    return 0.0;
+  }
+  return first_time_at_level(release, out, release.points.front().ms,
+                             release.points.back().ms);
 }
 
 /// Where a sounding voice is on its own envelope.
