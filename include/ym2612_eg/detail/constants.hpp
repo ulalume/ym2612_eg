@@ -22,6 +22,9 @@ inline constexpr uint16_t kMaxAttenuation = 0x3FF;
 inline constexpr uint16_t kSsgFoldAttenuation = 0x200;
 // Any output attenuation at or above this multiplies to exactly 0 in hardware.
 inline constexpr uint16_t kSilenceAttenuation = 0x340;
+// Reaching this forces the attenuation to the bottom of the scale, so a decay
+// or a release covers only this much ground rather than the whole of it.
+inline constexpr uint16_t kCutAttenuation = 0x3F0;
 
 // The attenuation SL names, i.e. where the decay stops and the sustain
 // begins.  SL = 15 becomes 0x3E0 (992), not 480.

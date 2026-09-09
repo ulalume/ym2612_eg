@@ -278,9 +278,13 @@ inline EnvelopeCurve build_envelope_curve(const OperatorParams &op,
       out.release.points.empty()
           ? 0.0
           : static_cast<double>(out.release.points.back().ms);
-  out.release_truncated = out.release_content_ms >= release.max_ms * 0.999 &&
-                          (out.release.points.empty() ||
-                           out.release.points.back().out < kMaxAttenuation);
+  // A release ends where the chip cuts the output dead, which is a level of
+  // ATTENUATION rather than one on the graph: TL lifts the whole envelope, so
+  // the drawn line can be at the bottom of the scale while the attenuation
+  // behind it still has ground to cover. Short of the cut, the run stopped
+  // because its budget did.
+  out.release_truncated = !out.release.points.empty() &&
+                          out.release.points.back().att < kCutAttenuation;
 
   // 3. The axis has to hold both traces -- but neither may crush the other. A
   //    loop keeps its own scale, and a release much longer than the held
@@ -829,7 +833,8 @@ uint8_t nearest_rate(int slowest, int fastest, double target_ms,
 /// same distance.
 inline double release_ms(const OperatorParams &op, NotePitch pitch) {
   const bool ssg = (op.ssg & 0x08) != 0;
-  const int end_att = ssg ? static_cast<int>(kSsgFoldAttenuation) : 0x3F0;
+  const int end_att =
+      static_cast<int>(ssg ? kSsgFoldAttenuation : kCutAttenuation);
   const int rate = ym2612_eg::detail::effective_rate(
       2 * (op.rr & 0x0F) + 1, key_scale_value(op, pitch));
   return ym2612_eg::detail::linear_phase_ms(rate, 0, end_att, ssg,
@@ -846,13 +851,14 @@ inline double release_ms(const OperatorParams &op, NotePitch pitch) {
 inline double sustain_out_at_ms(const OperatorParams &op, NotePitch pitch,
                                 double elapsed_ms) {
   const bool ssg = (op.ssg & 0x08) != 0;
-  const int end_att = ssg ? static_cast<int>(kSsgFoldAttenuation) : 0x3F0;
+  const int end_att =
+      static_cast<int>(ssg ? kSsgFoldAttenuation : kCutAttenuation);
   const int sustain_att = std::min(sustain_attenuation(op.sl), end_att);
   const int rate = ym2612_eg::detail::effective_rate(
       op.sr & 0x1F, key_scale_value(op, pitch));
   const double whole_ms = ym2612_eg::detail::linear_phase_ms(
       rate, sustain_att, end_att, ssg, eg_rate_hz(kNtscClockHz));
-  // Where the envelope stops: reaching 0x3F0 makes the chip force the bottom
+  // Where the envelope stops: reaching the cut makes the chip force the bottom
   // of the scale, and an SSG-EG envelope freezes at the fold instead.
   const double rest_att =
       ssg ? static_cast<double>(end_att) : static_cast<double>(kMaxAttenuation);
