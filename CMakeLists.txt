@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(ym2612_eg VERSION 0.3.0 LANGUAGES CXX)
+project(ym2612_eg VERSION 0.5.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -26,7 +26,7 @@ target_compile_features(ym2612_eg INTERFACE cxx_std_17)
 if(YM2612_EG_BUILD_TESTS)
   enable_testing()
 
-  foreach(_t eg_test ssg_test curve_test timing_test graph_test)
+  foreach(_t eg_test ssg_test curve_test timing_test graph_test handles_test)
     add_executable(ym2612_eg_${_t} test/${_t}.cpp)
     target_link_libraries(ym2612_eg_${_t} PRIVATE ym2612_eg)
     target_include_directories(ym2612_eg_${_t} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/test)

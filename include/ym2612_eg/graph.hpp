@@ -278,9 +278,13 @@ inline EnvelopeCurve build_envelope_curve(const OperatorParams &op,
       out.release.points.empty()
           ? 0.0
           : static_cast<double>(out.release.points.back().ms);
-  out.release_truncated = out.release_content_ms >= release.max_ms * 0.999 &&
-                          (out.release.points.empty() ||
-                           out.release.points.back().out < kMaxAttenuation);
+  // A release ends where the chip cuts the output dead, which is a level of
+  // ATTENUATION rather than one on the graph: TL lifts the whole envelope, so
+  // the drawn line can be at the bottom of the scale while the attenuation
+  // behind it still has ground to cover. Short of the cut, the run stopped
+  // because its budget did.
+  out.release_truncated = !out.release.points.empty() &&
+                          out.release.points.back().att < kCutAttenuation;
 
   // 3. The axis has to hold both traces -- but neither may crush the other. A
   //    loop keeps its own scale, and a release much longer than the held
@@ -376,36 +380,57 @@ inline double curve_out_at_ms(const CurveResult &curve, double ms) {
          (static_cast<double>(points[hi].out) - points[lo].out) * u;
 }
 
-/// Where on a release trace a release from attenuation `out` begins: the
-/// release is linear in attenuation, so a note let go at level L follows
-/// precisely the trace already on screen, entered later -- the first instant
-/// the trace reaches `out` IS where the voice joins it. Takes the trace rather
-/// than the whole curve, so the same question can be put to a release the
-/// simulator really ran.
-inline double release_entry_ms(const CurveResult &release, double out) {
-  const auto &points = release.points;
-  if (points.empty()) {
-    return 0.0;
+/// The first instant in [from_ms, to_ms] at which `trace` is drawn at or past
+/// `level`, or `to_ms` if it never is. Each phase is monotone and RDP leaves a
+/// straight edge between vertices, so interpolating inside the crossing edge
+/// is exact. This is where the drawn line arrives at a level the registers put
+/// somewhere else: TL lifts the whole envelope, and the output saturates
+/// before the attenuation does.
+inline double first_time_at_level(const CurveResult &trace, double level,
+                                  double from_ms, double to_ms) {
+  const auto &points = trace.points;
+  if (points.empty() || from_ms >= to_ms) {
+    return to_ms;
   }
-  if (out <= points.front().out) {
-    return points.front().ms;
+  if (curve_out_at_ms(trace, from_ms) >= level) {
+    return from_ms;
   }
-  // A release trace is a straight ramp in attenuation and RDP decimates it to
-  // a handful of vertices, so interpolating inside the crossing edge is exact.
   for (std::size_t i = 1; i < points.size(); ++i) {
-    const double a0 = points[i - 1].out;
-    const double a1 = points[i].out;
-    if (a1 < out) {
+    const double ms0 = points[i - 1].ms;
+    const double ms1 = points[i].ms;
+    if (ms1 <= from_ms) {
       continue;
     }
-    if (a1 <= a0) {
-      return points[i].ms; // a step, not a ramp: it arrives at this instant
+    if (ms0 >= to_ms) {
+      break;
     }
-    const double u = std::clamp((out - a0) / (a1 - a0), 0.0, 1.0);
-    return points[i - 1].ms +
-           (static_cast<double>(points[i].ms) - points[i - 1].ms) * u;
+    const double a0 = points[i - 1].out;
+    const double a1 = points[i].out;
+    if (a1 < level) {
+      continue;
+    }
+    double at = ms1; // a step, not a ramp: it arrives at this instant
+    if (a1 > a0) {
+      const double u = std::clamp((level - a0) / (a1 - a0), 0.0, 1.0);
+      at = ms0 + (ms1 - ms0) * u;
+    }
+    return std::clamp(at, from_ms, to_ms);
   }
-  return points.back().ms;
+  return to_ms;
+}
+
+/// Where a voice let go at `out` joins the release trace. The release is
+/// linear in attenuation, so a note let go at level L follows precisely the
+/// trace already on screen, entered later -- the first instant the trace
+/// reaches `out` IS where the voice joins it. Takes the trace rather than the
+/// whole curve, so the same question can be put to a release the simulator
+/// really ran.
+inline double release_entry_ms(const CurveResult &release, double out) {
+  if (release.points.empty()) {
+    return 0.0;
+  }
+  return first_time_at_level(release, out, release.points.front().ms,
+                             release.points.back().ms);
 }
 
 /// Where a sounding voice is on its own envelope.
@@ -829,7 +854,8 @@ uint8_t nearest_rate(int slowest, int fastest, double target_ms,
 /// same distance.
 inline double release_ms(const OperatorParams &op, NotePitch pitch) {
   const bool ssg = (op.ssg & 0x08) != 0;
-  const int end_att = ssg ? static_cast<int>(kSsgFoldAttenuation) : 0x3F0;
+  const int end_att =
+      static_cast<int>(ssg ? kSsgFoldAttenuation : kCutAttenuation);
   const int rate = ym2612_eg::detail::effective_rate(
       2 * (op.rr & 0x0F) + 1, key_scale_value(op, pitch));
   return ym2612_eg::detail::linear_phase_ms(rate, 0, end_att, ssg,
@@ -846,13 +872,14 @@ inline double release_ms(const OperatorParams &op, NotePitch pitch) {
 inline double sustain_out_at_ms(const OperatorParams &op, NotePitch pitch,
                                 double elapsed_ms) {
   const bool ssg = (op.ssg & 0x08) != 0;
-  const int end_att = ssg ? static_cast<int>(kSsgFoldAttenuation) : 0x3F0;
+  const int end_att =
+      static_cast<int>(ssg ? kSsgFoldAttenuation : kCutAttenuation);
   const int sustain_att = std::min(sustain_attenuation(op.sl), end_att);
   const int rate = ym2612_eg::detail::effective_rate(
       op.sr & 0x1F, key_scale_value(op, pitch));
   const double whole_ms = ym2612_eg::detail::linear_phase_ms(
       rate, sustain_att, end_att, ssg, eg_rate_hz(kNtscClockHz));
-  // Where the envelope stops: reaching 0x3F0 makes the chip force the bottom
+  // Where the envelope stops: reaching the cut makes the chip force the bottom
   // of the scale, and an SSG-EG envelope freezes at the fold instead.
   const double rest_att =
       ssg ? static_cast<double>(end_att) : static_cast<double>(kMaxAttenuation);
