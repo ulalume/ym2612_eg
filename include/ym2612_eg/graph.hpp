@@ -6,8 +6,9 @@
 // independent: the held envelope is simulated with the key never released,
 // the only way SR reads truthfully (SR = 0 holds flat, SR > 0 crawls); the
 // release is simulated on its own from full volume. The solvers at the end
-// run the other way, from a phase length back to the register value that
-// comes closest to it, which is what a dragged handle needs.
+// run the other way, from a phase length -- or, for the sustain, the level the
+// line has fallen to -- back to the register value that comes closest to it,
+// which is what a dragged handle needs.
 
 #include "detail/constants.hpp"
 #include "detail/curve.hpp"
@@ -835,18 +836,53 @@ inline double release_ms(const OperatorParams &op, NotePitch pitch) {
                                             eg_rate_hz(kNtscClockHz));
 }
 
+/// Where a sustain at `op`'s SR stands `elapsed_ms` after it begins, in the
+/// units the curve is drawn in: attenuation with TL added and the scale run
+/// backwards for an SSG-EG mode that inverts, clamped exactly as the
+/// simulator's output is. The phase is linear in attenuation, so its whole
+/// length places every instant inside it -- including a rate that never
+/// advances, whose length is infinite and whose level therefore never leaves
+/// the sustain. Past the end the envelope is at rest.
+inline double sustain_out_at_ms(const OperatorParams &op, NotePitch pitch,
+                                double elapsed_ms) {
+  const bool ssg = (op.ssg & 0x08) != 0;
+  const int end_att = ssg ? static_cast<int>(kSsgFoldAttenuation) : 0x3F0;
+  const int sustain_att = std::min(sustain_attenuation(op.sl), end_att);
+  const int rate = ym2612_eg::detail::effective_rate(
+      op.sr & 0x1F, key_scale_value(op, pitch));
+  const double whole_ms = ym2612_eg::detail::linear_phase_ms(
+      rate, sustain_att, end_att, ssg, eg_rate_hz(kNtscClockHz));
+  // Where the envelope stops: reaching 0x3F0 makes the chip force the bottom
+  // of the scale, and an SSG-EG envelope freezes at the fold instead.
+  const double rest_att =
+      ssg ? static_cast<double>(end_att) : static_cast<double>(kMaxAttenuation);
+
+  double att = static_cast<double>(sustain_att);
+  if (elapsed_ms > 0.0) {
+    att = elapsed_ms < whole_ms
+              ? sustain_att + (end_att - sustain_att) * (elapsed_ms / whole_ms)
+              : rest_att;
+  }
+  // Only an SSG-EG envelope inverts, and it never passes the fold, so the
+  // simulator's `(0x200 - a) & 0x3FF` cannot wrap and is a subtraction.
+  const double level = (ssg && (op.ssg & 0x04) != 0)
+                           ? static_cast<double>(kSsgFoldAttenuation) - att
+                           : att;
+  return std::min(level + static_cast<double>(op.tl & 0x7F) * 8.0,
+                  static_cast<double>(kMaxAttenuation));
+}
+
 } // namespace detail
 
 /// The register value whose phase lasts closest to `target_ms` at `pitch`,
 /// every other register left as `op` has it. `target_ms` is the length of
 /// that phase alone, not a position on the time axis: the attack, the decay
-/// down to the sustain level, the sustain from there to silence, and a
-/// release from full volume to silence.
+/// down to the sustain level, and a release from full volume to silence.
 ///
-/// AR, DR and SR are searched over 1..31 and never answer 0, which is not a
-/// slow rate but a phase that never advances -- whether a drag means that is
-/// the caller's decision, not the library's. RR is 4 bits and its effective
-/// rate is 2*RR+1, so every one of 0..15 finishes.
+/// AR and DR are searched over 1..31 and never answer 0, which is not a slow
+/// rate but a phase that never advances -- whether a drag means that is the
+/// caller's decision, not the library's. RR is 4 bits and its effective rate
+/// is 2*RR+1, so every one of 0..15 finishes.
 inline uint8_t solve_attack_rate(const OperatorParams &op, NotePitch pitch,
                                  double target_ms) {
   OperatorParams probe = op;
@@ -865,13 +901,38 @@ inline uint8_t solve_decay_rate(const OperatorParams &op, NotePitch pitch,
   });
 }
 
+/// The sustain rate whose envelope sits closest to `out_attenuation` (output
+/// units, TL included, 0..kMaxAttenuation) `elapsed_ms` after the sustain
+/// begins. SR = 0 holds at the sustain level, so it is the answer for a level
+/// that has not fallen at all.
+///
+/// The handle this inverts is dragged up and down a line rather than along
+/// the axis, so nearest is measured in attenuation units, which is what the
+/// graph's vertical axis is linear in. Ties go to the slower rate, so
+/// dragging is not sticky. An elapsed time that is not one -- negative,
+/// infinite, NaN -- is a sustain that has not advanced; a level off the scale
+/// clamps onto it.
 inline uint8_t solve_sustain_rate(const OperatorParams &op, NotePitch pitch,
-                                  double target_ms) {
+                                  double elapsed_ms, double out_attenuation) {
+  const double elapsed =
+      elapsed_ms > 0.0 && std::isfinite(elapsed_ms) ? elapsed_ms : 0.0;
+  const double target =
+      out_attenuation > 0.0
+          ? std::min(out_attenuation, static_cast<double>(kMaxAttenuation))
+          : 0.0;
   OperatorParams probe = op;
-  return detail::nearest_rate(1, 31, target_ms, [&](int rate) {
+  int best = 0;
+  double best_distance = std::numeric_limits<double>::infinity();
+  for (int rate = 0; rate <= 31; ++rate) {
     probe.sr = static_cast<uint8_t>(rate);
-    return phase_durations(probe, pitch).sustain_ms;
-  });
+    const double distance =
+        std::fabs(detail::sustain_out_at_ms(probe, pitch, elapsed) - target);
+    if (distance < best_distance) {
+      best_distance = distance;
+      best = rate;
+    }
+  }
+  return static_cast<uint8_t>(best);
 }
 
 inline uint8_t solve_release_rate(const OperatorParams &op, NotePitch pitch,

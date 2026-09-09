@@ -1616,12 +1616,12 @@ void test_key_scaling_follows_the_note() {
 
 // ----------------------------------------------------------- the solvers
 
-/// The four phases a rate solver inverts, so a test can put the same question
-/// to all of them.
-enum class Phase { Attack, Decay, Sustain, Release };
+/// The phases a solver inverts from a LENGTH, so a test can put the same
+/// question to all of them. The sustain is not one of them: its handle is
+/// dragged up and down the sustain line rather than along the axis.
+enum class Phase { Attack, Decay, Release };
 
-const Phase kPhases[] = {Phase::Attack, Phase::Decay, Phase::Sustain,
-                         Phase::Release};
+const Phase kPhases[] = {Phase::Attack, Phase::Decay, Phase::Release};
 
 const char *phase_name(Phase phase) {
   switch (phase) {
@@ -1629,8 +1629,6 @@ const char *phase_name(Phase phase) {
     return "attack";
   case Phase::Decay:
     return "decay";
-  case Phase::Sustain:
-    return "sustain";
   case Phase::Release:
     break;
   }
@@ -1651,9 +1649,6 @@ double phase_ms(Phase phase, const OperatorParams &op, NotePitch pitch,
   case Phase::Decay:
     probe.dr = static_cast<uint8_t>(value);
     return phase_durations(probe, pitch).decay_ms;
-  case Phase::Sustain:
-    probe.sr = static_cast<uint8_t>(value);
-    return phase_durations(probe, pitch).sustain_ms;
   case Phase::Release:
     break;
   }
@@ -1668,8 +1663,6 @@ int solve_rate(Phase phase, const OperatorParams &op, NotePitch pitch,
     return solve_attack_rate(op, pitch, target_ms);
   case Phase::Decay:
     return solve_decay_rate(op, pitch, target_ms);
-  case Phase::Sustain:
-    return solve_sustain_rate(op, pitch, target_ms);
   case Phase::Release:
     break;
   }
@@ -1749,9 +1742,9 @@ void test_a_longer_target_never_asks_for_a_faster_rate() {
   }
 }
 
-/// Pins that a rate solver never answers with the value that means "never":
-/// AR, DR and SR of 0 are a phase that does not advance, which is the
-/// caller's decision to make rather than something a drag can land on.
+/// Pins that a length solver never answers with the value that means "never":
+/// AR and DR of 0 are a phase that does not advance, which is the caller's
+/// decision to make rather than something a drag can land on.
 void test_a_rate_solver_never_answers_the_rate_that_never_advances() {
   const double targets[] = {0.0,
                             -1.0,
@@ -1765,10 +1758,8 @@ void test_a_rate_solver_never_answers_the_rate_that_never_advances() {
     for (double target : targets) {
       CHECK(solve_attack_rate(op, kMiddleC, target) >= 1);
       CHECK(solve_decay_rate(op, kMiddleC, target) >= 1);
-      CHECK(solve_sustain_rate(op, kMiddleC, target) >= 1);
       CHECK(solve_attack_rate(op, kMiddleC, target) <= 31);
       CHECK(solve_decay_rate(op, kMiddleC, target) <= 31);
-      CHECK(solve_sustain_rate(op, kMiddleC, target) <= 31);
       CHECK(solve_release_rate(op, kMiddleC, target) <= 15);
     }
   }
@@ -1805,7 +1796,6 @@ void test_a_target_that_is_not_a_time_asks_for_the_fastest() {
   for (double target : targets) {
     CHECK_EQ(solve_attack_rate(op, kMiddleC, target), 31);
     CHECK_EQ(solve_decay_rate(op, kMiddleC, target), 31);
-    CHECK_EQ(solve_sustain_rate(op, kMiddleC, target), 31);
     CHECK_EQ(solve_release_rate(op, kMiddleC, target), 15);
   }
 }
@@ -1883,9 +1873,9 @@ void test_the_release_length_matches_the_release_that_is_drawn() {
 }
 
 /// Pins which way a tie falls. The effective rate saturates at 63, so at
-/// KS = 0 on a low note DR and SR of 30 and 31 decay at exactly the same
-/// speed; the slower value wins, which is what keeps dragging a handle
-/// outward from sticking to the end of the range.
+/// KS = 0 on a low note DR of 30 and 31 decay at exactly the same speed; the
+/// slower value wins, which is what keeps dragging a handle outward from
+/// sticking to the end of the range.
 void test_a_tie_goes_to_the_slower_rate() {
   const OperatorParams op = adsr(25, 12, 4, 6, 8, 0);
   const NotePitch low = NotePitch::from_midi(12);
@@ -1894,10 +1884,6 @@ void test_a_tie_goes_to_the_slower_rate() {
   const double decay = phase_ms(Phase::Decay, op, low, 31);
   CHECK(phase_ms(Phase::Decay, op, low, 30) == decay);
   CHECK_EQ(solve_decay_rate(op, low, decay), 30);
-
-  const double sustain = phase_ms(Phase::Sustain, op, low, 31);
-  CHECK(phase_ms(Phase::Sustain, op, low, 30) == sustain);
-  CHECK_EQ(solve_sustain_rate(op, low, sustain), 30);
 }
 
 /// Pins that no value is shadowed: sweeping a handle across the axis lands on
@@ -1955,6 +1941,153 @@ void test_the_note_and_the_key_scaling_change_which_rate_a_time_means() {
   // key scale value is the keycode's top bits rather than nothing at all.
   CHECK(solve_decay_rate(unscaled, NotePitch::from_midi(0), 200.0) !=
         solve_decay_rate(unscaled, NotePitch::from_midi(120), 200.0));
+}
+
+// ------------------------------------------ the sustain, solved from a level
+
+/// The forward direction the sustain solver inverts: where a sustain at `sr`
+/// stands at that instant, in the units the graph draws.
+double sustain_out(const OperatorParams &op, NotePitch pitch, int sr,
+                   double elapsed_ms) {
+  OperatorParams probe = op;
+  probe.sr = static_cast<uint8_t>(sr);
+  return ym2612_eg::graph::detail::sustain_out_at_ms(probe, pitch, elapsed_ms);
+}
+
+/// Where a sustain at `sr` is probed: early in its fall, half way down, and
+/// past the point it has come to rest. A rate with no length of its own -- one
+/// that never advances, or a sustain with nowhere to fall -- borrows a spread
+/// of times instead.
+std::vector<double> sustain_probe_times(const OperatorParams &op,
+                                        NotePitch pitch, int sr) {
+  OperatorParams probe = op;
+  probe.sr = static_cast<uint8_t>(sr);
+  const double whole = phase_durations(probe, pitch).sustain_ms;
+  if (!std::isfinite(whole) || !(whole > 0.0)) {
+    return {1.0, 250.0, 10000.0};
+  }
+  return {0.05 * whole, 0.5 * whole, 2.0 * whole};
+}
+
+/// Pins the round trip: the level a sustain rate has fallen to at some instant
+/// solves back to that rate. Where two rates draw the same level -- TL
+/// flattening the bottom of the scale, or both already at rest -- either is a
+/// correct answer, so the levels are compared rather than the values.
+void test_every_sustain_rate_solves_back_from_the_level_it_reaches() {
+  for (const OperatorParams &op : solver_patches()) {
+    for (const NotePitch &pitch : kSolverNotes) {
+      for (int sr = 0; sr <= 31; ++sr) {
+        for (const double elapsed : sustain_probe_times(op, pitch, sr)) {
+          const double want = sustain_out(op, pitch, sr, elapsed);
+          const int got = solve_sustain_rate(op, pitch, elapsed, want);
+          CHECK(got >= 0);
+          CHECK(got <= 31);
+          if (sustain_out(op, pitch, got, elapsed) != want) {
+            std::cerr << "\n    (ks=" << static_cast<int>(op.ks)
+                      << " sl=" << static_cast<int>(op.sl)
+                      << " tl=" << static_cast<int>(op.tl)
+                      << " ssg=" << static_cast<int>(op.ssg) << " sr " << sr
+                      << " at " << elapsed << " ms -> " << got << ")";
+            CHECK(false);
+          }
+        }
+      }
+    }
+  }
+}
+
+/// Pins both ends of the drag: a level the sustain has not fallen from is the
+/// hold, SR = 0, at every instant; and the bottom of the scale is the first
+/// rate to have got that far, every slower one still being above it.
+void test_the_ends_of_the_drag_are_the_hold_and_the_first_rate_down() {
+  for (const OperatorParams &op : solver_patches()) {
+    for (const NotePitch &pitch : kSolverNotes) {
+      const double sustain_level = sustain_out(op, pitch, 0, 0.0);
+      for (const double elapsed : {1.0, 50.0, 1000.0, 20000.0}) {
+        CHECK_EQ(solve_sustain_rate(op, pitch, elapsed, sustain_level), 0);
+
+        const int down =
+            solve_sustain_rate(op, pitch, elapsed, kMaxAttenuation);
+        const double deepest = sustain_out(op, pitch, down, elapsed);
+        CHECK(deepest == sustain_out(op, pitch, 31, elapsed));
+        for (int slower = 0; slower < down; ++slower) {
+          CHECK(sustain_out(op, pitch, slower, elapsed) < deepest);
+        }
+      }
+    }
+  }
+}
+
+/// Pins that the handle and the register move together: at one instant, a
+/// quieter target never answers with a slower rate.
+void test_a_quieter_level_never_asks_for_a_slower_rate() {
+  for (const OperatorParams &op : solver_patches()) {
+    for (const NotePitch &pitch : kSolverNotes) {
+      for (const double elapsed : {2.0, 40.0, 600.0, 9000.0}) {
+        int previous = 0;
+        for (int step = 0; step <= 400; ++step) {
+          const double target = kMaxAttenuation * step / 400.0;
+          const int got = solve_sustain_rate(op, pitch, elapsed, target);
+          CHECK(got >= previous);
+          previous = got;
+        }
+      }
+    }
+  }
+}
+
+/// Pins the metric: no other rate's level sits closer to the target, and
+/// where one is exactly as close the slower value wins.
+void test_no_other_sustain_rate_sits_nearer_the_level() {
+  const OperatorParams op = adsr(25, 12, 4, 6, 8, 0);
+  for (const NotePitch &pitch : kSolverNotes) {
+    for (const double elapsed : {5.0, 120.0, 3000.0}) {
+      for (int step = 0; step <= 200; ++step) {
+        const double target = kMaxAttenuation * step / 200.0;
+        const int got = solve_sustain_rate(op, pitch, elapsed, target);
+        const double chosen =
+            std::fabs(sustain_out(op, pitch, got, elapsed) - target);
+        for (int sr = 0; sr <= 31; ++sr) {
+          const double distance =
+              std::fabs(sustain_out(op, pitch, sr, elapsed) - target);
+          CHECK(distance > chosen || (distance == chosen && sr >= got));
+        }
+      }
+    }
+  }
+}
+
+/// Pins that the target is read in OUTPUT units: TL moves the whole scale
+/// under it, so the same level at the same instant names a different rate.
+void test_total_level_moves_which_rate_a_level_means() {
+  OperatorParams loud = adsr(25, 12, 0, 6, 8, 0);
+  loud.tl = 0;
+  OperatorParams quiet = loud;
+  quiet.tl = 40;
+  CHECK(solve_sustain_rate(loud, kMiddleC, 200.0, 600.0) !=
+        solve_sustain_rate(quiet, kMiddleC, 200.0, 600.0));
+}
+
+/// Pins the edges of both arguments: an instant that is not one is a sustain
+/// that has not advanced, which every rate answers alike; and a level off the
+/// scale clamps onto its ends.
+void test_a_level_or_an_instant_off_the_scale_clamps() {
+  const OperatorParams op = adsr(25, 12, 4, 6, 8, 0);
+  const double fallen = sustain_out(op, kMiddleC, 20, 300.0);
+  const double infinity = std::numeric_limits<double>::infinity();
+  const double nan = std::numeric_limits<double>::quiet_NaN();
+  for (const double elapsed : {-1.0, -1e9, infinity, -infinity, nan, 0.0}) {
+    CHECK_EQ(solve_sustain_rate(op, kMiddleC, elapsed, fallen), 0);
+    CHECK_EQ(solve_sustain_rate(op, kMiddleC, elapsed, 0.0), 0);
+  }
+
+  const int bottom = solve_sustain_rate(op, kMiddleC, 300.0, kMaxAttenuation);
+  CHECK_EQ(solve_sustain_rate(op, kMiddleC, 300.0, 1e9), bottom);
+  CHECK_EQ(solve_sustain_rate(op, kMiddleC, 300.0, infinity), bottom);
+  const int top = solve_sustain_rate(op, kMiddleC, 300.0, 0.0);
+  CHECK_EQ(solve_sustain_rate(op, kMiddleC, 300.0, -1e9), top);
+  CHECK_EQ(solve_sustain_rate(op, kMiddleC, 300.0, -infinity), top);
+  CHECK_EQ(solve_sustain_rate(op, kMiddleC, 300.0, nan), top);
 }
 
 /// Pins TL as the top 7 bits of the 10-bit attenuation: one step is 8 units,
@@ -2085,6 +2218,14 @@ int main() {
   RUN_TEST(test_the_release_length_matches_the_release_that_is_drawn);
   RUN_TEST(test_dragging_across_the_axis_reaches_every_rate);
   RUN_TEST(test_the_note_and_the_key_scaling_change_which_rate_a_time_means);
+
+  RUN_TEST(test_every_sustain_rate_solves_back_from_the_level_it_reaches);
+  RUN_TEST(test_the_ends_of_the_drag_are_the_hold_and_the_first_rate_down);
+  RUN_TEST(test_a_quieter_level_never_asks_for_a_slower_rate);
+  RUN_TEST(test_no_other_sustain_rate_sits_nearer_the_level);
+  RUN_TEST(test_total_level_moves_which_rate_a_level_means);
+  RUN_TEST(test_a_level_or_an_instant_off_the_scale_clamps);
+
   RUN_TEST(test_total_level_rounds_to_the_nearest_step);
   RUN_TEST(test_sustain_level_rounds_to_the_nearest_level);
 
