@@ -2138,6 +2138,79 @@ void test_sustain_level_rounds_to_the_nearest_level() {
 
 } // namespace
 
+// ------------------------------------------- past the end of the trace
+
+/// The slope a trace has kept since `from_ms`, read off its own points.
+double drawn_slope(const CurveResult &trace, double from_ms) {
+  const CurvePoint &last = trace.points.back();
+  const double start = curve_out_at_ms(trace, from_ms);
+  return (static_cast<double>(last.out) - start) /
+         (static_cast<double>(last.ms) - from_ms);
+}
+
+void test_a_release_past_the_simulation_goes_on_at_its_own_slope() {
+  // RR 2 at KS 1 on block 4 is a slow staircase whose last edge, once
+  // decimated, is a single step: past 10 s the line has to keep the slope of
+  // the 10 s before it rather than bend.
+  OperatorParams op = adsr(25, 4, 3, 3, 2, 1);
+  op.tl = 33;
+  NotePitch pitch;
+  pitch.fnum = 644;
+  pitch.block = 4;
+  const EnvelopeCurve curve = build_envelope_curve(op, pitch);
+  CHECK(curve.release_truncated);
+  const double drawn = drawn_slope(curve.release, 0.0);
+  CHECK(std::fabs(curve.release_tail_slope - drawn) <= 0.02 * drawn);
+}
+
+void test_no_slow_release_bends_where_the_simulation_stops() {
+  int checked = 0;
+  for (int block = 0; block < 8; ++block) {
+    for (int ks = 0; ks < 4; ++ks) {
+      for (int rr = 0; rr < 4; ++rr) {
+        for (int fnum : {644, 1214}) {
+          const OperatorParams op = adsr(31, 4, 3, 3, rr, ks);
+          NotePitch pitch;
+          pitch.fnum = static_cast<uint16_t>(fnum);
+          pitch.block = static_cast<uint8_t>(block);
+          const EnvelopeCurve curve = build_envelope_curve(op, pitch);
+          if (!curve.release_truncated ||
+              curve.release.points.back().out >= kMaxAttenuation) {
+            continue;
+          }
+          const double drawn = drawn_slope(curve.release, 0.0);
+          CHECK(std::fabs(curve.release_tail_slope - drawn) <= 0.03 * drawn);
+          ++checked;
+        }
+      }
+    }
+  }
+  CHECK(checked > 20);
+}
+
+void test_a_held_line_past_its_trace_goes_on_at_its_phase_rate() {
+  // The sustain after the knee, read over the whole of it.
+  int checked = 0;
+  for (int sr = 1; sr <= 8; ++sr) {
+    const EnvelopeCurve curve =
+        build_envelope_curve(adsr(31, 10, 2, sr, 7, 0), kMiddleC);
+    const auto &last = curve.held.points.back();
+    if (curve.held_parked || curve.decay_end_ms < 0.0 ||
+        last.out >= kMaxAttenuation || last.ms - curve.decay_end_ms < 1000.0) {
+      continue;
+    }
+    const double drawn = drawn_slope(curve.held, curve.decay_end_ms);
+    CHECK(std::fabs(curve.held_tail_slope - drawn) <= 0.03 * drawn);
+    ++checked;
+  }
+  CHECK(checked >= 3);
+  // A decay that never advances goes on flat.
+  const EnvelopeCurve held =
+      build_envelope_curve(adsr(31, 0, 2, 5, 7, 0), kMiddleC);
+  CHECK(held.decay_end_ms < 0.0);
+  CHECK(held.held_tail_slope == 0.0);
+}
+
 int main() {
   std::cout << "graph_test\n";
 
@@ -2228,6 +2301,10 @@ int main() {
 
   RUN_TEST(test_total_level_rounds_to_the_nearest_step);
   RUN_TEST(test_sustain_level_rounds_to_the_nearest_level);
+
+  RUN_TEST(test_a_release_past_the_simulation_goes_on_at_its_own_slope);
+  RUN_TEST(test_no_slow_release_bends_where_the_simulation_stops);
+  RUN_TEST(test_a_held_line_past_its_trace_goes_on_at_its_phase_rate);
 
   return testing::summary();
 }

@@ -146,6 +146,15 @@ inline double tail_slope(const CurveResult &curve, bool at_rest) {
   return dt > 0.0 ? (static_cast<double>(last.out) - previous.out) / dt : 0.0;
 }
 
+/// The mean rise of a phase that is linear in attenuation, in units per ms.
+/// Every tick adds the same mean increment, so a trace that stops inside such
+/// a phase goes on at this slope -- read off the trace instead, the last edge
+/// of a slow phase can be a single step of its staircase.
+inline double linear_phase_slope(int rate) {
+  return ym2612_eg::detail::atten_per_eg_tick(rate, false) *
+         eg_rate_hz(kNtscClockHz) / 1000.0;
+}
+
 } // namespace detail
 
 /// The grid/label interval for a given span: a round number, 3-6 divisions.
@@ -326,9 +335,23 @@ inline EnvelopeCurve build_envelope_curve(const OperatorParams &op,
   out.held_silence_ms = detail::silence_or_never(out.held);
   out.release_silence_ms = detail::silence_or_never(out.release);
 
+  // A trace that stops inside a linear phase goes on at that phase's rate. An
+  // attack still under way keeps the slope of its last edge, since it is not
+  // linear, and so does an SSG-EG trace, which folds.
+  const bool ssg = (op.ssg & 0x08) != 0;
+  const int ksv = key_scale_value(op, pitch);
   out.held_tail_slope = detail::tail_slope(out.held, out.held_parked);
+  if (!out.held_parked && !ssg && out.attack_end_ms >= 0.0) {
+    const int rate = out.decay_end_ms >= 0.0 ? op.sr : op.dr;
+    out.held_tail_slope = detail::linear_phase_slope(
+        ym2612_eg::detail::effective_rate(rate & 0x1F, ksv));
+  }
   out.release_tail_slope =
       detail::tail_slope(out.release, !out.release_truncated);
+  if (out.release_truncated && !ssg) {
+    out.release_tail_slope = detail::linear_phase_slope(
+        ym2612_eg::detail::effective_rate(2 * (op.rr & 0x0F) + 1, ksv));
+  }
 
   const int tl_att = static_cast<int>(op.tl) * 8;
   out.peak_out =
