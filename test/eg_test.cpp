@@ -725,12 +725,11 @@ void test_tl_and_units() {
   CHECK_REL(atten_to_amplitude(128), 0.25, 1e-12);
 }
 
-// megatoy src/ym2612/note.hpp: fnote_from_key() + Note::from_midi_note()
-// + frequency_with_bend(note, 0).
-void test_from_midi_matches_megatoy() {
-  const uint16_t table[12] = {322, 341, 361, 383, 406, 430,
-                              455, 482, 511, 541, 574, 608};
-  // One full octave, MIDI 60..71 (megatoy octave 4).
+// MIDI note: F-num from the note table, block = octave.
+void test_from_midi_uses_the_note_table() {
+  const uint16_t table[12] = {644, 682, 723, 766, 811, 859,
+                              910, 965, 1022, 1083, 1147, 1215};
+  // One full octave, MIDI 60..71: octave 4.
   for (int m = 60; m <= 71; ++m) {
     const NotePitch p = NotePitch::from_midi(m);
     CHECK_EQ(p.fnum, table[m % 12]);
@@ -743,22 +742,39 @@ void test_from_midi_matches_megatoy() {
     CHECK_EQ(p.fnum, table[m % 12]);
     CHECK_EQ(p.block, block);
   }
-  // Extremes.  megatoy clamps negative octaves (MIDI 0..11) up to block 0,
-  // the lowest representable octave, while keeping the pitch-class F-num.
-  CHECK_EQ(NotePitch::from_midi(0).fnum, 322);
+  // Extremes: MIDI 0..11 clamp up to block 0, octaves above 7 down to
+  // block 7.
+  CHECK_EQ(NotePitch::from_midi(0).fnum, 644);
   CHECK_EQ(NotePitch::from_midi(0).block, 0);
-  CHECK_EQ(NotePitch::from_midi(11).fnum, 608);
+  CHECK_EQ(NotePitch::from_midi(11).fnum, 1215);
   CHECK_EQ(NotePitch::from_midi(11).block, 0);
   CHECK_EQ(NotePitch::from_midi(12).block, 0);
-  CHECK_EQ(NotePitch::from_midi(127).fnum, 482);
+  CHECK_EQ(NotePitch::from_midi(127).fnum, 965);
   CHECK_EQ(NotePitch::from_midi(127).block, 7);
   // Out-of-range input is clamped into the MIDI range.
   CHECK_EQ(NotePitch::from_midi(-5).fnum, NotePitch::from_midi(0).fnum);
   CHECK_EQ(NotePitch::from_midi(999).fnum, NotePitch::from_midi(127).fnum);
 
-  // C4 (MIDI 60) with megatoy's F-num gives the same keycode as EG_SPEC's
-  // F-num 644 / block 4 example, so key scaling matches.
+  // C4 (MIDI 60) is EG_SPEC's F-num 644 / block 4 example.
   CHECK_EQ(NotePitch::from_midi(60).keycode(), kC4.keycode());
+}
+
+// MIDI 60 is middle C, MIDI 69 is A440, and C4..B4 have these key codes.
+void test_from_midi_is_standard_pitch() {
+  const NotePitch c4 = NotePitch::from_midi(60);
+  CHECK_EQ(c4.fnum, 644);
+  CHECK_EQ(c4.block, 4);
+
+  // Hz = fnum * 2^(block - 1) * clock / 144 / 2^20.
+  const NotePitch a4 = NotePitch::from_midi(69);
+  const double a4_hz = std::ldexp(static_cast<double>(a4.fnum), a4.block - 1) *
+                       7670454.0 / 144.0 / 1048576.0;
+  CHECK_REL(a4_hz, 440.0, 0.005);
+
+  const int keycodes[12] = {16, 16, 16, 16, 16, 16, 17, 17, 17, 18, 18, 19};
+  for (int m = 60; m <= 71; ++m) {
+    CHECK_EQ(NotePitch::from_midi(m).keycode(), keycodes[m - 60]);
+  }
 }
 
 // ------------------------------------------------------- cross-check vs ref
@@ -845,7 +861,8 @@ int main() {
   RUN_TEST(test_skip_matches_stepping);
   RUN_TEST(test_alternating_run_matches_stepping);
   RUN_TEST(test_tl_and_units);
-  RUN_TEST(test_from_midi_matches_megatoy);
+  RUN_TEST(test_from_midi_uses_the_note_table);
+  RUN_TEST(test_from_midi_is_standard_pitch);
   RUN_TEST(test_cross_check_against_reference);
   return testing::summary();
 }
