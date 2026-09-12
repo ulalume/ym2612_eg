@@ -32,7 +32,7 @@ struct NotePitch {
   uint16_t fnum = 0; // 11-bit
   uint8_t block = 0; // 0..7
 
-  // F-num from MDSDRV's standard row, block = midi/12 - 1 clamped to 0..7:
+  // F-num from the note table, block = midi/12 - 1 clamped to 0..7:
   // MIDI 60 is middle C at block 4, F-num 644.
   static NotePitch from_midi(int midi_note);
 
@@ -44,7 +44,7 @@ enum class EgPhase : uint8_t { Attack, Decay, Sustain, Release };
 
 namespace detail {
 
-// MDSDRV's standard F-number row, C .. B.
+// F-number of each note, C .. B.
 inline constexpr uint16_t kNoteFnum[12] = {644, 682, 723, 766, 811, 859,
                                            910, 965, 1022, 1083, 1147, 1215};
 
@@ -75,8 +75,7 @@ inline NotePitch NotePitch::from_midi(int midi_note) {
   }
   const uint8_t block =
       octave > 7 ? uint8_t{7} : static_cast<uint8_t>(octave);
-  // Bends renormalise F-num into [644, 1288); every table entry is already
-  // inside that window, so block is the octave.
+  // Every table entry lies in [644, 1288), so block is the octave.
   return NotePitch{detail::kNoteFnum[m % 12], block};
 }
 

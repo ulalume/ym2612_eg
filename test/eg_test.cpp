@@ -725,12 +725,11 @@ void test_tl_and_units() {
   CHECK_REL(atten_to_amplitude(128), 0.25, 1e-12);
 }
 
-// megatoy src/ym2612/note.hpp: fnote_from_key() + Note::from_midi_note()
-// + frequency_with_bend(note, 0).
-void test_from_midi_matches_megatoy() {
+// MIDI note: F-num from the note table, block = octave.
+void test_from_midi_uses_the_note_table() {
   const uint16_t table[12] = {644, 682, 723, 766, 811, 859,
                               910, 965, 1022, 1083, 1147, 1215};
-  // One full octave, MIDI 60..71 (megatoy octave 4).
+  // One full octave, MIDI 60..71: octave 4.
   for (int m = 60; m <= 71; ++m) {
     const NotePitch p = NotePitch::from_midi(m);
     CHECK_EQ(p.fnum, table[m % 12]);
@@ -743,8 +742,8 @@ void test_from_midi_matches_megatoy() {
     CHECK_EQ(p.fnum, table[m % 12]);
     CHECK_EQ(p.block, block);
   }
-  // Extremes.  megatoy clamps negative octaves (MIDI 0..11) up to block 0,
-  // the lowest representable octave, while keeping the pitch-class F-num.
+  // Extremes: MIDI 0..11 clamp up to block 0, octaves above 7 down to
+  // block 7.
   CHECK_EQ(NotePitch::from_midi(0).fnum, 644);
   CHECK_EQ(NotePitch::from_midi(0).block, 0);
   CHECK_EQ(NotePitch::from_midi(11).fnum, 1215);
@@ -760,8 +759,7 @@ void test_from_midi_matches_megatoy() {
   CHECK_EQ(NotePitch::from_midi(60).keycode(), kC4.keycode());
 }
 
-// MIDI 60 is middle C and MIDI 69 is A440; C4..B4 get the key codes MDSDRV
-// and Furnace give the same pitches.
+// MIDI 60 is middle C, MIDI 69 is A440, and C4..B4 have these key codes.
 void test_from_midi_is_standard_pitch() {
   const NotePitch c4 = NotePitch::from_midi(60);
   CHECK_EQ(c4.fnum, 644);
@@ -863,7 +861,7 @@ int main() {
   RUN_TEST(test_skip_matches_stepping);
   RUN_TEST(test_alternating_run_matches_stepping);
   RUN_TEST(test_tl_and_units);
-  RUN_TEST(test_from_midi_matches_megatoy);
+  RUN_TEST(test_from_midi_uses_the_note_table);
   RUN_TEST(test_from_midi_is_standard_pitch);
   RUN_TEST(test_cross_check_against_reference);
   return testing::summary();
