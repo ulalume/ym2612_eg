@@ -32,8 +32,8 @@ struct NotePitch {
   uint16_t fnum = 0; // 11-bit
   uint8_t block = 0; // 0..7
 
-  // Mirrors megatoy's note -> (fnum, block) mapping exactly:
-  // ym2612::Note::from_midi_note() followed by frequency_with_bend(note, 0).
+  // F-num from MDSDRV's standard row, block = midi/12 - 1 clamped to 0..7:
+  // MIDI 60 is middle C at block 4, F-num 644.
   static NotePitch from_midi(int midi_note);
 
   // keycode = (block << 2) | (F11 << 1) | lsb.
@@ -44,9 +44,9 @@ enum class EgPhase : uint8_t { Attack, Decay, Sustain, Release };
 
 namespace detail {
 
-// megatoy src/ym2612/note.hpp, fnote_from_key(): C .. B.
-inline constexpr uint16_t kMegatoyFnum[12] = {322, 341, 361, 383, 406, 430,
-                                              455, 482, 511, 541, 574, 608};
+// MDSDRV's standard F-number row, C .. B.
+inline constexpr uint16_t kNoteFnum[12] = {644, 682, 723, 766, 811, 859,
+                                           910, 965, 1022, 1083, 1147, 1215};
 
 // What EgSimulator::skippable_samples() reports when the envelope can only be
 // moved again by an external event.  Far past any axis a caller can ask for,
@@ -67,17 +67,17 @@ enum EventBits : uint32_t {
 
 inline NotePitch NotePitch::from_midi(int midi_note) {
   const int m = midi_note < 0 ? 0 : (midi_note > 127 ? 127 : midi_note);
-  // Follows megatoy's mapping: octave = midi/12 - 1, negative octaves clamped
-  // up, so MIDI 0..11 land on block 0.
+  // octave = midi/12 - 1, negative octaves clamped up, so MIDI 0..11 land on
+  // block 0.
   int octave = m / 12 - 1;
   if (octave < 0) {
     octave = 0;
   }
   const uint8_t block =
       octave > 7 ? uint8_t{7} : static_cast<uint8_t>(octave);
-  // frequency_with_bend() renormalises F-num into [322, 644); every table
-  // entry is already inside that window, so block is untouched.
-  return NotePitch{detail::kMegatoyFnum[m % 12], block};
+  // Bends renormalise F-num into [644, 1288); every table entry is already
+  // inside that window, so block is the octave.
+  return NotePitch{detail::kNoteFnum[m % 12], block};
 }
 
 inline uint8_t NotePitch::keycode() const {
