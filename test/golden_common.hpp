@@ -100,20 +100,6 @@ inline int counter_shift_for_case(const EgSimulator &eg, bool *mixed) {
   return counter_shift_for_case(rate, mixed);
 }
 
-// Nuked runs its envelope state machine once per output sample and advances at
-// most one state per sample, while this library evaluates both transitions at
-// the top of an EG tick (EG_SPEC "reference tick loop", ymfm's model).  The two
-// agree whenever the attack ends *on* an EG tick, because the two spare samples
-// before the next tick absorb the Attack->Decay->Sustain pair.  They do not
-// agree when the attack ends between ticks, which only happens with the
-// instant attack (rate >= 62 forces att = 0 at key-on): SL = 0 then needs both
-// transitions and Nuked loses one increment, leaving it exactly one EG tick
-// behind us for the rest of the note.  Such cases are excluded from the
-// vectors.
-inline bool has_sl0_instant_attack_divergence(const EgSimulator &eg) {
-  return eg.rate_of(EgPhase::Attack) >= 62 && eg.sustain_attenuation() == 0;
-}
-
 // EG_SPEC 6 [DIFF] / SSG_EG_SPEC 5.1.  Nuked tests Decay -> Sustain with an
 // equality on the top six bits ((level >> 4) == (sl5 << 1)), which is a 16-wide
 // window; this library uses att >= sustain_att, as ymfm does and as both specs

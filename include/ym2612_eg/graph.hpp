@@ -252,9 +252,9 @@ inline EnvelopeCurve build_envelope_curve(const OperatorParams &op,
   //    "Full volume" is one step short of loudest_attenuation(), not 0: with
   //    an inverted SSG-EG mode 0 is the quiet end of the ramp, and the loudest
   //    attenuation is the fold level itself, which an operator only ever
-  //    passes through. AR is zeroed for this run alone -- key_on() snaps an
-  //    instant attack straight to att = 0 and would throw the start level
-  //    away, and the release rate does not depend on AR.
+  //    passes through. AR is zeroed for this run alone -- the key-on sample
+  //    snaps an instant attack straight to att = 0 and would throw the start
+  //    level away, and the release rate does not depend on AR.
   CurveRequest release;
   release.op = op;
   release.op.ar = 0;
@@ -264,9 +264,9 @@ inline EnvelopeCurve build_envelope_curve(const OperatorParams &op,
   const uint16_t loudest = loudest_attenuation(op);
   release.start_att = loudest > 0 ? static_cast<uint16_t>(loudest - 1) : 0;
   out.release = sample_curve(release);
-  // The key reaches the envelope one sample after the write, so the samples
-  // before that carry a level the note never sounds at: drop them and put the
-  // first sounding one at the origin.
+  // The key reaches the envelope on the sample after the write, and the
+  // release is drawn from the first point after that: drop what comes before
+  // it and put that point at the origin.
   {
     const float settled =
         static_cast<float>(1000.0 / sample_rate_hz(kNtscClockHz));

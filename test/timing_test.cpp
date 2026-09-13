@@ -105,8 +105,9 @@ void test_the_loudest_attenuation_follows_the_inversion() {
         (type & 0x04) != 0 ? kSsgFoldAttenuation : uint16_t{0};
     CHECK_EQ(loudest_attenuation(op), want);
     // ... and it agrees with output(), which is what does the inverting. AR
-    // is zeroed exactly as a caller staging a release does it: key_on() snaps
-    // an instant attack straight to att = 0 and would throw the level away.
+    // is zeroed exactly as a caller staging a release does it: the key-on
+    // sample snaps an instant attack straight to att = 0 and would throw the
+    // level away.
     OperatorParams released = op;
     released.ar = 0;
     EgSimulator sim(released, note(kReferenceMidiNote));
@@ -259,8 +260,8 @@ void test_a_rate_of_zero_lasts_forever() {
   CHECK(!std::isfinite(lifetime_of(adsr(31, 10, 2, 0, 7, 0))));  // SR = 0
   CHECK(!std::isfinite(lifetime_of(adsr(31, 0, 2, 5, 7, 0))));   // DR = 0, SL > 0
   CHECK(!std::isfinite(lifetime_of(adsr(0, 10, 2, 5, 7, 0))));   // AR = 0
-  // ... but SL = 0 skips the decay outright, exactly as the chip does, so
-  // DR = 0 costs nothing there.
+  // ... but SL = 0 leaves the decay on its first sample, with no update,
+  // exactly as the chip does, so DR = 0 costs nothing there.
   CHECK(std::isfinite(lifetime_of(adsr(31, 0, 0, 5, 7, 0))));
   // And a phase that never ends means the ones after it never start: it is
   // the phase itself that is infinite, not just the sum.
@@ -343,8 +344,8 @@ void test_the_loop_period_agrees_with_the_simulator() {
  * These are exactly the patches sample_curve() flags as SsgNeverLoops, and
  * the closed form arrives at the same three by arithmetic rather than by a
  * rule: an infinite phase makes the ramp infinite, and only the phases the
- * ramp actually needs are in the sum. SL = 0 skips the decay outright, so
- * DR = 0 costs nothing there; SL = 15 puts the sustain level above the fold,
+ * ramp actually needs are in the sum. SL = 0 leaves the decay on its first
+ * sample, with no update, so DR = 0 costs nothing there; SL = 15 puts the sustain level above the fold,
  * so SR never runs and SR = 0 costs nothing.
  */
 void test_a_ramp_that_never_finishes_is_no_loop_at_all() {

@@ -1,5 +1,5 @@
 // Golden-vector test: replays a recorded Nuked-OPN2 scenario on EgSimulator and
-// compares tick by tick.
+// compares sample by sample.
 //
 // The vectors in golden/*.json were produced by tools/golden_gen, which links
 // Nuked-OPN2 (LGPL 2.1).  Nothing here does -- this reads committed data.
@@ -11,13 +11,8 @@
 //   * eg_out   vs output()       -- exact, at every sample, allowing for
 //                                   Nuked's one-sample eg_out pipeline lag,
 //                                   which the generator already removed.
-//   * eg_state vs phase()        -- exact, but only on EG-tick samples.  Nuked
-//                                   runs its state machine once per output
-//                                   sample and moves one state per sample,
-//                                   while this library evaluates the whole
-//                                   transition chain at the top of an EG tick;
-//                                   the two agree at every tick.
-//   * counter_shift              -- recomputed here from the case's own rates
+//   * eg_state vs phase()        -- exact, at every sample.
+//   * counter_shift             -- recomputed here from the case's own rates
 //                                   and required to match what the file says,
 //                                   so a vector cannot ship a fitted alignment.
 
@@ -98,9 +93,7 @@ void run_case(const jsonlite::Value &c) {
   // Combinations this library is known to disagree with must never reach a
   // vector.
   const char *excluded = nullptr;
-  if (has_sl0_instant_attack_divergence(eg))
-    excluded = "SL=0 with instant attack";
-  else if (has_ssg_sustain_window_divergence(op, eg))
+  if (has_ssg_sustain_window_divergence(op, eg))
     excluded = "SSG-EG decay step wide enough to jump Nuked's sustain window";
   else if (shift != 0 && counter_wraps(counter_phase, samples))
     excluded = "counter-shifted case that outlives one 12-bit counter sweep";
@@ -151,8 +144,7 @@ void run_case(const jsonlite::Value &c) {
         first_bad = i;
       ++bad_out;
     }
-    if (i % 3 == 0 &&
-        static_cast<int>(eg.phase()) != state[static_cast<size_t>(i)]) {
+    if (static_cast<int>(eg.phase()) != state[static_cast<size_t>(i)]) {
       if (first_bad < 0)
         first_bad = i;
       ++bad_state;

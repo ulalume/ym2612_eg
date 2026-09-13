@@ -102,10 +102,8 @@ struct Scenario {
   std::vector<Case> cases;
 };
 
-// Nuked's state machine needs one spare output sample after a key transition
-// before the next EG tick, otherwise the tick is spent on a state transition
-// instead of an increment.  EG ticks sit on samples that are multiples of 3, so
-// an effective key event must land on sample % 3 == 1.
+// The first sample at or after `sample` that follows an EG tick.  EG ticks sit
+// on samples that are multiples of 3, so that is sample % 3 == 1.
 int align_gate(int sample) {
   while (sample % 3 != 1)
     ++sample;
@@ -222,12 +220,6 @@ Verdict verify(const Case &c, const Trace &t, bool *out_differs) {
     shift = 0;
   v.shift = shift;
 
-  if (has_sl0_instant_attack_divergence(eg)) {
-    v.ok = false;
-    v.why = "SL=0 with instant attack: Nuked spends the first EG tick on the "
-            "second state transition";
-    return v;
-  }
   if (has_ssg_sustain_window_divergence(c.op, eg)) {
     v.ok = false;
     v.why = "SSG-EG with a decay step > 15 can jump Nuked's 16-wide "
@@ -261,9 +253,9 @@ Verdict verify(const Case &c, const Trace &t, bool *out_differs) {
               std::to_string(t.level[i]);
       return v;
     }
-    if (i % 3 == 0 && static_cast<int>(eg.phase()) != t.state[i]) {
+    if (static_cast<int>(eg.phase()) != t.state[i]) {
       v.ok = false;
-      v.why = "state mismatch at EG tick " + std::to_string(i) + ": ours " +
+      v.why = "state mismatch at sample " + std::to_string(i) + ": ours " +
               std::to_string(static_cast<int>(eg.phase())) + " vs Nuked " +
               std::to_string(t.state[i]);
       return v;
@@ -680,6 +672,60 @@ Scenario high_rate() {
   return s;
 }
 
+// 10. Key events on every alignment to the EG tick.  Sample 0 of a vector is
+//     an EG tick, so a key event on sample % 3 == 0 lands on a tick and 1 and
+//     2 on the two samples after it.
+Scenario key_alignment() {
+  Scenario s;
+  s.file = "key_alignment";
+  s.title = "Key events on every EG-tick alignment";
+  s.description = "Key-on and key-off on samples 0, 1 and 2 mod 3, named in "
+                  "each case: SL=0 with the instant attack, SSG-EG $08 at "
+                  "SL=0 with every rate 63 and at SL=1 with DR rate 52, a "
+                  "rate-48 attack from release, key-off in decay and in "
+                  "sustain, and a retrigger during the attack.";
+  for (int a = 0; a < 3; ++a) {
+    const int b = (a + 1) % 3;
+    const int c = (a + 2) % 3;
+    const std::string at = ", on " + num(a) + " off " + num(b);
+    s.cases.push_back({"SL=0 instant attack" + at,
+                       patch(31, 10, 5, 7, 0, 0, 0, 0), note(60), 20000,
+                       {{9 + a, true}, {15000 + b, false}}});
+    // KS=3 at C4: ksv 16.
+    s.cases.push_back({"SSG=$08 SL=0 rates 63" + at,
+                       patch(31, 31, 31, 15, 0, 0, 3, 8), note(60), 6000,
+                       {{9 + a, true}, {5100 + b, false}}});
+    // DR rate 52 keeps the 4x decay step at 8, inside the sustain window.
+    s.cases.push_back({"SSG=$08 SL=1 DR rate 52" + at,
+                       patch(31, 18, 31, 15, 1, 0, 3, 8), note(60), 6000,
+                       {{9 + a, true}, {5100 + b, false}}});
+    // Block 0: ksv 0, so AR=24 is rate 48, an update on every tick.
+    s.cases.push_back({"AR rate 48 from release" + at + " on " + num(c),
+                       patch(24, 10, 5, 7, 2, 0, 0, 0), NotePitch{644, 0},
+                       12000,
+                       {{9 + a, true},
+                        {3000 + b, false},
+                        {6000 + c, true},
+                        {9000 + a, false}}});
+    s.cases.push_back({"key-off in decay, DR rate 48" + at,
+                       patch(31, 23, 4, 1, 8, 0, 0, 0), note(60), 6000,
+                       {{9 + a, true}, {402 + b, false}}});
+    s.cases.push_back({"key-off in sustain, SR rate 48" + at,
+                       patch(31, 23, 23, 1, 2, 0, 0, 0), note(60), 6000,
+                       {{9 + a, true}, {1500 + b, false}}});
+    // AR=12 at C4: rate 26, an attack of ~9300 samples; the key comes back
+    // 1, 2 or 3 samples after the key-off.
+    s.cases.push_back({"retrigger during attack" + at + " on " +
+                           num((b + 1 + a) % 3),
+                       patch(12, 8, 4, 6, 6, 0, 0, 0), note(60), 24000,
+                       {{9 + a, true},
+                        {3000 + b, false},
+                        {3001 + b + a, true},
+                        {20000 + c, false}}});
+  }
+  return s;
+}
+
 } // namespace
 
 int main(int argc, char **argv) {
@@ -694,7 +740,7 @@ int main(int argc, char **argv) {
                                 sr_rr_sweep(),     ks_pitch(),
                                 ssg_modes(),       ssg_slow_attack(),
                                 retrigger(),       edge_anchors(),
-                                high_rate()};
+                                high_rate(),       key_alignment()};
   bool ok = true;
   for (const Scenario &s : scenarios)
     ok &= emit(s, dir);

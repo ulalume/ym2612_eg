@@ -113,6 +113,7 @@ void test_sr0_never_loops() {
   // SL <= 14 with SR = 0: the ramp parks at SL and never reaches 0x200.
   EgSimulator sim(ssg_patch(31, 0, 4, 0x08), kRks0);
   sim.key_on();
+  sim.step(); // the key-on sample
   const auto folds = ssg_fold_samples(sim, 3, 400000);
   CHECK_EQ(folds.size(), size_t{0});
   CHECK_EQ(sim.attenuation(), 128); // parked exactly at the sustain level
@@ -124,6 +125,7 @@ void test_dr0_never_loops() {
   // DR = 0 with SL > 0: decay never advances, so the operator sits at 0.
   EgSimulator sim(ssg_patch(0, 31, 4, 0x08), kRks0);
   sim.key_on();
+  sim.step(); // the key-on sample
   const auto folds = ssg_fold_samples(sim, 3, 400000);
   CHECK_EQ(folds.size(), size_t{0});
   CHECK_EQ(sim.attenuation(), 0);
@@ -135,6 +137,7 @@ void test_dr0_never_loops() {
 void test_one_sample_at_0x200_before_fold() {
   EgSimulator sim(ssg_patch(15, 0, 15, 0x08), kRks0);
   sim.key_on();
+  sim.step(); // the key-on sample
   int runs = 0;
   int current = 0;
   int max_run = 0;
@@ -178,6 +181,7 @@ void test_four_times_increment_and_freeze() {
   // where the plain envelope would run all the way to 0x3FF.
   EgSimulator loop(ssg_patch(15, 0, 15, 0x08), kRks0);
   loop.key_on();
+  loop.step(); // the key-on sample
   uint16_t peak = 0;
   for (uint64_t i = 0; i < 100000; ++i) {
     peak = std::max(peak, loop.attenuation());
@@ -238,6 +242,7 @@ void test_mode_shapes() {
   {
     EgSimulator sim(ssg_patch(15, 0, 15, 0x0A), kRks0);
     sim.key_on();
+    sim.step(); // the key-on sample
     CHECK(!sim.ssg_inverted());
     ssg_fold_samples(sim, 1, 200000);
     sim.step(); // consume the fold
@@ -275,6 +280,7 @@ void test_mode_shapes() {
   {
     EgSimulator sim(ssg_patch(15, 0, 15, 0x0E), kRks0);
     sim.key_on();
+    sim.step(); // the key-on sample
     CHECK(sim.ssg_inverted());
     ssg_fold_samples(sim, 1, 200000);
     sim.step();
@@ -383,6 +389,7 @@ void test_release_is_also_four_times_faster() {
     OperatorParams op = ssg_patch(15, 0, 15, ssg, 31, /*rr=*/6);
     EgSimulator sim(op, kRks0);
     sim.key_on();
+    sim.step(); // the key-on sample
     CHECK_EQ(sim.attenuation(), 0);
     sim.key_off();
     return ticks_until(
@@ -397,6 +404,7 @@ void test_release_is_also_four_times_faster() {
 void test_key_off_is_edge_triggered() {
   EgSimulator sim(ssg_patch(15, 0, 15, 0x0A), kRks0);
   sim.key_on();
+  sim.step(); // the key-on sample
   ssg_fold_samples(sim, 1, 200000);
   sim.step();
   while (sim.attenuation() < 128)

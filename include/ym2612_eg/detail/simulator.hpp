@@ -125,44 +125,37 @@ public:
     recompute();
   }
 
-  // Edge-triggered, like a $28 write.  A write takes one output sample to
-  // reach the envelope: until the next step() the SSG-EG block still acts on
-  // the key state it had before.
-  void key_on() {
-    if (keyed_on_)
-      return;
-    keyed_on_ = true;
-    ssg_held_ = false;
-    ssg_in_fold_ = false;
-    phase_ = EgPhase::Attack;
-    // Attenuation is NOT reset; attack resumes from the current level,
-    // except the instant-attack case.
-    if (rate_[0] >= 62)
-      att_ = 0;
-  }
-
-  void key_off() {
-    if (!keyed_on_)
-      return;
-    keyed_on_ = false;
-    phase_ = EgPhase::Release;
-  }
+  // Edge-triggered, like a $28 write.  The edge lands on the next step(): the
+  // phase, the level and the SSG-EG block act on the key state before it until
+  // then.  Attenuation is never reset by a key-on; the attack resumes from the
+  // current level, except at rate >= 62, which snaps it to 0.
+  void key_on() { keyed_on_ = true; }
+  void key_off() { keyed_on_ = false; }
 
   // Advance one output sample (clock / 144).  SSG-EG logic runs every sample
-  // and *before* the envelope update; the envelope itself advances once per
-  // three samples.
+  // and *before* the envelope update.  The envelope moves at most one phase
+  // per sample, and its level only on an EG tick (every third sample) that
+  // does not change the phase.
   void step() {
     events_ = 0;
-    if (ssg_enable_)
-      ssg_step();
-    else
-      envelope_off_step();
-    if (eg_divider_ == 0)
-      eg_step();
-    // The key state and the phase are both latched at the end of the update,
-    // so the next sample acts on what this one started with.
+    const bool tick = eg_divider_ == 0;
+    if (tick) {
+      // 12-bit free-running counter that skips 0 on overflow.
+      counter_ = (counter_ + 1) & 0x0FFF;
+      if (counter_ == 0)
+        counter_ = 1;
+    }
+    const bool kon_edge = keyed_on_ && !keyed_on_at_start_;
+    if (kon_edge) {
+      ssg_held_ = false;
+      ssg_in_fold_ = false;
+    }
+    bool hold_up = false;
+    const bool kon_event = ssg_enable_ ? ssg_step(hold_up) : kon_edge;
+    envelope_step(kon_event, hold_up, tick);
+    // The key state is latched at the end of the update, so the next sample
+    // acts on what this one ended with.
     keyed_on_at_start_ = keyed_on_;
-    phase_at_start_ = phase_;
     if (++eg_divider_ == kEgClockDivider)
       eg_divider_ = 0;
     ++samples_;
@@ -191,7 +184,7 @@ public:
         return 0;
     } else if (phase_ != EgPhase::Attack && (att_ & 0x3F0) == 0x3F0 &&
                att_ != kMaxAttenuation) {
-      // envelope_off_step() snaps to silence on the next output sample.
+      // The envelope-off snap to silence lands on the next output sample.
       return 0;
     }
 
@@ -258,7 +251,6 @@ public:
     counter_ = counter_phase & 0x0FFF;
     att_ = start_att > kMaxAttenuation ? kMaxAttenuation : start_att;
     phase_ = EgPhase::Release;
-    phase_at_start_ = EgPhase::Release;
     keyed_on_ = false;
     keyed_on_at_start_ = false;
     ssg_invert_ = false;
@@ -294,7 +286,7 @@ public:
       return false;
     if (phase_ == EgPhase::Attack) {
       if (att_ == 0)
-        return false; // -> Decay on the next EG tick
+        return false; // -> Decay on the next sample
       if (ssg_churning())
         return false;
       // Rate 0/1 (only reachable with AR=0) and rates 62/63 both freeze the
@@ -319,8 +311,8 @@ public:
     if (!ssg_enable_ && (att_ & 0x3F0) == 0x3F0)
       return false;
     // A Decay that already satisfies the sustain test still has that
-    // transition ahead of it: reporting rest here would end a caller's run
-    // one tick early and swallow the Decay -> Sustain event.
+    // transition ahead of it, on the next sample: reporting rest here would
+    // end a caller's run early and swallow the Decay -> Sustain event.
     if (phase_ == EgPhase::Decay && att_ >= sustain_att_)
       return false;
     return rate_[static_cast<int>(phase_)] == 0;
@@ -391,19 +383,19 @@ private:
     return true;
   }
 
-  // Output samples until an EG tick can move the attenuation or the phase;
+  // Output samples until one can move the attenuation or the phase;
   // detail::kUnboundedSkip when none ever will.
   uint32_t samples_to_eg_move() const {
+    // A transition test that already holds fires on the very next sample,
+    // whatever the rate does.
+    if ((phase_ == EgPhase::Attack && att_ == 0) ||
+        (phase_ == EgPhase::Decay && att_ >= sustain_att_))
+      return 0;
+
     // An EG tick lands on the samples whose divider reads 0 on entry.
     const uint32_t to_tick =
         static_cast<uint32_t>((kEgClockDivider - eg_divider_) %
                               kEgClockDivider);
-
-    // A transition test that already holds fires on that tick whatever the
-    // rate does, and the phase changing is itself a change.
-    if ((phase_ == EgPhase::Attack && att_ == 0) ||
-        (phase_ == EgPhase::Decay && att_ >= sustain_att_))
-      return to_tick;
 
     const int rate = rate_[static_cast<int>(phase_)];
     // Where the increment cannot land, no tick moves anything: the attack
@@ -456,16 +448,20 @@ private:
   // Runs once per output sample, before the envelope update.  The latches it
   // raises are consumed by the same sample; the key state and the phase it
   // reads are the ones this sample started with, so a key write that has not
-  // been through a step() yet does not reach any of them.
-  void ssg_step() {
-    const bool in_fold = att_ >= kSsgFoldAttenuation;
+  // been through a step() yet does not reach any of them.  Returns whether a
+  // key-on, real or re-asserted by the fold, reaches the envelope this sample;
+  // `hold_up` is set when the hold-up latch blocks the envelope-off snap.
+  bool ssg_step(bool &hold_up) {
+    // A key-on at rate >= 62 zeroes the level on this very sample, so it never
+    // visits the fold it starts from; the repeat and the direction toggle the
+    // fold would raise change nothing on a key-on sample.
+    const bool in_fold = att_ >= kSsgFoldAttenuation &&
+                         !(keyed_on_ && !keyed_on_at_start_ && rate_[0] >= 62);
     // Below the fold with the key state settled and the direction flag already
     // masked, every branch below is a no-op.
     if (!in_fold && keyed_on_ == keyed_on_at_start_ && (keyed_on_at_start_ || !ssg_invert_)) {
       ssg_in_fold_ = false;
-      if (!keyed_on_)
-        phase_ = EgPhase::Release;
-      return;
+      return false;
     }
     // The fold region is every sample the envelope spends at or above 0x200,
     // which with AR < 31 is every sample of a whole attack.  The events report
@@ -488,8 +484,7 @@ private:
     }
     // Modes 3 and 5 (hold set, attack and alternate differing) freeze at 0x200,
     // i.e. at full output volume, instead of cutting to silence below.
-    const bool hold_up =
-        keyed_on_ && ssg_hold_ && (ssg_attack_ != ssg_alternate_);
+    hold_up = keyed_on_ && ssg_hold_ && (ssg_attack_ != ssg_alternate_);
     direction = direction && keyed_on_at_start_;
     if (direction != ssg_invert_)
       events_ |= detail::kEvSsgInvert;
@@ -502,88 +497,74 @@ private:
     // from what was heard, not from the internal level.
     if (koff_event && (ssg_attack_ != direction))
       att_ = (kSsgFoldAttenuation - att_) & 0x3FF;
-    const bool eg_off = att_ >= kSsgFoldAttenuation;
 
-    if (kon_event) {
-      // The virtual key-on: this is the 0x200 -> 0 snap.
-      phase_ = EgPhase::Attack;
-      if (rate_[0] >= 62)
-        att_ = 0;
-      if (entering && keyed_on_ && !ssg_hold_)
-        events_ |= detail::kEvSsgFold;
-    } else if (!keyed_on_) {
-      phase_ = EgPhase::Release;
-    }
+    // The virtual key-on; envelope_step() makes it the 0x200 -> 0 snap.
+    if (kon_event && entering && keyed_on_ && !ssg_hold_)
+      events_ |= detail::kEvSsgFold;
 
     // Hold set -> the mode latches here, once.
-    if (in_fold && ssg_hold_ && phase_at_start_ != EgPhase::Attack &&
-        !ssg_held_) {
+    if (in_fold && ssg_hold_ && phase_ != EgPhase::Attack && !ssg_held_) {
       ssg_held_ = true;
       events_ |= detail::kEvSsgHold;
     }
-
-    envelope_off(kon_event, hold_up, eg_off);
+    return kon_event;
   }
 
-  // "Envelope off": with the slot out of Attack and no key-on re-asserted, a
-  // level at the threshold forces att = 0x3FF and Release.  Evaluated per
-  // output sample, so it lands on the sample after the tick that pushed att
-  // there -- and the phase it tests is the one the sample started with, so a
-  // slot that has yet to leave Attack is held for a sample first.
-  void envelope_off(bool kon_event, bool hold_up, bool eg_off) {
-    if (kon_event || hold_up || phase_at_start_ == EgPhase::Attack || !eg_off)
-      return;
-    att_ = kMaxAttenuation;
-    phase_ = EgPhase::Release;
-  }
+  // The envelope update for one output sample, decided by the phase the
+  // sample starts in.  A key-on enters Attack.  Otherwise a phase whose end
+  // test holds moves on by one, and only a phase that stays takes the EG
+  // tick's increment, at its own rate; a key-off then leaves for Release.
+  void envelope_step(bool kon_event, bool hold_up, bool tick) {
+    const EgPhase start = phase_;
+    // Without SSG-EG the threshold is the top row of the scale, with it 0x200.
+    const bool eg_off = ssg_enable_ ? att_ >= kSsgFoldAttenuation
+                                    : (att_ & 0x3F0) == 0x3F0;
 
-  // Without SSG-EG the threshold is the top row of the scale instead of 0x200.
-  void envelope_off_step() {
-    envelope_off(keyed_on_ && !keyed_on_at_start_, false,
-                 (att_ & 0x3F0) == 0x3F0 && att_ != kMaxAttenuation);
-  }
-
-  // One EG tick, clock / 432.
-  void eg_step() {
-    // 12-bit free-running counter that skips 0 on overflow.
-    counter_ = (counter_ + 1) & 0x0FFF;
-    if (counter_ == 0)
-      counter_ = 1;
-
-    // Transitions are checked at the top of the tick, before any increment,
-    // so both can fire on the same tick and SL=0 skips decay entirely.
-    if (phase_ == EgPhase::Attack && att_ == 0) {
-      phase_ = EgPhase::Decay;
-      events_ |= detail::kEvAttackEnd;
-    }
-    if (phase_ == EgPhase::Decay && att_ >= sustain_att_) {
-      phase_ = EgPhase::Sustain;
-      events_ |= detail::kEvDecayEnd;
-    }
-
-    const int rate = rate_[static_cast<int>(phase_)];
-    const int shift = detail::rate_shift(rate);
-    if (counter_ & ((1 << shift) - 1))
-      return;
-    const int inc = detail::kIncTable[rate][(counter_ >> shift) & 7];
-
-    if (phase_ == EgPhase::Attack) {
-      // Exponential, and the shift must be arithmetic: ~att is negative.
-      static_assert((-16 >> 4) == -1, "arithmetic right shift required");
-      if (rate < 62 && inc != 0 && keyed_on_)
-        att_ += (~att_ * inc) >> 4;
-      return;
-    }
-
-    if (ssg_enable_) {
-      // 4x increment, frozen at 0x200.  Applies to DR, SR and RR alike.
-      if (att_ < kSsgFoldAttenuation)
-        att_ += 4 * inc;
-    } else {
-      att_ += inc;
-    }
-    if (att_ > kMaxAttenuation)
+    // "Envelope off": out of Attack, with no key-on re-asserted and no hold-up,
+    // a level at the threshold forces att = 0x3FF and Release.  It lands on
+    // the sample after the one that pushed att there.
+    if (!kon_event && !hold_up && start != EgPhase::Attack && eg_off) {
       att_ = kMaxAttenuation;
+      phase_ = EgPhase::Release;
+      return;
+    }
+
+    if (kon_event) {
+      phase_ = EgPhase::Attack;
+      if (rate_[0] >= 62)
+        att_ = 0;
+      else if (start == EgPhase::Attack && att_ != 0 && keyed_on_ && tick)
+        attack_increment();
+      return;
+    }
+
+    EgPhase next = start;
+    if (start == EgPhase::Attack) {
+      if (att_ == 0)
+        next = EgPhase::Decay;
+      else if (tick && keyed_on_ && rate_[0] < 62)
+        attack_increment();
+    } else if (start == EgPhase::Decay && att_ >= sustain_att_) {
+      next = EgPhase::Sustain;
+    } else if (tick && !eg_off) {
+      // DR, SR and RR alike: 4x under SSG-EG, where eg_off freezes it at 0x200.
+      const int inc =
+          detail::increment_at(rate_[static_cast<int>(start)], counter_);
+      att_ += ssg_enable_ ? 4 * inc : inc;
+    }
+
+    if (!keyed_on_)
+      next = EgPhase::Release;
+    else if (next != start)
+      events_ |= next == EgPhase::Decay ? detail::kEvAttackEnd
+                                        : detail::kEvDecayEnd;
+    phase_ = next;
+  }
+
+  void attack_increment() {
+    // Exponential, and the shift must be arithmetic: ~att is negative.
+    static_assert((-16 >> 4) == -1, "arithmetic right shift required");
+    att_ += (~att_ * detail::increment_at(rate_[0], counter_)) >> 4;
   }
 
   OperatorParams params_{};
@@ -602,7 +583,6 @@ private:
   int counter_ = 0;
   int eg_divider_ = 0;
   EgPhase phase_ = EgPhase::Release;
-  EgPhase phase_at_start_ = EgPhase::Release;
   bool keyed_on_ = false;
   bool keyed_on_at_start_ = false;
   bool ssg_invert_ = false;

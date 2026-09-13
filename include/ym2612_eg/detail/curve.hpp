@@ -257,9 +257,16 @@ inline CurveResult sample_curve(const CurveRequest &request) {
     return true;
   };
 
-  push_point(0.0, true);
+  // The note starts on the key-on sample, the first step() below, so the curve
+  // starts at the level that sample leaves.
+  EgSimulator key_on_sample = sim;
+  if (!gate_forever && gate_sample == 0)
+    key_on_sample.key_off();
+  key_on_sample.step();
+  emit(0.0, key_on_sample.output(), key_on_sample.attenuation(), true);
 
-  double silence_start_ms = sim.output() >= kSilenceAttenuation ? 0.0 : -1.0;
+  double silence_start_ms =
+      key_on_sample.output() >= kSilenceAttenuation ? 0.0 : -1.0;
   size_t silence_index = 0;
 
   // The run into silence has to be unbroken, so any louder sample restarts it.

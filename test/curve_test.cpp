@@ -81,7 +81,11 @@ std::vector<CurvePoint> raw_curve(const CurveRequest &req, double end_ms) {
   sim.reset(0, req.start_att);
   sim.key_on();
   std::vector<CurvePoint> raw;
-  raw.push_back(CurvePoint{0.0f, sim.output(), sim.attenuation()});
+  // sample_curve() starts at the level the key-on sample leaves.
+  EgSimulator key_on_sample = sim;
+  key_on_sample.step();
+  raw.push_back(
+      CurvePoint{0.0f, key_on_sample.output(), key_on_sample.attenuation()});
   while (sim.time_ms() < end_ms) {
     sim.step();
     const uint16_t o = sim.output();
@@ -128,7 +132,7 @@ void test_points_and_marker_ordering() {
   CHECK(has_marker(r, MarkerKind::Silence));
   CHECK(!has_marker(r, MarkerKind::SsgFold));
 
-  // Fires on EG tick 1, i.e. the very first output sample.
+  // Fires on the sample after the key-on sample, inside EG tick 1.
   CHECK(marker_ms(r, MarkerKind::AttackEnd) > 0.0);
   CHECK(marker_ms(r, MarkerKind::AttackEnd) <= 0.0564);
   CHECK_REL(marker_ms(r, MarkerKind::DecayEnd), 306.4, 0.01);

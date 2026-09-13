@@ -67,7 +67,8 @@ inline double linear_phase_ms(int rate, int from_att, int to_att, bool ssg,
 /// left the shared counter -- so ssg_ramp_ms() walks its own rather than
 /// calling this.
 inline double attack_ms(int rate, double eg_hz) {
-  // key_on() snaps these straight to att = 0; eg_step() guards on `rate < 62`.
+  // A key-on snaps these straight to att = 0; the attack update guards on
+  // `rate < 62`.
   if (rate >= 62) {
     return 0.0;
   }
@@ -85,7 +86,7 @@ inline double attack_ms(int rate, double eg_hz) {
   for (; att > 0 && slots < kSlotLimit; ++slots) {
     const int inc = kIncTable[rate][slots & 7];
     if (inc != 0) {
-      // Arithmetic shift of a negative value, exactly as eg_step() does it.
+      // Arithmetic shift of a negative value, exactly as the simulator does it.
       att += (~att * inc) >> 4;
     }
   }
@@ -119,6 +120,12 @@ struct EgWalk {
     ticks += step;
     return kIncTable[rate][(counter >> shift) & 7];
   }
+
+  /// Let the next tick go by without acting on it.
+  void pass_tick() {
+    counter = (counter + 1) & 0x0FFF;
+    ++ticks;
+  }
 };
 
 /**
@@ -144,9 +151,9 @@ inline double ssg_ramp_ms(int ar, int dr, int sr, int sustain_att,
   // table could not hang a frame.
   constexpr long long kSlotLimit = 8192;
   const double forever = std::numeric_limits<double>::infinity();
-  // ssg_step()'s virtual key-on snaps an instant attack straight to 0,
-  // exactly as key_on() does; anything slower resumes from where the fold
-  // found it.
+  // The fold's virtual key-on snaps an instant attack straight to 0, exactly
+  // as a real key-on does; anything slower resumes from where the fold found
+  // it.
   const bool instant_attack = ar >= 62;
   if (!instant_attack && !rate_advances(ar)) {
     return forever;
@@ -159,6 +166,11 @@ inline double ssg_ramp_ms(int ar, int dr, int sr, int sustain_att,
     long long slots = 0;
     if (instant_attack) {
       att = 0;
+      // The fold lands on the sample after the tick that reached it, and the
+      // virtual key-on and Attack -> Decay take a sample each, so with SL = 0
+      // Decay -> Sustain takes the next tick.
+      if (sustain_att == 0)
+        walk.pass_tick();
     } else {
       while (att > 0) {
         if (++slots > kSlotLimit) {
@@ -166,7 +178,7 @@ inline double ssg_ramp_ms(int ar, int dr, int sr, int sustain_att,
         }
         const int inc = walk.next_increment(ar);
         if (inc != 0) {
-          // Arithmetic shift of a negative value, as eg_step() does it.
+          // Arithmetic shift of a negative value, as the simulator does it.
           att += (~att * inc) >> 4;
         }
       }
@@ -196,8 +208,8 @@ inline double ssg_ramp_ms(int ar, int dr, int sr, int sustain_att,
 /// ends means the ones after it never start.
 struct PhaseDurations {
   double attack_ms = 0.0;
-  /// Full volume down to the sustain level.  Zero when SL = 0, which the chip
-  /// skips outright.
+  /// Full volume down to the sustain level.  Zero when SL = 0, where the
+  /// decay lasts one sample and adds nothing.
   double decay_ms = 0.0;
   /// The sustain level the rest of the way to silence -- or, with SSG-EG
   /// enabled, to the fold at 0x200.
