@@ -10,10 +10,6 @@
 
 namespace ym2612_eg {
 
-struct CurveRequest;
-struct CurveResult;
-inline CurveResult sample_curve(const CurveRequest &request);
-
 // Per-operator register values, already unpacked.
 struct OperatorParams {
   uint8_t ar = 0;  // attack rate, 0..31        ($50-$5F bits 0-4)
@@ -104,13 +100,6 @@ inline uint16_t loudest_attenuation(const OperatorParams &op) {
   const bool inverted = (op.ssg & 0x08) != 0 && (op.ssg & 0x04) != 0;
   return inverted ? kSsgFoldAttenuation : uint16_t{0};
 }
-
-namespace detail {
-struct HeldRun;
-inline HeldRun run_held(const OperatorParams &op, NotePitch pitch,
-                        uint16_t counter_phase, uint16_t start_att,
-                        uint32_t max_folds);
-} // namespace detail
 
 class EgSimulator {
 public:
@@ -333,13 +322,10 @@ public:
   int key_scale_value() const { return ksv_; }
   double clock_hz() const { return clock_hz_; }
 
-private:
-  friend CurveResult sample_curve(const CurveRequest &request);
-  friend detail::HeldRun detail::run_held(const OperatorParams &, NotePitch,
-                                          uint16_t, uint16_t, uint32_t);
-
+  // The detail::EventBits the last step() raised; skip() raises none.
   uint32_t step_events() const { return events_; }
 
+private:
   void recompute() {
     // Qualified: the member below shadows the free function's name.
     ksv_ = ym2612_eg::key_scale_value(params_, pitch_);
@@ -380,9 +366,9 @@ private:
     if (keyed_on_ && !ssg_hold_ &&
         (phase_ != EgPhase::Attack || rate_[0] >= 62))
       return false;
-    // Hold: the mode latch, and for the non-inverted modes the jump to
-    // silence, are both already behind us.
-    if (ssg_hold_ && phase_ != EgPhase::Attack) {
+    // Hold with the key down: the mode latch, and for the non-inverted modes
+    // the jump to silence, are both already behind us.
+    if (ssg_hold_ && keyed_on_ && phase_ != EgPhase::Attack) {
       if (!ssg_held_)
         return false;
       if (ssg_attack_ == ssg_invert_ &&
@@ -511,9 +497,9 @@ private:
     if (kon_event && entering && keyed_on_ && !ssg_hold_)
       events_ |= detail::kEvSsgFold;
 
-    // Hold set -> the mode latches here, once.
-    if (in_fold && ssg_hold_ && !kon_event && phase_ != EgPhase::Attack &&
-        !ssg_held_) {
+    // Hold set -> with the key down, the mode latches here, once.
+    if (in_fold && ssg_hold_ && keyed_on_ && !kon_event &&
+        phase_ != EgPhase::Attack && !ssg_held_) {
       ssg_held_ = true;
       events_ |= detail::kEvSsgHold;
     }

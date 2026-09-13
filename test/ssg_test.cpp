@@ -509,6 +509,47 @@ void test_fold_is_reported_once_per_cycle() {
   CHECK_REL(1000.0 / r.loop_hz, measured, 0.15);
 }
 
+// SsgHold is the hold mode latching with the key down. Wherever the key comes
+// up -- in a slow attack from 0x3FF, in the fold, before a release climbs to
+// it -- no sample with the key up raises it.
+void test_hold_latches_only_with_the_key_on() {
+  long latched = 0;
+  const auto run = [&latched](EgSimulator &sim, int samples) {
+    for (int i = 0; i < samples; ++i) {
+      sim.step();
+      if ((sim.step_events() & detail::kEvSsgHold) != 0) {
+        CHECK(sim.keyed_on());
+        ++latched;
+      }
+    }
+  };
+  for (const int ssg : {0x09, 0x0B, 0x0D, 0x0F})
+    for (const int ar : {31, 20, 10})
+      for (const int held : {1, 2, 3, 40, 400, 4000, 40000}) {
+        EgSimulator sim(ssg_patch(28, 20, 4, ssg, ar, 15), kRks2);
+        sim.key_on();
+        run(sim, held);
+        sim.key_off();
+        run(sim, 20000);
+      }
+  helpers::Rng rng(2612);
+  for (int n = 0; n < 150; ++n) {
+    const OperatorParams op =
+        ssg_patch(rng.in(0, 31), rng.in(0, 31), rng.in(0, 15),
+                  0x09 | (rng.in(0, 3) << 1), rng.in(1, 31), rng.in(0, 15));
+    EgSimulator sim(op, rng.in(0, 1) != 0 ? kRks2 : kRks0);
+    sim.reset(static_cast<uint16_t>(rng.in(0, 0x0FFF)));
+    for (int k = 0; k < 40; ++k) {
+      if (k % 2 == 0)
+        sim.key_on();
+      else
+        sim.key_off();
+      run(sim, rng.in(1, 3000));
+    }
+  }
+  CHECK(latched > 100);
+}
+
 } // namespace
 
 int main() {
@@ -532,5 +573,6 @@ int main() {
   RUN_TEST(test_sustain_window_hit_and_skipped);
   RUN_TEST(test_sl_below_15_always_under_fold);
   RUN_TEST(test_fold_is_reported_once_per_cycle);
+  RUN_TEST(test_hold_latches_only_with_the_key_on);
   return testing::summary();
 }
