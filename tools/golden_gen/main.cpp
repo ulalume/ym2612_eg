@@ -202,32 +202,12 @@ Trace record(const Case &c) {
 struct Verdict {
   bool ok = true;
   std::string why;
-  int shift = 0;
 };
 
 Verdict verify(const Case &c, const Trace &t, bool *out_differs) {
   Verdict v;
   EgSimulator eg(c.op, c.pitch);
-
-  bool mixed = false;
-  int shift = counter_shift_for_case(eg, &mixed);
-  if (mixed) {
-    v.ok = false;
-    v.why = "phases demand different eg_timer_low_lock shifts (mixed <48/>=48)";
-    return v;
-  }
-  if (shift == kNoConstraint)
-    shift = 0;
-  v.shift = shift;
-
-  if (shift != 0 && counter_wraps(t.counter_phase, c.samples)) {
-    v.ok = false;
-    v.why = "a counter-shifted case must stay inside one sweep of the 12-bit "
-            "EG counter; shorten `samples`";
-    return v;
-  }
-
-  eg.reset(static_cast<uint16_t>(apply_counter_shift(t.counter_phase, shift)));
+  eg.reset(static_cast<uint16_t>(t.counter_phase));
   size_t g = 0;
   *out_differs = false;
   const bool check_out = output_comparable(c.op);
@@ -301,8 +281,7 @@ void write_changes(std::string &json, const char *key,
   json += "],\n";
 }
 
-std::string case_json(const Case &c, const Trace &t, const Verdict &v,
-                      bool out_differs) {
+std::string case_json(const Case &c, const Trace &t, bool out_differs) {
   std::string j;
   j += "    {\n";
   j += "      \"name\": \"" + c.name + "\",\n";
@@ -317,8 +296,7 @@ std::string case_json(const Case &c, const Trace &t, const Verdict &v,
   j += "      \"fnum\": " + std::to_string(c.pitch.fnum) +
        ", \"block\": " + std::to_string(c.pitch.block) + ",\n";
   j += "      \"samples\": " + std::to_string(c.samples) +
-       ", \"counter_phase\": " + std::to_string(t.counter_phase) +
-       ", \"counter_shift\": " + std::to_string(v.shift) + ",\n";
+       ", \"counter_phase\": " + std::to_string(t.counter_phase) + ",\n";
   j += "      \"gate\": [";
   for (size_t i = 0; i < t.gate.size(); ++i) {
     if (i)
@@ -366,7 +344,7 @@ bool emit(const Scenario &s, const std::string &dir) {
     }
     if (i)
       j += ",\n";
-    j += case_json(c, t, v, out_differs);
+    j += case_json(c, t, out_differs);
   }
   j += "\n  ]\n}\n";
 
@@ -621,21 +599,15 @@ Scenario edge_anchors() {
   return s;
 }
 
-// 9. The rate >= 48 regime, where Nuked's latched timer bits rotate the
-//    increment row by one EG tick.  Every case here keeps all of its
-//    non-constant rows on the same side of that rotation, so the comparison
-//    stays exact once the documented counter shift is applied.
+// 9. The rate >= 48 regime, where the step comes from the low two bits of the
+//    timer Nuked latches on the previous tick (eg_timer_low_lock).
 Scenario high_rate() {
   Scenario s;
   s.file = "high_rate";
-  s.title = "Rates >= 48 (eg_timer_low_lock rotation)";
-  s.description = "Cases whose non-constant increment rows are all >= 48. The "
-                  "library follows the published table, Nuked latches the "
-                  "timer's low bits one tick late, so these are compared with "
-                  "the documented one-EG-tick counter shift -- exactly, not "
-                  "with a tolerance.";
-  // ksv = 2 at C4/KS=0, so every rate is 0 or 2 mod 4: the 2 mod 4 rows all
-  // want the same -1 shift and the 0 mod 4 rows are constant.
+  s.title = "Rates >= 48";
+  s.description = "Rates >= 48, whose step comes from the low two bits of the "
+                  "EG timer as latched on the previous tick.";
+  // ksv = 2 at C4/KS=0, so every rate is 0 or 2 mod 4.
   s.cases.push_back({"AR=28 (rate 58)", patch(28, 26, 24, 15, 4, 0, 0, 0),
                      note(60), 11000, hold(6, 7000)});
   s.cases.push_back({"AR=26 (rate 54)", patch(26, 26, 24, 15, 4, 0, 0, 0),
@@ -655,10 +627,10 @@ Scenario high_rate() {
   // to reach rate % 4 == 1 and 3.  fnum 960 -> fn_note 1, block 6 -> kcode 25,
   // KS=3 -> ksv 25.
   const NotePitch odd{960, 6};
-  s.cases.push_back({"rates 51/55/59 (+1 shift)",
+  s.cases.push_back({"rates 51/55/59",
                      patch(13, 15, 17, 7, 4, 0, 3, 0), odd, 11000,
                      hold(6, 7000)});
-  s.cases.push_back({"rates 49/53/57 (-1 shift)",
+  s.cases.push_back({"rates 49/53/57",
                      patch(12, 14, 16, 10, 4, 0, 3, 0), odd, 11000,
                      hold(6, 7000)});
   s.cases.push_back({"rates 51/55/59, SL=1", patch(13, 15, 17, 7, 1, 0, 3, 0),
@@ -735,7 +707,8 @@ Scenario sustain_window() {
                   "and can land past the sustain level's 16-wide window, after "
                   "which the decay carries on at DR. Key-ons on different "
                   "samples start the decay on different counter phases, so "
-                  "the window is hit in some cases and skipped in others.";
+                  "the window is hit in some cases and skipped in others. "
+                  "Slow attacks end on a counter aligned to their stride.";
   const NotePitch c4 = note(60);  // KS=0: ksv 2
   const NotePitch block2{644, 2}; // ksv 1
   const NotePitch block6{644, 6}; // ksv 3
@@ -768,6 +741,23 @@ Scenario sustain_window() {
     s.cases.push_back({"SSG=$09 DR rate 59 SL=4, on " + num(on(k)),
                        patch(31, 28, 0, 15, 4, 0, 0, 9), block6, 8000,
                        {{on(k), true}, {6000 + k, false}}});
+  // A slow attack ends on a counter aligned to its stride, which fixes where
+  // in the rate-57/58/59 row the decay's first step falls.
+  for (int ar : {16, 20, 22})
+    for (int sl : {1, 2})
+      for (int k = 0; k < 4; ++k)
+        s.cases.push_back({"SSG=$09 AR=" + num(ar) + " DR rate 58 SL=" +
+                               num(sl) + ", on " + num(on(k)),
+                           patch(ar, 28, 0, 15, sl, 0, 0, 9), c4, 6000,
+                           {{on(k), true}, {5000 + k % 3, false}}});
+  for (const NotePitch pitch : {block2, block6})
+    for (int sl : {1, 2})
+      for (int k = 0; k < 2; ++k)
+        s.cases.push_back({"SSG=$09 AR=20 DR rate " +
+                               num(pitch.block == 2 ? 57 : 59) + " SL=" +
+                               num(sl) + ", on " + num(on(k)),
+                           patch(20, 28, 0, 15, sl, 0, 0, 9), pitch, 6000,
+                           {{on(k), true}, {5000 + k, false}}});
   return s;
 }
 

@@ -1,12 +1,7 @@
 #pragma once
 
-// Rules shared by the golden-vector generator (tools/golden_gen, which links
-// Nuked-OPN2) and the golden test (test/golden_test.cpp, which does not).
-//
-// Everything here is *documentation with teeth*: the generator stamps the
-// values it used into the JSON, and the test recomputes them from the case
-// parameters and refuses to run if they disagree.  A vector can therefore never
-// smuggle in a hand-fitted alignment.
+// Constants shared by the golden-vector generator (tools/golden_gen, which
+// links Nuked-OPN2) and the golden test (test/golden_test.cpp, which does not).
 
 #include <ym2612_eg/ym2612_eg.hpp>
 
@@ -24,81 +19,8 @@ inline constexpr char kNukedCommit[] =
 // cycle slot+2), so our output() at sample i is Nuked's eg_out at sample i+1.
 inline constexpr int kOutputLagSamples = 1;
 
-// The free-running 12-bit EG counter, which skips 0 on overflow (EG_SPEC 1).
-inline int counter_step(int v) {
-  const int n = (v + 1) & 0x0FFF;
-  return n == 0 ? 1 : n;
-}
+// The EG counter value one tick earlier; the counter skips 0 on overflow.
 inline int counter_unstep(int v) { return v == 1 ? 0x0FFF : (v - 1) & 0x0FFF; }
-
-inline int apply_counter_shift(int phase, int shift) {
-  for (int i = 0; i < shift; ++i)
-    phase = counter_step(phase);
-  for (int i = 0; i > shift; --i)
-    phase = counter_unstep(phase);
-  return phase;
-}
-
-// A rate whose increment row is constant cannot expose a phase error at all.
-// That covers rows 0/1 (all zero), 48, 52, 56 and 60-63 (all eight cells
-// equal), which is why those rates never constrain the alignment.
-inline bool row_is_constant(int rate) {
-  for (int i = 1; i < 8; ++i)
-    if (detail::kIncTable[rate][i] != detail::kIncTable[rate][0])
-      return false;
-  return true;
-}
-
-// EG_SPEC 4 [DIFF].  For rate >= 48 Nuked does not use the published 64x8
-// table: it computes the increment from eg_stephi[rate & 3][eg_timer_low_lock],
-// and eg_timer_low_lock is a pipeline-latched copy of the timer.  Measured
-// against full Nuked traces for every rate 44..63, the result is exactly a
-// one-EG-tick rotation of the table row, in a direction that depends only on
-// rate % 4:
-//
-//   row constant   -> no constraint at all
-//   rate < 48      -> agrees with the table exactly, so the shift must be 0
-//   rate % 4 == 3  -> Nuked is one tick late  -> our counter must run +1 ahead
-//   otherwise      -> Nuked is one tick early -> our counter must run -1 behind
-//
-// The library deliberately keeps the table (EG_SPEC 4 recommends it, and the
-// per-4-tick average is identical); the shift is how the golden test states the
-// divergence exactly instead of loosening the comparison.
-inline constexpr int kNoConstraint = 99;
-
-inline int counter_shift_for_rate(int rate) {
-  if (row_is_constant(rate))
-    return kNoConstraint;
-  if (rate < 48)
-    return 0;
-  return (rate & 3) == 3 ? +1 : -1;
-}
-
-// Combine the constraints of the four phase rates of one case.  Returns
-// kNoConstraint if nothing constrains the alignment, and sets *mixed when two
-// phases demand different shifts -- such a case cannot be compared exactly and
-// the generator refuses to emit it.
-inline int counter_shift_for_case(const int rate[4], bool *mixed) {
-  int shift = kNoConstraint;
-  *mixed = false;
-  for (int i = 0; i < 4; ++i) {
-    const int s = counter_shift_for_rate(rate[i]);
-    if (s == kNoConstraint)
-      continue;
-    if (shift == kNoConstraint)
-      shift = s;
-    else if (shift != s)
-      *mixed = true;
-  }
-  return shift;
-}
-
-inline int counter_shift_for_case(const EgSimulator &eg, bool *mixed) {
-  const int rate[4] = {
-      eg.rate_of(EgPhase::Attack), eg.rate_of(EgPhase::Decay),
-      eg.rate_of(EgPhase::Sustain), eg.rate_of(EgPhase::Release)};
-  return counter_shift_for_case(rate, mixed);
-}
 
 // Nuked reads eg_out one pipeline stage ahead of the level it belongs to:
 // OPN2_EnvelopeSSGEG runs at cycle `slot`, OPN2_EnvelopeGenerate at slot+1 and
@@ -110,16 +32,6 @@ inline int counter_shift_for_case(const EgSimulator &eg, bool *mixed) {
 // alternate bit (bit 1 of $90) clear.
 inline bool output_comparable(const OperatorParams &op) {
   return !(op.ssg & 0x08) || !(op.ssg & 0x02);
-}
-
-// The one-EG-tick counter shift models Nuked's latched timer exactly, but only
-// inside a single sweep of the 12-bit counter: the skip-0 wrap (0xFFF -> 1)
-// is a discontinuity in `counter & 3`, and a shifted counter crosses it one
-// tick away from the real one.  A shifted case must therefore stay inside one
-// counter period.
-inline bool counter_wraps(int phase, int samples) {
-  const int ticks = (samples + 2) / 3;
-  return phase + ticks >= 0x0FFF;
 }
 
 } // namespace golden

@@ -12,9 +12,6 @@
 //                                   Nuked's one-sample eg_out pipeline lag,
 //                                   which the generator already removed.
 //   * eg_state vs phase()        -- exact, at every sample.
-//   * counter_shift             -- recomputed here from the case's own rates
-//                                   and required to match what the file says,
-//                                   so a vector cannot ship a fitted alignment.
 
 #include <ym2612_eg/ym2612_eg.hpp>
 
@@ -68,41 +65,8 @@ void run_case(const jsonlite::Value &c) {
 
   const int samples = static_cast<int>(c.integer("samples"));
   const int counter_phase = static_cast<int>(c.integer("counter_phase"));
-  const int stored_shift = static_cast<int>(c.integer("counter_shift"));
 
   EgSimulator eg(op, pitch);
-
-  // The alignment is a rule, not a fitted constant: derive it here and refuse
-  // the vector if it disagrees with what the generator recorded.
-  bool mixed = false;
-  int shift = counter_shift_for_case(eg, &mixed);
-  if (shift == kNoConstraint)
-    shift = 0;
-  if (mixed || shift != stored_shift) {
-    testing::fail(__FILE__, __LINE__,
-                  g_file + " / " + name + ": counter_shift " +
-                      std::to_string(stored_shift) + " is not the shift the " +
-                      "documented eg_timer_low_lock rule derives (" +
-                      (mixed ? std::string("mixed rates")
-                             : std::to_string(shift)) +
-                      ")");
-    return;
-  }
-  ++testing::g_checks;
-
-  // Combinations this library is known to disagree with must never reach a
-  // vector.
-  const char *excluded = nullptr;
-  if (shift != 0 && counter_wraps(counter_phase, samples))
-    excluded = "counter-shifted case that outlives one 12-bit counter sweep";
-  if (excluded) {
-    testing::fail(__FILE__, __LINE__,
-                  g_file + " / " + name + ": " + excluded +
-                      " is a documented divergence and must not appear in a "
-                      "golden vector");
-    return;
-  }
-  ++testing::g_checks;
 
   const std::vector<int> level = expand(c.nums("level"), samples);
   const std::vector<int> state = expand(c.nums("state"), samples);
@@ -114,7 +78,7 @@ void run_case(const jsonlite::Value &c) {
       c.find("out") ? expand(c.nums("out"), samples) : level;
   const std::vector<double> &gate = c.nums("gate");
 
-  eg.reset(static_cast<uint16_t>(apply_counter_shift(counter_phase, shift)));
+  eg.reset(static_cast<uint16_t>(counter_phase));
 
   int bad_level = 0, bad_state = 0, bad_out = 0;
   int first_bad = -1;

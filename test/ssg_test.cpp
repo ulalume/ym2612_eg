@@ -439,8 +439,8 @@ void test_sustain_window_hit_and_skipped() {
   EgSimulator hit(op, kRks2), skipped(op, kRks2);
   CHECK_EQ(hit.rate_of(EgPhase::Decay), 58);
   CHECK_EQ(hit.sustain_attenuation(), 128);
-  hit.reset(1);
-  skipped.reset(0);
+  hit.reset(0);
+  skipped.reset(1);
   hit.key_on();
   skipped.key_on();
   bool in_window = false;
