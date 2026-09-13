@@ -675,8 +675,8 @@ Scenario key_alignment() {
   s.title = "Key events on every EG-tick alignment";
   s.description = "Key-on and key-off on samples 0, 1 and 2 mod 3, named in "
                   "each case: SL=0 with the instant attack, SSG-EG $08 at "
-                  "SL=0 with every rate 63 and at SL=1 with DR rate 52, a "
-                  "rate-48 attack from release, key-off in decay and in "
+                  "SL=0 and SL=1 with every rate 63 and at SL=1 with DR rate "
+                  "52, a rate-48 attack from release, key-off in decay and in "
                   "sustain, and a retrigger during the attack.";
   for (int a = 0; a < 3; ++a) {
     const int b = (a + 1) % 3;
@@ -692,6 +692,9 @@ Scenario key_alignment() {
     // DR rate 52 keeps the 4x decay step at 8, inside the sustain window.
     s.cases.push_back({"SSG=$08 SL=1 DR rate 52" + at,
                        patch(31, 18, 31, 15, 1, 0, 3, 8), note(60), 6000,
+                       {{9 + a, true}, {5100 + b, false}}});
+    s.cases.push_back({"SSG=$08 SL=1 rates 63" + at,
+                       patch(31, 31, 31, 15, 1, 0, 3, 8), note(60), 6000,
                        {{9 + a, true}, {5100 + b, false}}});
     // Block 0: ksv 0, so AR=24 is rate 48, an update on every tick.
     s.cases.push_back({"AR rate 48 from release" + at + " on " + num(c),

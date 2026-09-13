@@ -1,6 +1,6 @@
 # Golden vectors
 
-155 cases recorded from Nuked-OPN2 (`ym3438.c` @ `335747d78cb0abbc3b55b004e62dad9763140115`)
+158 cases recorded from Nuked-OPN2 (`ym3438.c` @ `335747d78cb0abbc3b55b004e62dad9763140115`)
 at the register level: `eg_level`, `eg_state` and `eg_out` as change lists, plus the
 EG-counter phase. Each file's `format` field describes its layout.
 `test/golden_test.cpp` replays every case on `EgSimulator` with no tolerance; the
