@@ -449,7 +449,7 @@ void test_the_closed_forms_follow_the_sustain_window() {
                   CHECK_REL(period, 1000.0 / held.loop_hz, 1e-9);
                 }
               }
-  // Both outcomes, and loops whose closed form used to assume the window.
+  // The sweep reaches both outcomes, and loops among them.
   CHECK(skipped > 20);
   CHECK(hit > 20);
   CHECK(loops > 20);
