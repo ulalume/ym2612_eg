@@ -52,6 +52,9 @@ struct CurveRequest {
   double max_ms = 2000.0;
   double clock_hz = kNtscClockHz;
   uint16_t start_att = kMaxAttenuation; // retrigger support
+  // EG counter value preset before the key-on; negative picks the one the
+  // closed forms in timing.hpp describe, curve_counter_phase(op, pitch, false).
+  int counter_phase = -1;
 };
 
 struct CurveResult {
@@ -207,7 +210,11 @@ inline CurveResult sample_curve(const CurveRequest &request) {
   const double ms_per_sample = 1000.0 / fs;
 
   EgSimulator sim(request.op, request.pitch, request.clock_hz);
-  sim.reset(kCurveCounterPhase, request.start_att);
+  const uint16_t counter_phase =
+      request.counter_phase >= 0
+          ? static_cast<uint16_t>(request.counter_phase & 0x0FFF)
+          : detail::curve_counter_phase(request.op, request.pitch, false);
+  sim.reset(counter_phase, request.start_att);
   sim.key_on();
 
   const bool ssg_enabled = (request.op.ssg & 0x08) != 0;
@@ -413,7 +420,8 @@ inline CurveResult sample_curve(const CurveRequest &request) {
   // the loop runs; fewer are settled by following the held key.
   if (looping_mode && fold_samples.size() < 3 &&
       !std::isfinite(detail::loop_ramp_samples(request.op, request.pitch,
-                                               request.start_att)))
+                                               request.start_att,
+                                               counter_phase)))
     res.warnings.push_back(CurveWarning::SsgNeverLoops);
   if (res.loop_hz > 20.0)
     res.warnings.push_back(CurveWarning::SsgAudioRate);

@@ -180,12 +180,71 @@ inline bool window_can_be_skipped(const OperatorParams &op, NotePitch pitch) {
   return full && smaller;
 }
 
+/// Whether the first decay after a key-on steps past the sustain window, the
+/// key-on `alignment` samples after an EG tick whose counter reads `counter`,
+/// with the counter taken to run on without wrapping.
+inline bool first_ramp_skips(const OperatorParams &op, NotePitch pitch,
+                             int counter, int alignment) {
+  if (!window_can_be_skipped(op, pitch))
+    return false;
+  const int ksv = key_scale_value(op, pitch);
+  const int ar = effective_rate(op.ar & 0x1F, ksv);
+  const int dr = effective_rate(op.dr & 0x1F, ksv);
+  // The counter of the decay's first update.
+  int first = 0;
+  if (ar >= 62) {
+    // The key-on sample zeroes the level and Attack -> Decay takes the next,
+    // which is itself an EG tick when the key-on is two samples after one.
+    first = counter + (alignment == 2 ? 2 : 1);
+  } else if (!rate_advances(ar)) {
+    return false;
+  } else if (rate_shift(ar) >= 2) {
+    // The attack's last update lands on a counter that is a multiple of four.
+    first = 1;
+  } else {
+    // The attack updates from the tick after the key-on sample, and the decay
+    // from the tick after the attack's last update.
+    int att = kMaxAttenuation;
+    int c = counter;
+    while (att > 0) {
+      ++c;
+      att += (~att * increment_at(ar, c)) >> 4;
+    }
+    first = c + 1;
+  }
+  const int sustain = sustain_attenuation(op.sl);
+  int level = 0;
+  for (int c = first; level < kSsgFoldAttenuation; ++c) {
+    level += 4 * increment_at(dr, c);
+    if ((level >> 4) == (sustain >> 4))
+      return false;
+  }
+  return true;
+}
+
+/// The EG counter value sample_curve() keys on at: kCurveCounterPhase, or where
+/// the key-on decides the sustain window, the first value counting up from it
+/// whose first decay lands in the window (`skipping` false) or skips it (true).
+inline uint16_t curve_counter_phase(const OperatorParams &op, NotePitch pitch,
+                                    bool skipping) {
+  if (!window_can_be_skipped(op, pitch))
+    return kCurveCounterPhase;
+  // Wherever the outcome depends on the counter it repeats within 16 ticks.
+  for (int n = 0; n < 16; ++n) {
+    const int phase = (kCurveCounterPhase + n) & 0x0FFF;
+    const int counter = phase == 0x0FFF ? 1 : phase + 1;
+    if (first_ramp_skips(op, pitch, counter, 0) == skipping)
+      return static_cast<uint16_t>(phase);
+  }
+  return kCurveCounterPhase;
+}
+
 /// The mean ramp of a held SSG-EG loop in output samples, measured as
 /// sample_curve() measures it; infinite when the loop stops before three folds.
 inline double loop_ramp_samples(const OperatorParams &op, NotePitch pitch,
-                                uint16_t start_att) {
+                                uint16_t start_att, uint16_t counter_phase) {
   const uint32_t ramps = (op.ssg & 0x02) != 0 ? 2 : 1;
-  const HeldRun run = run_held(op, pitch, kCurveCounterPhase, start_att,
+  const HeldRun run = run_held(op, pitch, counter_phase, start_att,
                                kMeasuredLoopPeriods * ramps);
   const double mean = mean_fold_interval(run.folds);
   return mean > 0.0 ? mean : std::numeric_limits<double>::infinity();
@@ -214,13 +273,14 @@ struct PhaseDurations {
 
 /// The phase durations of `op` at `pitch`, with the key never released.  Where
 /// the counter decides whether the decay lands in the sustain window, the first
-/// ramp is run from kCurveCounterPhase.
+/// ramp is run from the phase sample_curve() draws.
 inline PhaseDurations phase_durations(const OperatorParams &op, NotePitch pitch,
                                       double clock_hz = kNtscClockHz) {
   PhaseDurations phases;
   if (detail::window_can_be_skipped(op, pitch)) {
-    const detail::HeldRun run = detail::run_held(op, pitch, kCurveCounterPhase,
-                                                 kMaxAttenuation, 0);
+    const detail::HeldRun run = detail::run_held(
+        op, pitch, detail::curve_counter_phase(op, pitch, false),
+        kMaxAttenuation, 0);
     const double ms = 1000.0 / sample_rate_hz(clock_hz);
     const double forever = std::numeric_limits<double>::infinity();
     if (run.attack_end < 0) {
@@ -275,8 +335,29 @@ inline double ssg_loop_period_ms(const OperatorParams &op, NotePitch pitch,
   }
   // The alternating modes invert on every fold: two ramps to a period.
   const double ramps_per_period = (op.ssg & 0x02) != 0 ? 2.0 : 1.0;
-  return detail::loop_ramp_samples(op, pitch, kMaxAttenuation) *
+  return detail::loop_ramp_samples(
+             op, pitch, kMaxAttenuation,
+             detail::curve_counter_phase(op, pitch, false)) *
          ramps_per_period * 1000.0 / sample_rate_hz(clock_hz);
+}
+
+/// The fraction of key-on phases -- counter values, and the three samples of an
+/// EG tick -- whose first decay steps past the sustain window, the counter's
+/// wrap left out.  0 or 1 wherever the key-on phase does not decide it.
+inline double sl_skip_probability(const OperatorParams &op, NotePitch pitch) {
+  if (!detail::window_can_be_skipped(op, pitch))
+    return 0.0;
+  const int ar =
+      detail::effective_rate(op.ar & 0x1F, key_scale_value(op, pitch));
+  // The outcome repeats every 4 ticks after an instant attack and every
+  // 8 << shift after one that walks its row; a slower one always ends aligned.
+  const int shift = detail::rate_shift(ar);
+  const int period = ar >= 62 ? 4 : (shift >= 2 ? 1 : 8 << shift);
+  int skips = 0;
+  for (int k = 0; k < period; ++k)
+    for (int a = 0; a < 3; ++a)
+      skips += detail::first_ramp_skips(op, pitch, k, a) ? 1 : 0;
+  return static_cast<double>(skips) / (3.0 * period);
 }
 
 } // namespace ym2612_eg

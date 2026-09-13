@@ -14,6 +14,7 @@
 #include <cmath>
 #include <iostream>
 #include <limits>
+#include <vector>
 
 using namespace ym2612_eg;
 
@@ -388,7 +389,8 @@ void test_the_alternating_modes_count_two_ramps() {
 
 /// Where the counter decides whether the decay lands in the sustain window --
 /// SSG-EG at DR rates 57-59, whose 4x step reaches 32 -- the closed forms run
-/// the envelope from kCurveCounterPhase, so they describe the curve drawn.
+/// the envelope from the phase sample_curve() keys on at, so they describe the
+/// curve drawn.
 void test_the_closed_forms_follow_the_sustain_window() {
   const auto first_ms = [](const CurveResult &curve, MarkerKind kind,
                            double after) {
@@ -455,6 +457,127 @@ void test_the_closed_forms_follow_the_sustain_window() {
             << ", loops " << loops << "  ... ";
 }
 
+/// Keys on `alignment` samples into the EG tick that takes the counter past
+/// `phase` and steps to the end of the first decay: 1 when it steps past the
+/// sustain window, 0 when it lands in it, -1 when the counter wraps first.
+int first_ramp_outcome(const OperatorParams &op, NotePitch pitch, int phase,
+                       int alignment) {
+  EgSimulator sim(op, pitch);
+  sim.reset(static_cast<uint16_t>(phase));
+  for (int k = 0; k < alignment; ++k)
+    sim.step();
+  sim.key_on();
+  uint64_t samples = static_cast<uint64_t>(alignment);
+  bool decaying = false;
+  int outcome = -2;
+  while (outcome == -2 && samples < 1000000) {
+    sim.step();
+    ++samples;
+    if (!decaying)
+      decaying = sim.phase() == EgPhase::Decay;
+    else if (sim.phase() == EgPhase::Sustain)
+      outcome = 0;
+    else if (sim.attenuation() >= kSsgFoldAttenuation)
+      outcome = 1;
+  }
+  // The first step after reset() is an EG tick, and so is every third one.
+  const uint64_t ticks = (samples + 2) / 3;
+  return outcome != -2 && static_cast<uint64_t>(phase) + ticks > 0x0FFF
+             ? -1
+             : outcome;
+}
+
+/// Every key-on phase -- 4096 counter values, and the three samples of an EG
+/// tick -- stepped to the end of its first decay agrees with
+/// first_ramp_skips(), and sl_skip_probability() is the share that steps past
+/// the window. Ramps that run through the counter's wrap are left out.
+void test_the_skip_probability_counts_every_key_on_phase() {
+  struct Case {
+    int ar, sl, type;
+    NotePitch pitch;
+  };
+  // DR28 at KS0 is rate 57 at block 2, 58 at block 4 and 59 at block 6.
+  const NotePitch r57{644, 2}, r58{644, 4}, r59{644, 6};
+  std::vector<Case> cases = {
+      {31, 4, 1, r58},  {31, 3, 1, r58}, {20, 1, 1, r58}, {20, 2, 1, r58},
+      {22, 1, 1, r58},  {23, 2, 1, r58}, {31, 4, 0, r58}, {22, 2, 2, r58},
+      {19, 4, 1, r57},  {21, 9, 1, r57}, {26, 7, 1, r59}, {22, 5, 5, r59},
+  };
+  for (int sl = 1; sl <= 14; ++sl) {
+    cases.push_back({31, sl, 1, r57});
+    cases.push_back({31, sl, 1, r59});
+  }
+  int decided = 0;
+  for (const Case &c : cases) {
+    const OperatorParams op = ssg_patch(c.type, c.ar, 28, c.sl, 0, 15, 0);
+    std::vector<int> outcome(4096 * 3);
+    int whole = 4096; // phases before the first ramp through the wrap
+    for (int phase = 0; phase < 4096; ++phase)
+      for (int a = 0; a < 3; ++a) {
+        const int o = first_ramp_outcome(op, c.pitch, phase, a);
+        CHECK(o != -2);
+        outcome[static_cast<size_t>(phase * 3 + a)] = o;
+        if (o < 0) {
+          whole = std::min(whole, phase);
+          continue;
+        }
+        CHECK((o == 1) == detail::first_ramp_skips(op, c.pitch, phase + 1, a));
+      }
+    // Whole turns of the counter's low four bits, over which p is the share.
+    whole -= whole % 16;
+    CHECK(whole >= 3584);
+    int skips = 0;
+    for (int i = 0; i < whole * 3; ++i)
+      skips += outcome[static_cast<size_t>(i)];
+    const double p = sl_skip_probability(op, c.pitch);
+    CHECK(p == static_cast<double>(skips) / (3.0 * whole));
+    decided += p > 0.0 && p < 1.0;
+  }
+  CHECK(decided >= 10);
+}
+
+/// The patches measured on hardware: DR28 KS0 at block 4 / F-num 644, SSG-EG
+/// $09.
+void test_the_measured_patches_skip_as_measured() {
+  const NotePitch pitch{644, 4};
+  CHECK(sl_skip_probability(ssg_patch(1, 31, 28, 4, 0, 15, 0), pitch) == 0.5);
+  CHECK(sl_skip_probability(ssg_patch(1, 31, 28, 3, 0, 15, 0), pitch) == 0.0);
+  CHECK(sl_skip_probability(ssg_patch(1, 20, 28, 1, 0, 15, 0), pitch) == 1.0);
+  CHECK(sl_skip_probability(ssg_patch(1, 20, 28, 2, 0, 15, 0), pitch) == 0.0);
+}
+
+/// sample_curve() keys on at kCurveCounterPhase, or where the key-on decides
+/// the sustain window, at the first phase counting up from it whose first
+/// decay lands in it; the second path starts from the first that skips.
+void test_the_curve_keys_on_at_the_first_phase_that_lands() {
+  int decided = 0;
+  for (const int midi : {36, 48, 60, 72, 84})
+    for (const int ks : {0, 3})
+      for (const int ar : {31, 26, 23, 22, 21, 20})
+        for (int sl = 1; sl <= 14; ++sl) {
+          const OperatorParams op = ssg_patch(1, ar, 28, sl, 0, 15, ks);
+          const NotePitch pitch = note(midi);
+          const double p = sl_skip_probability(op, pitch);
+          const int lands = detail::curve_counter_phase(op, pitch, false);
+          const int skips = detail::curve_counter_phase(op, pitch, true);
+          if (!(p > 0.0 && p < 1.0)) {
+            CHECK(lands == kCurveCounterPhase);
+            CHECK(skips == kCurveCounterPhase);
+            continue;
+          }
+          ++decided;
+          for (int phase = kCurveCounterPhase; phase <= lands; ++phase)
+            CHECK(detail::first_ramp_skips(op, pitch, phase + 1, 0) ==
+                  (phase != lands));
+          for (int phase = kCurveCounterPhase; phase <= skips; ++phase)
+            CHECK(detail::first_ramp_skips(op, pitch, phase + 1, 0) ==
+                  (phase == skips));
+          CHECK(phase_durations(op, pitch).sustain_ms > 0.0);
+        }
+  CHECK(decided > 20);
+  std::cout << "\n    decided by the key-on " << decided << "  ... ";
+}
+
 /// The clock is an argument, not a constant: PAL runs about 1% slower and
 /// every duration follows it.
 void test_the_clock_scales_every_duration() {
@@ -485,6 +608,9 @@ int main() {
   RUN_TEST(test_a_ramp_that_never_finishes_is_no_loop_at_all);
   RUN_TEST(test_the_alternating_modes_count_two_ramps);
   RUN_TEST(test_the_closed_forms_follow_the_sustain_window);
+  RUN_TEST(test_the_skip_probability_counts_every_key_on_phase);
+  RUN_TEST(test_the_measured_patches_skip_as_measured);
+  RUN_TEST(test_the_curve_keys_on_at_the_first_phase_that_lands);
   RUN_TEST(test_the_clock_scales_every_duration);
   return testing::summary();
 }
