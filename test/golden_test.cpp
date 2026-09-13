@@ -1,17 +1,6 @@
-// Golden-vector test: replays a recorded Nuked-OPN2 scenario on EgSimulator and
-// compares sample by sample.
-//
-// The vectors in golden/*.json were produced by tools/golden_gen, which links
-// Nuked-OPN2 (LGPL 2.1).  Nothing here does -- this reads committed data.
-//
-//   ym2612_eg_golden_test <path-to-vector.json>
-//
-// Comparison policy:
-//   * eg_level vs attenuation()  -- exact, at every output sample.
-//   * eg_out   vs output()       -- exact, at every sample, allowing for
-//                                   Nuked's one-sample eg_out pipeline lag,
-//                                   which the generator already removed.
-//   * eg_state vs phase()        -- exact, at every sample.
+// Replays a golden/*.json vector recorded by tools/golden_gen and requires
+// attenuation(), output() and phase() to equal the recorded level, output and
+// state at every sample. Usage: ym2612_eg_golden_test <path-to-vector.json>
 
 #include <ym2612_eg/ym2612_eg.hpp>
 

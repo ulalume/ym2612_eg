@@ -286,43 +286,34 @@ struct EnvelopeCurve {
   std::string warning; ///< empty when there is none
 };
 
-/// Two passes over the simulator: a release from full volume, which shares
-/// only the time axis with the other; and -- once the window policy and the
-/// release have decided how wide the axis is -- the held trace, simulated
-/// across the whole of it so a loop keeps looping to the right edge. Where the
-/// key-on decides the sustain window, a third draws the key-on that skips it.
-/// `min_span_ms` is the axis the curve will actually be DRAWN on, which for a
-/// voice overlay is another curve's rather than its own; the held trace is
-/// simulated across at least that much, because a sawtooth extrapolated along
-/// the slope of its last ramp is not a sawtooth. A pure function of the
-/// operator and the note.
+/// One operator's curves at `pitch`: a release from full volume and the held
+/// trace on one time axis, plus the key-on that skips the sustain window where
+/// the key-on decides it. The held trace covers at least `min_span_ms`.
 inline EnvelopeCurve build_envelope_curve(const OperatorParams &op,
                                           NotePitch pitch,
                                           double min_span_ms = 0.0) {
   EnvelopeCurve out;
 
-  // 1. What the axis has to hold, in closed form over the registers alone.
+  // 1. What the axis has to hold: the loop period, or the phase durations.
   const double period_ms = ssg_loop_period_ms(op, pitch);
   const bool loops = period_ms > 0.0 && std::isfinite(period_ms);
   out.held_ms = detail::held_ms_for_period(op, pitch, period_ms);
 
-  // 2. The release, on its own: keyed on at full volume and released at once,
-  //    which routes it through the chip's real key-off rules -- the SSG
-  //    inversion latch, the 4x increments, the hard cut at 0x200. The key comes
-  //    up two samples in; released on the sample it went down, it never starts.
-  //
-  //    "Full volume" is one step short of loudest_attenuation(), not 0: with
-  //    an inverted SSG-EG mode 0 is the quiet end of the ramp, and the loudest
-  //    attenuation is the fold level itself, which an operator only ever
-  //    passes through. AR is zeroed for this run alone -- the key-on sample
-  //    snaps an instant attack straight to att = 0 and would throw the start
-  //    level away, and the release rate does not depend on AR.
+  // 2. The release on its own, keyed on at full volume and released at once,
+  //    so it takes the chip's key-off rules: the SSG inversion latch, the 4x
+  //    increments, the hard cut at 0x200.
   CurveRequest release;
   release.op = op;
+  // The key-on sample would snap an instant attack to att = 0, and the
+  // release rate does not depend on AR.
   release.op.ar = 0;
   release.pitch = pitch;
+  // The key comes up two samples in; released on the sample it went down, it
+  // never starts.
   release.gate_ms = 2000.0 / sample_rate_hz(kNtscClockHz);
   release.max_ms = release_max_ms();
+  // Full volume is one step short of loudest_attenuation(): for an inverted
+  // SSG-EG mode that is the fold level, which an operator only passes through.
   const uint16_t loudest = loudest_attenuation(op);
   release.start_att = loudest > 0 ? static_cast<uint16_t>(loudest - 1) : 0;
   out.release = sample_curve(release);
@@ -395,6 +386,8 @@ inline EnvelopeCurve build_envelope_curve(const OperatorParams &op,
   CurveRequest request;
   request.op = op;
   request.pitch = pitch;
+  // A voice overlay is drawn on another curve's axis, and a loop has to be
+  // simulated across it rather than extrapolated along its last ramp.
   request.max_ms = std::max({out.span_ms, out.held_ms, min_span_ms});
   request.gate_ms = loops ? request.max_ms + 1.0 : -1.0;
   out.held = sample_curve(request);
@@ -929,9 +922,9 @@ inline const EnvelopeCurve &EnvelopeCurveCache::get(const OperatorParams &op,
 
 namespace detail {
 
-/// Half an EG tick, in ms: the shortest length the closed forms tell apart.
-/// A phase they report as zero is not instantaneous but over within one tick,
-/// and a ratio match needs a positive length to stand in for it.
+/// Half an EG tick, in ms: what a phase length reported as zero stands for in
+/// a ratio match. Such a phase is not instantaneous but over within one tick,
+/// and the match needs a positive length.
 inline constexpr double kInstantMs = 500.0 / eg_rate_hz(kNtscClockHz);
 
 /// The candidate in `slowest`..`fastest` whose phase lasts closest to

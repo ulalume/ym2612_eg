@@ -52,8 +52,9 @@ struct CurveRequest {
   double max_ms = 2000.0;
   double clock_hz = kNtscClockHz;
   uint16_t start_att = kMaxAttenuation; // retrigger support
-  // EG counter value preset before the key-on; negative picks the one the
-  // closed forms in timing.hpp describe, curve_counter_phase(op, pitch, false).
+  // EG counter value preset before the key-on; negative picks
+  // curve_counter_phase(op, pitch, false), the phase phase_durations() and
+  // ssg_loop_period_ms() run the envelope from.
   int counter_phase = -1;
 };
 

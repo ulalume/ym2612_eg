@@ -103,9 +103,8 @@ bool has_marker(const CurveResult &curve, MarkerKind kind) {
   return first_marker_ms(curve, kind) >= 0.0;
 }
 
-/// A held-forever simulation with a horizon, which the closed forms are
-/// checked AGAINST: where the decay really ends, where the envelope really
-/// parks, how fast the loop really runs.
+/// A held-forever sample_curve() run with a horizon: the curve the timing
+/// answers are checked against.
 CurveResult simulate_held(const OperatorParams &op, NotePitch pitch,
                           double max_ms = 12000.0) {
   CurveRequest request;
