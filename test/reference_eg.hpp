@@ -1,12 +1,8 @@
 #pragma once
 
-// A second, deliberately independent implementation of the base (non-SSG)
-// envelope generator, written as an EG-tick loop rather than as a per-sample
-// machine.  One tick() is the tick's own output sample and the two after it:
-// a key edge, a phase transition and the "envelope off" snap each take one of
-// those samples, and only the tick's own sample adds an increment.  Used to
-// cross-check EgSimulator, and with `snap` off to produce the ymfm-style
-// numbers for the anchors that predate Nuked's "envelope off" snap.
+// An independent base (non-SSG) envelope generator written as an EG-tick loop:
+// a tick() is the tick's sample and the two after it, and a key edge, a phase
+// transition or the envelope-off snap takes one of them.  A cross-check.
 
 #include "ym2612_eg/ym2612_eg.hpp"
 

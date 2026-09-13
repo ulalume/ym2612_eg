@@ -112,10 +112,8 @@ inline double held_ms_for_period(const OperatorParams &op, NotePitch pitch,
 } // namespace detail
 
 /// How much of the held envelope is worth seeing at `pitch`, in ms: about
-/// kSsgLoopPeriods periods of an SSG loop, or otherwise the envelope's own
-/// phase durations via window_for_timeline_ms(). A scale, not a length: the
-/// envelope is drawn across the whole axis chosen from it. Nothing here is a
-/// key-off.
+/// kSsgLoopPeriods periods of an SSG loop, or else window_for_timeline_ms() of
+/// its phase durations.  A scale for the axis, not a key-off.
 inline double choose_held_ms(const OperatorParams &op, NotePitch pitch) {
   return detail::held_ms_for_period(op, pitch, ssg_loop_period_ms(op, pitch));
 }
@@ -254,9 +252,8 @@ inline EnvelopeCurve build_envelope_curve(const OperatorParams &op,
 
   // 2. The release, on its own: keyed on at full volume and released at once,
   //    which routes it through the chip's real key-off rules -- the SSG
-  //    inversion latch, the 4x increments, the hard cut at 0x200. The gate is
-  //    a sample rather than zero because a key write takes a sample to reach
-  //    the envelope; released on sample zero the note never starts.
+  //    inversion latch, the 4x increments, the hard cut at 0x200. The key comes
+  //    up two samples in; released on the sample it went down, it never starts.
   //
   //    "Full volume" is one step short of loudest_attenuation(), not 0: with
   //    an inverted SSG-EG mode 0 is the quiet end of the ramp, and the loudest
@@ -273,9 +270,8 @@ inline EnvelopeCurve build_envelope_curve(const OperatorParams &op,
   const uint16_t loudest = loudest_attenuation(op);
   release.start_att = loudest > 0 ? static_cast<uint16_t>(loudest - 1) : 0;
   out.release = sample_curve(release);
-  // The key reaches the envelope on the sample after the write, and the
-  // release is drawn from the first point after that: drop what comes before
-  // it and put that point at the origin.
+  // The release is drawn from the end of the key-on sample: points before it
+  // are dropped and the first at or after it becomes the origin.
   {
     const float settled =
         static_cast<float>(1000.0 / sample_rate_hz(kNtscClockHz));

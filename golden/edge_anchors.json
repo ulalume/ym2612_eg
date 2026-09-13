@@ -1,12 +1,12 @@
 {
   "scenario": "edge_anchors",
   "title": "Edge anchors",
-  "description": "SL=0 skip-decay (with a real attack -- SL=0 plus the instant attack is a documented divergence), SL=15, instant attack, AR=0, DR=0, SR=0, and TL well above zero.",
+  "description": "SL=0 under a real attack, SL=15, instant attack, AR=0, DR=0, SR=0, and TL well above zero.",
   "source": "Nuked-OPN2 ym3438.c @ 335747d78cb0abbc3b55b004e62dad9763140115",
   "format": "level/out/state are flat [sample,value,...] change lists; a value holds until the next pair. out is Nuked eg_out already shifted back by its 1-sample pipeline lag, and is omitted when it equals level. gate is [sample,keyed_on,...].",
   "cases": [
     {
-      "name": "SL=0 skip decay",
+      "name": "SL=0",
       "ar": 16, "dr": 10, "sr": 5, "rr": 7, "sl": 0, "tl": 0, "ks": 0, "ssg": 0,
       "fnum": 644, "block": 4,
       "samples": 40000, "counter_phase": 13,

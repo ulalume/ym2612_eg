@@ -270,8 +270,9 @@ void test_worked_example() {
 }
 
 void test_ks_sweep_durations() {
-  // EG_SPEC section 9 "Same patch, KS swept".  decay_ticks is the tick of the
-  // last decay update; Sustain begins on the sample after it.
+  // The patch of EG_SPEC section 9 "Same patch, KS swept".  decay_ticks counts
+  // to the last decay update, one short of the spec: Sustain begins on the
+  // sample after it.
   const uint32_t decay_ticks[4] = {5439, 4064, 2032, 508};
   const uint32_t quiet_ticks[4] = {488585, 326065, 163033, 40759};
   const double decay_ms[4] = {306.4, 228.9, 114.5, 28.7};
@@ -331,9 +332,9 @@ void test_three_octaves() {
 }
 
 void test_attack_shape_anchors() {
-  // EG_SPEC section 9: DR/SL as the worked example, KS=0, C4 (ksv 2).
-  // `ticks` is the tick of the last attack update, Attack -> Decay taking the
-  // sample after it; the key-on sample, an EG tick, adds nothing.
+  // The patches of EG_SPEC section 9 (DR/SL as the worked example, KS=0, C4).
+  // `ticks` counts to the last attack update, Attack -> Decay taking the sample
+  // after it, which is one short of the spec for AR=12..20.
   struct Case {
     int ar, rate;
     uint32_t ticks;
@@ -374,7 +375,7 @@ void test_release_worked_example() {
       sim, [](EgSimulator &s) { return s.attenuation() >= 0x3F0; }, 60000);
   CHECK_EQ(quiet, 15076u);
   CHECK_REL(ticks_to_ms(quiet), 849.0, 0.01);
-  // Nuked behavior: 0x3F0 and 0x3FF now coincide.
+  // Nuked behavior: 0x3F0 and 0x3FF coincide.
   CHECK_EQ(sim.attenuation(), 0x3FF);
 
   // Without the snap (ymfm / jsgroth path) the tail creeps on to 862.5 ms.
@@ -501,7 +502,7 @@ void test_key_edges_and_retrigger() {
 
   sim.key_on();
   CHECK(sim.keyed_on());
-  sim.step(); // the key-on sample; each eg_tick() below now ends on a tick
+  sim.step(); // the key-on sample; each eg_tick() below ends on a tick
   CHECK_EQ(sim.attenuation(), 0);
   ticks_until(sim, [](EgSimulator &s) { return s.attenuation() >= 300; },
               20000);
@@ -535,7 +536,7 @@ void test_key_off_from_any_phase() {
     OperatorParams op{16, 10, 5, 7, 2, 0, 0, 0};
     EgSimulator sim(op, kC4);
     sim.key_on();
-    sim.step(); // the key-on sample; each eg_tick() below now ends on a tick
+    sim.step(); // the key-on sample; each eg_tick() below ends on a tick
     if (phase_step >= 1)
       ticks_until(sim, [](EgSimulator &s) { return s.phase() == EgPhase::Decay; },
                   20000);
@@ -588,9 +589,8 @@ void test_key_off_sample_takes_the_old_phase_increment() {
 }
 
 // SSG-EG $08 with every rate at 63 (KS=3 at C4) ramps 0 -> 0x200 in 16 EG
-// ticks, so at SL=1 the loop is 48 samples.  At SL=0 the fold's virtual
-// key-on, Attack -> Decay and Decay -> Sustain take a sample each, the last
-// of them an EG tick, so the loop is 51.
+// ticks: the loop is 48 samples at SL=1 and 51 at SL=0, where Decay -> Sustain
+// takes the EG tick after the fold's key-on and Attack -> Decay.
 void test_ssg_loop_period_sl0_vs_sl1() {
   for (const int sl : {0, 1}) {
     const OperatorParams op{31, 31, 31, 15, static_cast<uint8_t>(sl), 0, 3, 0x08};

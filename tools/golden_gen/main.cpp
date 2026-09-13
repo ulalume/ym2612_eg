@@ -573,10 +573,9 @@ Scenario edge_anchors() {
   Scenario s;
   s.file = "edge_anchors";
   s.title = "Edge anchors";
-  s.description = "SL=0 skip-decay (with a real attack -- SL=0 plus the "
-                  "instant attack is a documented divergence), SL=15, instant "
-                  "attack, AR=0, DR=0, SR=0, and TL well above zero.";
-  s.cases.push_back({"SL=0 skip decay", patch(16, 10, 5, 7, 0, 0, 0, 0),
+  s.description = "SL=0 under a real attack, SL=15, instant attack, AR=0, "
+                  "DR=0, SR=0, and TL well above zero.";
+  s.cases.push_back({"SL=0", patch(16, 10, 5, 7, 0, 0, 0, 0),
                      note(60), 40000, hold(6, 25000)});
   s.cases.push_back({"SL=0, KS=2", patch(14, 12, 7, 6, 0, 0, 2, 0), note(60),
                      40000, hold(6, 25000)});
@@ -696,9 +695,8 @@ Scenario key_alignment() {
 }
 
 // 11. The Decay -> Sustain window: the level's top six bits have to equal the
-//     sustain level's.  At DR rates 57-59 the 4x SSG-EG decay step reaches 32
-//     and can land past that 16-wide window, and the decay then carries on at
-//     DR.  Which step lands where depends on the counter phase at key-on.
+//     sustain level's, and a 4x SSG-EG step of 32 (DR rates 57-59) can land
+//     past it, depending on the counter phase at key-on.
 Scenario sustain_window() {
   Scenario s;
   s.file = "sustain_window";

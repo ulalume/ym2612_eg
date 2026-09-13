@@ -429,11 +429,9 @@ void test_sl15_leaves_dr_in_charge() {
   CHECK(!entered_sustain); // 0x3E0 is unreachable under the 0x200 freeze
 }
 
-// Decay -> Sustain needs the level's top six bits to equal the sustain
-// level's, a window 16 wide.  At DR rate 58 the 4x decay step alternates
-// between 16 and 32 with the counter's parity: from 0 it lands on 128 (SL=4)
-// on one parity and steps from 112 to 144 on the other, and that decay carries
-// on at DR to the fold, where mode 1 cuts it to silence.
+// Decay -> Sustain needs the level's top six bits to equal the sustain level's.
+// At DR rate 58 the 4x step alternates 16 and 32 with the counter's parity:
+// from 0 it lands on 128 (SL=4), or steps 112 -> 144 and decays to the fold.
 void test_sustain_window_hit_and_skipped() {
   const OperatorParams op = ssg_patch(28, 0, 4, 0x09); // SR=0: Sustain holds
   EgSimulator hit(op, kRks2), skipped(op, kRks2);

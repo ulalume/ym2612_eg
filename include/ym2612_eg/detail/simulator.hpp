@@ -132,17 +132,15 @@ public:
     recompute();
   }
 
-  // Edge-triggered, like a $28 write.  The edge lands on the next step(): the
-  // phase, the level and the SSG-EG block act on the key state before it until
-  // then.  Attenuation is never reset by a key-on; the attack resumes from the
-  // current level, except at rate >= 62, which snaps it to 0.
+  // Edge-triggered, like a $28 write: the edge lands on the next step().  A
+  // key-on keeps the level for the attack to resume from, except at rate >= 62,
+  // which snaps it to 0.
   void key_on() { keyed_on_ = true; }
   void key_off() { keyed_on_ = false; }
 
-  // Advance one output sample (clock / 144).  SSG-EG logic runs every sample
-  // and *before* the envelope update.  The envelope moves at most one phase
-  // per sample, and its level only on an EG tick (every third sample) that
-  // does not change the phase.
+  // Advance one output sample (clock / 144): the SSG-EG block, then the
+  // envelope update, which moves at most one phase and changes the level only
+  // on an EG tick (every third sample) that keeps the phase.
   void step() {
     events_ = 0;
     const bool tick = eg_divider_ == 0;
@@ -178,8 +176,8 @@ public:
   // next sample can already change something; detail::kUnboundedSkip when
   // only an external event can.
   uint32_t skippable_samples() const {
-    // A key write has not reached the envelope yet, and the sample that lets
-    // it through is not like the ones around it.
+    // A key write lands on the next step(), which is not like the samples
+    // around it.
     if (keyed_on_ != keyed_on_at_start_)
       return 0;
     if (ssg_enable_) {
@@ -287,8 +285,8 @@ public:
   // True when nothing can change without an external event (a register write
   // or a key on/off).  Used to cut simulation short.
   bool is_static() const {
-    // A key write still has a sample to travel before the envelope sees it,
-    // and the direction flag it leaves behind is masked out a sample later.
+    // A key write lands on the next step(), and the direction flag it leaves
+    // behind is masked out on the step after.
     if (keyed_on_ != keyed_on_at_start_ || (ssg_enable_ && ssg_invert_ && !keyed_on_at_start_))
       return false;
     if (phase_ == EgPhase::Attack) {
@@ -459,12 +457,9 @@ private:
     return 0;
   }
 
-  // Runs once per output sample, before the envelope update.  The latches it
-  // raises are consumed by the same sample; the key state and the phase it
-  // reads are the ones this sample started with, so a key write that has not
-  // been through a step() yet does not reach any of them.  Returns whether a
-  // key-on, real or re-asserted by the fold, reaches the envelope this sample;
-  // `hold_up` is set when the hold-up latch blocks the envelope-off snap.
+  // Once per output sample, before the envelope update.  Returns whether a
+  // key-on, real or re-asserted by the fold, reaches the envelope this sample,
+  // and sets `hold_up` when the hold-up latch blocks the envelope-off snap.
   bool ssg_step(bool &hold_up) {
     // A key-on at rate >= 62 zeroes the level on this very sample, so it never
     // visits the fold it starts from; the repeat and the direction toggle the
@@ -525,10 +520,9 @@ private:
     return kon_event;
   }
 
-  // The envelope update for one output sample, decided by the phase the
-  // sample starts in.  A key-on enters Attack.  Otherwise a phase whose end
-  // test holds moves on by one, and only a phase that stays takes the EG
-  // tick's increment, at its own rate; a key-off then leaves for Release.
+  // The envelope update, decided by the phase the sample starts in: a key-on
+  // enters Attack, a phase whose end test holds moves on by one, only a phase
+  // that stays takes the tick's increment, and a key-off leaves for Release.
   void envelope_step(bool kon_event, bool hold_up, bool tick) {
     const EgPhase start = phase_;
     // Without SSG-EG the threshold is the top row of the scale, with it 0x200.
