@@ -310,12 +310,12 @@ void test_only_a_non_standard_ssg_attack_earns_a_line() {
   const auto warning_for = [](const OperatorParams &op) {
     return build_envelope_curve(op, kMiddleC).warning;
   };
-  CHECK(warning_for(ssg_patch(0, 30, 15, 4, 8, 7, 0)) != nullptr);
-  CHECK(warning_for(ssg_patch(0, 31, 15, 4, 8, 7, 0)) == nullptr);
-  CHECK(warning_for(adsr(30, 15, 4, 8, 7, 0)) == nullptr);
+  CHECK(!warning_for(ssg_patch(0, 30, 15, 4, 8, 7, 0)).empty());
+  CHECK(warning_for(ssg_patch(0, 31, 15, 4, 8, 7, 0)).empty());
+  CHECK(warning_for(adsr(30, 15, 4, 8, 7, 0)).empty());
   for (int type = 0; type < 8; ++type) {
-    CHECK(warning_for(ssg_patch(type, 0, 15, 4, 8, 7, 0)) != nullptr);
-    CHECK(warning_for(ssg_patch(type, 31, 15, 4, 8, 7, 0)) == nullptr);
+    CHECK(!warning_for(ssg_patch(type, 0, 15, 4, 8, 7, 0)).empty());
+    CHECK(warning_for(ssg_patch(type, 31, 15, 4, 8, 7, 0)).empty());
   }
 }
 
@@ -663,7 +663,7 @@ void test_the_worked_examples_decay_lands_on_the_real_millisecond_axis() {
   CHECK(curve.span_ms >= curve.held_ms);
   CHECK(near_rel(content_ms(curve.held), curve.span_ms, 0.01));
   CHECK(!curve.held.points.empty());
-  CHECK(curve.warning == nullptr);
+  CHECK(curve.warning.empty());
 
   CHECK(!has_marker(curve.held, MarkerKind::KeyOff));
   CHECK(!curve.held_parked); // SR = 5 keeps crawling
@@ -934,9 +934,10 @@ void test_a_slow_release_is_simulated_to_the_end() {
 
 // -------------------------------------------------------------- warnings
 
-/// Pins that the only warning the graph draws is a non-standard SSG-EG
-/// attack (AR < 31); every other simulator defect is left to the curve shape.
-void test_the_only_warning_is_the_non_standard_ssg_attack() {
+/// Pins that outside a sustain window the key-on decides, the only warning the
+/// graph draws is a non-standard SSG-EG attack (AR < 31); every other
+/// simulator defect is left to the curve shape.
+void test_the_only_other_warning_is_the_non_standard_ssg_attack() {
   OperatorParams slow_attack;
   slow_attack.ar = 20;
   slow_attack.dr = 15;
@@ -945,15 +946,14 @@ void test_the_only_warning_is_the_non_standard_ssg_attack() {
   slow_attack.rr = 7;
   slow_attack.ssg = ssg_bits(0);
   const EnvelopeCurve slow = build_envelope_curve(slow_attack, kMiddleC);
-  CHECK(slow.warning != nullptr);
-  CHECK(std::string(slow.warning) == "AR<31: non-standard SSG-EG");
+  CHECK(slow.warning == "AR<31: non-standard SSG-EG");
   OperatorParams plain = slow_attack;
   plain.ssg = 0;
-  CHECK(build_envelope_curve(plain, kMiddleC).warning == nullptr);
+  CHECK(build_envelope_curve(plain, kMiddleC).warning.empty());
 
   OperatorParams frozen = worked_example();
   frozen.ar = 0;
-  CHECK(build_envelope_curve(frozen, kMiddleC).warning == nullptr);
+  CHECK(build_envelope_curve(frozen, kMiddleC).warning.empty());
 
   OperatorParams never_loops;
   never_loops.ar = 31;
@@ -963,7 +963,7 @@ void test_the_only_warning_is_the_non_standard_ssg_attack() {
   never_loops.rr = 7;
   never_loops.ssg = ssg_bits(0);
   const EnvelopeCurve stuck = build_envelope_curve(never_loops, kMiddleC);
-  CHECK(stuck.warning == nullptr);
+  CHECK(stuck.warning.empty());
 
   OperatorParams audio_rate;
   audio_rate.ar = 31;
@@ -973,9 +973,106 @@ void test_the_only_warning_is_the_non_standard_ssg_attack() {
   audio_rate.ssg = ssg_bits(0);
   const EnvelopeCurve fast = build_envelope_curve(audio_rate, kMiddleC);
   CHECK(fast.held.loop_hz > 100.0);
-  CHECK(fast.warning == nullptr);
+  CHECK(fast.warning.empty());
 
-  CHECK(build_envelope_curve(worked_example(), kMiddleC).warning == nullptr);
+  CHECK(build_envelope_curve(worked_example(), kMiddleC).warning.empty());
+}
+
+// ------------------------------------------------------- the sustain window
+
+/// The trace's vertex nearest `ms`.
+CurvePoint vertex_near(const CurveResult &curve, double ms) {
+  CurvePoint best = curve.points.front();
+  for (const CurvePoint &p : curve.points)
+    if (std::fabs(p.ms - ms) < std::fabs(best.ms - ms))
+      best = p;
+  return best;
+}
+
+/// Pins that where the key-on decides whether the first decay lands in the
+/// sustain window, both outcomes are drawn: the held line lands in it, and a
+/// second path leaves that line at its knee and goes on past SL.
+void test_a_key_on_that_decides_the_sustain_window_draws_both() {
+  // DR28 KS0 at middle C is DR rate 58, whose 4x steps alternate 16 and 32.
+  const OperatorParams split = ssg_patch(1, 31, 28, 4, 0, 15, 0);
+  const int window = sustain_attenuation(4) >> 4;
+  const EnvelopeCurve c = build_envelope_curve(split, kMiddleC);
+  CHECK(c.sl_skip_probability == 0.5);
+  CHECK(c.decay_end_ms > 0.0);
+  CHECK(c.held_skip.size() >= 3);
+  const CurvePoint knee = vertex_near(c.held, c.decay_end_ms);
+  CHECK((knee.att >> 4) == window);
+  CHECK(std::fabs(c.held_skip.front().ms - c.decay_end_ms) < 1e-3);
+  CHECK(c.held_skip.front().out == knee.out);
+  CHECK(c.held_skip.front().att == knee.att);
+  uint16_t highest = 0;
+  for (size_t i = 1; i < c.held_skip.size(); ++i) {
+    CHECK(c.held_skip[i].ms >= c.held_skip[i - 1].ms);
+    CHECK((c.held_skip[i].att >> 4) != window);
+    highest = std::max(highest, c.held_skip[i].att);
+  }
+  CHECK(highest >= kSsgFoldAttenuation);
+  CHECK(c.held_skip.back().ms <= c.span_ms);
+
+  // One line wherever the key-on does not decide it.
+  struct Fixed {
+    int ar, sl;
+    double p;
+  };
+  for (const Fixed f : {Fixed{31, 3, 0.0}, Fixed{20, 1, 1.0}, Fixed{20, 2, 0.0}}) {
+    const EnvelopeCurve one =
+        build_envelope_curve(ssg_patch(1, f.ar, 28, f.sl, 0, 15, 0), kMiddleC);
+    CHECK(one.sl_skip_probability == f.p);
+    CHECK(one.held_skip.empty());
+  }
+  CHECK(build_envelope_curve(worked_example(), kMiddleC).held_skip.empty());
+}
+
+/// Pins that in a repeating SSG-EG mode the second path ends with its first
+/// loop: it climbs from the knee to the fold and stops before the ramp starts
+/// over, which the key-on it comes from goes on to do.
+void test_the_second_path_of_a_loop_stops_at_its_first_fold() {
+  const OperatorParams loop = ssg_patch(0, 31, 28, 4, 0, 15, 0);
+  const EnvelopeCurve c = build_envelope_curve(loop, kMiddleC);
+  CHECK(c.sl_skip_probability == 0.5);
+  CHECK(c.held_skip.size() >= 3);
+  for (size_t i = 1; i < c.held_skip.size(); ++i) {
+    CHECK(c.held_skip[i].ms >= c.held_skip[i - 1].ms);
+    CHECK(c.held_skip[i].att >= c.held_skip[i - 1].att);
+  }
+  CHECK(c.held_skip.back().att >= kSsgFoldAttenuation);
+  CHECK(c.held_skip.back().ms <= c.span_ms);
+
+  CurveRequest skip;
+  skip.op = loop;
+  skip.pitch = kMiddleC;
+  skip.max_ms = 100.0;
+  skip.counter_phase =
+      ym2612_eg::detail::curve_counter_phase(loop, kMiddleC, true);
+  const CurveResult skipped = sample_curve(skip);
+  CHECK(std::count_if(skipped.markers.begin(), skipped.markers.end(),
+                      [](const Marker &m) {
+                        return m.kind == MarkerKind::SsgFold;
+                      }) >= 2);
+}
+
+/// Pins the warning for a sustain window the key-on decides: the share of
+/// notes that step past it, rounded, in place of the AR < 31 line.
+void test_the_sl_skip_warning_says_how_often() {
+  CHECK(build_envelope_curve(ssg_patch(1, 31, 28, 4, 0, 15, 0), kMiddleC)
+            .warning == "SL skipped on 50% of notes");
+  CHECK(build_envelope_curve(ssg_patch(1, 22, 28, 1, 0, 15, 0), kMiddleC)
+            .warning == "SL skipped on 25% of notes");
+  CHECK(build_envelope_curve(ssg_patch(1, 20, 28, 1, 0, 15, 0), kMiddleC)
+            .warning == "AR<31: non-standard SSG-EG");
+  CHECK(build_envelope_curve(ssg_patch(1, 31, 28, 3, 0, 15, 0), kMiddleC)
+            .warning.empty());
+
+  const CurveResult quiet;
+  CHECK(warning_line(quiet, 1.0 / 3.0) == "SL skipped on 33% of notes");
+  CHECK(warning_line(quiet, 2.0 / 3.0) == "SL skipped on 67% of notes");
+  CHECK(warning_line(quiet, 0.0).empty());
+  CHECK(warning_line(quiet, 1.0).empty());
 }
 
 // ----------------------------------------------------------------- cache
@@ -2266,7 +2363,10 @@ int main() {
   RUN_TEST(test_a_very_long_release_does_not_crush_the_held_trace);
   RUN_TEST(test_a_slow_release_is_simulated_to_the_end);
 
-  RUN_TEST(test_the_only_warning_is_the_non_standard_ssg_attack);
+  RUN_TEST(test_the_only_other_warning_is_the_non_standard_ssg_attack);
+  RUN_TEST(test_a_key_on_that_decides_the_sustain_window_draws_both);
+  RUN_TEST(test_the_second_path_of_a_loop_stops_at_its_first_fold);
+  RUN_TEST(test_the_sl_skip_warning_says_how_often);
   RUN_TEST(test_the_cache_recomputes_only_on_a_real_change);
   RUN_TEST(test_the_throttle_spaces_a_rebuild_by_what_it_cost);
   RUN_TEST(test_a_cheap_curve_is_rebuilt_every_frame);
