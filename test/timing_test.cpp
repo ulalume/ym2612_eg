@@ -318,11 +318,9 @@ void test_the_loop_period_agrees_with_the_simulator() {
                   worst_instant_attack = std::max(worst_instant_attack, error);
                 }
                 ++compared;
-                // A few percent. What is left is not a modelling error but
-                // the loop's own shape: a ramp ends on a slot boundary of
-                // whichever rate carried it there, so successive ramps can
-                // differ by a slot, and the two answers average a different
-                // number of them.
+                // The closed form measures the folds sample_curve() measures;
+                // a slow loop reaches the end of kMeasurableMs first and so
+                // averages fewer of them.
                 CHECK(error < 0.04);
               }
             }
@@ -368,15 +366,94 @@ void test_a_ramp_that_never_finishes_is_no_loop_at_all() {
                   CurveWarning::SsgNeverLoops) != stalled.warnings.end());
 }
 
-/// The alternating modes fold twice per visible period, so they are exactly
-/// twice their own ramp -- a factor of two, not a few percent.
+/// The alternating modes fold twice per visible period, so their period is two
+/// of their own ramps: exactly twice the plain mode's where every ramp is the
+/// same length, and wherever the ramps vary, the period sample_curve() draws.
 void test_the_alternating_modes_count_two_ramps() {
+  // DR = 31 at SL = 15: every ramp is sixteen steps of 32.
+  const double plain = period_of(ssg_patch(0, 31, 31, 15, 8, 7, 0));
+  const double alternating = period_of(ssg_patch(2, 31, 31, 15, 8, 7, 0));
+  CHECK(plain > 0.0);
+  CHECK_REL(alternating, plain * 2.0, 1e-9);
   for (const int ar : {31, 20}) {
-    const double plain = period_of(ssg_patch(0, ar, 20, 4, 8, 7, 0));
-    const double alternating = period_of(ssg_patch(2, ar, 20, 4, 8, 7, 0));
-    CHECK(plain > 0.0);
-    CHECK_REL(alternating, plain * 2.0, 1e-9);
+    for (const int type : {0, 2}) {
+      const OperatorParams op = ssg_patch(type, ar, 20, 4, 8, 7, 0);
+      const CurveResult held =
+          simulate_held(op, note(kReferenceMidiNote), 60000.0);
+      CHECK(held.loop_hz > 0.0);
+      CHECK_REL(period_of(op), 1000.0 / held.loop_hz, 1e-9);
+    }
   }
+}
+
+/// Where the counter decides whether the decay lands in the sustain window --
+/// SSG-EG at DR rates 57-59, whose 4x step reaches 32 -- the closed forms run
+/// the envelope from kCurveCounterPhase, so they describe the curve drawn.
+void test_the_closed_forms_follow_the_sustain_window() {
+  const auto first_ms = [](const CurveResult &curve, MarkerKind kind,
+                           double after) {
+    for (const Marker &m : curve.markers)
+      if (m.kind == kind && m.ms > after)
+        return static_cast<double>(m.ms);
+    return -1.0;
+  };
+  const auto near_ms = [](double a, double b) {
+    return std::fabs(a - b) <= 2e-3 + 1e-6 * std::fabs(b);
+  };
+  int skipped = 0, hit = 0, loops = 0;
+  for (const int midi : {48, 60, 72, 84})
+    for (const int ks : {0, 3})
+      for (const int dr : {27, 28, 29})
+        for (const int sl : {1, 2, 4, 9, 14})
+          for (const int ar : {31, 20})
+            for (const int type : {0, 1, 2})
+              for (const int sr : {0, 12}) {
+                const OperatorParams op = ssg_patch(type, ar, dr, sl, sr, 15, ks);
+                const NotePitch pitch = note(midi);
+                const int rate = detail::effective_rate(dr, key_scale_value(op, pitch));
+                if (rate < 57 || rate > 59)
+                  continue;
+                const CurveResult held = simulate_held(op, pitch, 60000.0);
+                const PhaseDurations phases = phase_durations(op, pitch);
+                // The first ramp ends at the first fold after the attack.
+                const double attack = first_ms(held, MarkerKind::AttackEnd, -1.0);
+                const double fold = first_ms(held, MarkerKind::SsgFold, attack);
+                double decay = first_ms(held, MarkerKind::DecayEnd, -1.0);
+                if (fold >= 0.0 && decay > fold)
+                  decay = -1.0;
+                CHECK(near_ms(attack, phases.attack_ms));
+                if (decay >= 0.0) {
+                  ++hit;
+                  CHECK(near_ms(decay, phases.sustain_start_ms()));
+                  CHECK(phases.sustain_ms > 0.0);
+                } else {
+                  ++skipped;
+                  CHECK(phases.sustain_ms == 0.0);
+                }
+                if ((type & 1) != 0) {
+                  // Mode 1 cuts to silence at the fold.
+                  if (ar == 31)
+                    CHECK((marker_ms(held, MarkerKind::Silence) >= 0.0) ==
+                          std::isfinite(phases.lifetime_ms()));
+                  continue;
+                }
+                const double period = ssg_loop_period_ms(op, pitch);
+                const bool never = std::find(held.warnings.begin(), held.warnings.end(),
+                                             CurveWarning::SsgNeverLoops) !=
+                                   held.warnings.end();
+                CHECK(never == !std::isfinite(period));
+                CHECK((held.loop_hz > 0.0) == std::isfinite(period));
+                if (held.loop_hz > 0.0) {
+                  ++loops;
+                  CHECK_REL(period, 1000.0 / held.loop_hz, 1e-9);
+                }
+              }
+  // Both outcomes, and loops whose closed form used to assume the window.
+  CHECK(skipped > 20);
+  CHECK(hit > 20);
+  CHECK(loops > 20);
+  std::cout << "\n    first ramp hit " << hit << ", skipped " << skipped
+            << ", loops " << loops << "  ... ";
 }
 
 /// The clock is an argument, not a constant: PAL runs about 1% slower and
@@ -408,6 +485,7 @@ int main() {
   RUN_TEST(test_the_loop_period_agrees_with_the_simulator);
   RUN_TEST(test_a_ramp_that_never_finishes_is_no_loop_at_all);
   RUN_TEST(test_the_alternating_modes_count_two_ramps);
+  RUN_TEST(test_the_closed_forms_follow_the_sustain_window);
   RUN_TEST(test_the_clock_scales_every_duration);
   return testing::summary();
 }

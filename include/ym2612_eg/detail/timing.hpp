@@ -1,18 +1,17 @@
 #pragma once
 
-// Closed-form answers about an envelope's shape: how long each phase of a
-// key-held note lasts, and how fast an SSG-EG loop runs. A rate of 0 really
-// does hold forever, and says so exactly -- rather than reporting whatever a
-// probe saw before giving up -- which is the difference between SR = 0 and
-// SR = 31. The post-attack phases are linear in attenuation, so each is one
-// division; the attack is not, so its recurrence is iterated instead.
+// Answers about an envelope's shape without drawing it: how long each phase of
+// a key-held note lasts and how fast an SSG-EG loop runs. A rate that never
+// advances holds forever, and says so.
 
 #include "constants.hpp"
 #include "simulator.hpp"
 #include "tables.hpp"
 
 #include <algorithm>
+#include <cstdint>
 #include <limits>
+#include <vector>
 
 namespace ym2612_eg {
 namespace detail {
@@ -59,13 +58,9 @@ inline double linear_phase_ms(int rate, int from_att, int to_att, bool ssg,
   return ticks * 1000.0 / eg_hz;
 }
 
-/// How long the attack after a key-on takes, in ms. The attack is the one
-/// phase that is not linear: it multiplies what is left,
-/// `att += (~att * inc) >> 4`, so there is no closed form and the recurrence
-/// is run instead. The attack an SSG-EG fold starts is different -- it
-/// resumes from 0x200, and its length depends on where the climb before it
-/// left the shared counter -- so ssg_ramp_ms() walks its own rather than
-/// calling this.
+/// How long the attack after a key-on takes, in ms. It multiplies what is
+/// left, `att += (~att * inc) >> 4`, so the recurrence is run rather than
+/// divided.
 inline double attack_ms(int rate, double eg_hz) {
   // A key-on snaps these straight to att = 0; the attack update guards on
   // `rate < 62`.
@@ -93,112 +88,107 @@ inline double attack_ms(int rate, double eg_hz) {
   return static_cast<double>(slots << shift) * 1000.0 / eg_hz;
 }
 
-/**
- * One walk of the envelope's own recurrence, kept where the chip keeps it: on
- * the free-running 12-bit counter, which every phase shares.
- *
- * A phase does not get its own clock.  rate_shift() says how many of the
- * counter's low bits must be clear before this rate may act, and the three
- * bits above that choose the table entry -- so a phase inherits whatever
- * phase of the counter the phase before it left behind, and where a boundary
- * falls decides which increment lands next.
- */
-struct EgWalk {
-  int counter = 0;
-  long long ticks = 0;
+/// How many periods of a held SSG-EG loop sample_curve() draws before it
+/// stops, and so how many ramps the loop period is measured over.
+inline constexpr int kMeasuredLoopPeriods = 5;
 
-  /// Advance to the next tick this rate is allowed to act on, and answer with
-  /// the increment it finds there.
-  int next_increment(int rate) {
-    const int shift = rate_shift(rate);
-    const int mask = (1 << shift) - 1;
-    const int step = mask == 0 ? 1 : (mask + 1 - (counter & mask));
-    // The chip's counter skips 0 on overflow, making its period 4095 rather
-    // than 4096.  That is one tick in four thousand, far below anything a
-    // graph resolves, and modelling it would buy a slip nothing can see.
-    counter = (counter + step) & 0x0FFF;
-    ticks += step;
-    return kIncTable[rate][(counter >> shift) & 7];
+/// The mean fold-to-fold interval in output samples, skipping the first, which
+/// still carries the key-on; 0 with fewer than three folds.
+inline double mean_fold_interval(const std::vector<uint64_t> &folds) {
+  if (folds.size() < 3) {
+    return 0.0;
   }
+  double sum = 0.0;
+  size_t n = 0;
+  for (size_t k = 2; k < folds.size(); ++k) {
+    sum += static_cast<double>(folds[k] - folds[k - 1]);
+    ++n;
+  }
+  return sum / static_cast<double>(n);
+}
 
-  /// Let the next tick go by without acting on it.
-  void pass_tick() {
-    counter = (counter + 1) & 0x0FFF;
-    ++ticks;
-  }
+/// A held envelope as sample_curve() steps it: the labels of the samples its
+/// first Attack -> Decay and Decay -> Sustain land on and where the level first
+/// runs out of scale after the attack (-1 for never), and every SSG-EG fold.
+struct HeldRun {
+  int64_t attack_end = -1;
+  int64_t decay_end = -1;
+  int64_t ramp_end = -1;
+  std::vector<uint64_t> folds;
+  bool at_rest = false;
 };
 
-/**
- * How long one SSG-EG ramp takes, in ms: the attack that follows a fold, then
- * the attenuation climbing back to the fold at 0x200 -- through the decay
- * rate to the sustain level and the sustain rate the rest of the way, at
- * SSG-EG's quadrupled increments. Infinite when a rate the ramp needs never
- * advances, because then there is no next fold.
- *
- * Walked slot by slot rather than divided like linear_phase_ms(): the decay
- * overshoots the sustain level by up to one increment, negligible over a
- * whole lifetime but enough to shift a single ramp's length noticeably. The
- * overshoot also depends on the counter, which a fold does not reset, so ramp
- * lengths settle into a short repeating cycle rather than one value -- the
- * first ramps are walked and discarded to reach it, and the rest averaged.
- */
-inline double ssg_ramp_ms(int ar, int dr, int sr, int sustain_att,
-                          double eg_hz) {
-  constexpr int kFold = static_cast<int>(kSsgFoldAttenuation);
-  constexpr int kSettlingRamps = 2;
-  constexpr int kMeasuredRamps = 4;
-  // Loose enough that no reachable patch meets it, tight enough that a future
-  // table could not hang a frame.
-  constexpr long long kSlotLimit = 8192;
-  const double forever = std::numeric_limits<double>::infinity();
-  // The fold's virtual key-on snaps an instant attack straight to 0, exactly
-  // as a real key-on does; anything slower resumes from where the fold found
-  // it.
-  const bool instant_attack = ar >= 62;
-  if (!instant_attack && !rate_advances(ar)) {
-    return forever;
+/// Keys on at `counter_phase` from `start_att` and follows the envelope to
+/// `max_folds` folds -- with 0, to the end of its first ramp -- unless it comes
+/// to rest first.
+inline HeldRun run_held(const OperatorParams &op, NotePitch pitch,
+                        uint16_t counter_phase, uint16_t start_att,
+                        uint32_t max_folds) {
+  HeldRun run;
+  EgSimulator sim(op, pitch);
+  sim.reset(counter_phase, start_att);
+  sim.key_on();
+  const int end_att = (op.ssg & 0x08) != 0 ? kSsgFoldAttenuation
+                                           : kCutAttenuation;
+  constexpr uint64_t kSampleLimit = uint64_t{1} << 40;
+  for (uint64_t i = 0; i < kSampleLimit;) {
+    uint32_t n = sim.skippable_samples();
+    if (n == 0) {
+      uint16_t first = 0, second = 0;
+      n = sim.alternating_samples(first, second);
+    }
+    if (sim.is_static() || n >= kUnboundedSkip) {
+      run.at_rest = true;
+      break;
+    }
+    if (n > 0) {
+      sim.skip(n);
+      i += n;
+      continue;
+    }
+    sim.step();
+    const uint32_t ev = sim.step_events();
+    const int64_t label = static_cast<int64_t>(i) + 1;
+    if ((ev & kEvAttackEnd) && run.attack_end < 0)
+      run.attack_end = label;
+    if ((ev & kEvDecayEnd) && run.decay_end < 0)
+      run.decay_end = label;
+    if (run.attack_end >= 0 && run.ramp_end < 0 && sim.attenuation() >= end_att)
+      run.ramp_end = label;
+    if (ev & kEvSsgFold)
+      run.folds.push_back(i);
+    ++i;
+    if (max_folds == 0 ? run.ramp_end >= 0 : run.folds.size() >= max_folds)
+      break;
   }
+  return run;
+}
 
-  EgWalk walk;
-  int att = kFold;
-  long long settled_ticks = 0;
-  for (int ramp = 0; ramp < kSettlingRamps + kMeasuredRamps; ++ramp) {
-    long long slots = 0;
-    if (instant_attack) {
-      att = 0;
-      // The fold lands on the sample after the tick that reached it, and the
-      // virtual key-on and Attack -> Decay take a sample each, so with SL = 0
-      // Decay -> Sustain takes the next tick.
-      if (sustain_att == 0)
-        walk.pass_tick();
-    } else {
-      while (att > 0) {
-        if (++slots > kSlotLimit) {
-          return forever;
-        }
-        const int inc = walk.next_increment(ar);
-        if (inc != 0) {
-          // Arithmetic shift of a negative value, as the simulator does it.
-          att += (~att * inc) >> 4;
-        }
-      }
-    }
-    while (att < kFold) {
-      // The decay hands over to SR at the sustain level, as it does when an
-      // increment lands in the sustain window.  SL = 15 (0x3E0) sits above
-      // the fold, so it spends the whole ramp in decay.
-      const int rate = att < sustain_att ? dr : sr;
-      if (!rate_advances(rate) || ++slots > kSlotLimit) {
-        return forever;
-      }
-      att += 4 * walk.next_increment(rate);
-    }
-    if (ramp == kSettlingRamps - 1) {
-      settled_ticks = walk.ticks;
-    }
+/// Whether the counter decides if a decay from 0 lands in the sustain window:
+/// with SSG-EG, a row whose 4x steps mix 32 with smaller ones (DR rates 57-59)
+/// can step past a window short of the fold.
+inline bool window_can_be_skipped(const OperatorParams &op, NotePitch pitch) {
+  const int sustain = sustain_attenuation(op.sl);
+  if ((op.ssg & 0x08) == 0 || sustain == 0 || sustain >= kSsgFoldAttenuation)
+    return false;
+  const int rate = effective_rate(op.dr & 0x1F, key_scale_value(op, pitch));
+  bool full = false, smaller = false;
+  for (int i = 0; i < 8; ++i) {
+    full = full || kIncTable[rate][i] == 8;
+    smaller = smaller || kIncTable[rate][i] != 8;
   }
-  return static_cast<double>(walk.ticks - settled_ticks) * 1000.0 /
-         (kMeasuredRamps * eg_hz);
+  return full && smaller;
+}
+
+/// The mean ramp of a held SSG-EG loop in output samples, measured as
+/// sample_curve() measures it; infinite when the loop stops before three folds.
+inline double loop_ramp_samples(const OperatorParams &op, NotePitch pitch,
+                                uint16_t start_att) {
+  const uint32_t ramps = (op.ssg & 0x02) != 0 ? 2 : 1;
+  const HeldRun run = run_held(op, pitch, kCurveCounterPhase, start_att,
+                               kMeasuredLoopPeriods * ramps);
+  const double mean = mean_fold_interval(run.folds);
+  return mean > 0.0 ? mean : std::numeric_limits<double>::infinity();
 }
 
 } // namespace detail
@@ -209,10 +199,8 @@ inline double ssg_ramp_ms(int ar, int dr, int sr, int sustain_att,
 /// ends means the ones after it never start.
 struct PhaseDurations {
   double attack_ms = 0.0;
-  /// Full volume down to the sustain level.  Zero when SL = 0, where the
-  /// decay lasts one sample and adds nothing.  An SSG-EG decay at DR rates
-  /// 57-59 can step past the sustain window and keep decaying; this is the
-  /// length when it does not.
+  /// Full volume down to the sustain level -- or, with SSG-EG, to the fold at
+  /// 0x200 when the decay steps past the sustain window.
   double decay_ms = 0.0;
   /// The sustain level the rest of the way to silence -- or, with SSG-EG
   /// enabled, to the fold at 0x200.
@@ -224,24 +212,50 @@ struct PhaseDurations {
   double lifetime_ms() const { return sustain_start_ms() + sustain_ms; }
 };
 
-/// The phase durations of `op` at `pitch`, with the key never released.
+/// The phase durations of `op` at `pitch`, with the key never released.  Where
+/// the counter decides whether the decay lands in the sustain window, the first
+/// ramp is run from kCurveCounterPhase.
 inline PhaseDurations phase_durations(const OperatorParams &op, NotePitch pitch,
                                       double clock_hz = kNtscClockHz) {
+  PhaseDurations phases;
+  if (detail::window_can_be_skipped(op, pitch)) {
+    const detail::HeldRun run = detail::run_held(op, pitch, kCurveCounterPhase,
+                                                 kMaxAttenuation, 0);
+    const double ms = 1000.0 / sample_rate_hz(clock_hz);
+    const double forever = std::numeric_limits<double>::infinity();
+    if (run.attack_end < 0) {
+      phases.attack_ms = forever;
+      return phases;
+    }
+    phases.attack_ms = static_cast<double>(run.attack_end) * ms;
+    const int64_t decay_end = run.decay_end >= 0 ? run.decay_end : run.ramp_end;
+    if (decay_end < 0) {
+      phases.decay_ms = forever;
+      return phases;
+    }
+    phases.decay_ms = static_cast<double>(decay_end - run.attack_end) * ms;
+    if (run.decay_end >= 0) {
+      phases.sustain_ms =
+          run.ramp_end >= 0
+              ? static_cast<double>(run.ramp_end - run.decay_end) * ms
+              : forever;
+    }
+    return phases;
+  }
+
   const int ksv = key_scale_value(op, pitch);
   const bool ssg = (op.ssg & 0x08) != 0;
   const double eg_hz = eg_rate_hz(clock_hz);
-
-  // Where the held envelope runs out of scale.  Without SSG-EG the chip cuts
-  // the output dead the moment the attenuation reaches 0x3F0; with it, both
-  // the fold and the hold latch happen at 0x200 instead.
-  const int end_att = ssg ? static_cast<int>(kSsgFoldAttenuation) : 0x3F0;
+  // Where the held envelope runs out of scale: the output is cut dead at 0x3F0,
+  // and with SSG-EG the fold and the hold latch are at 0x200.
+  const int end_att = ssg ? static_cast<int>(kSsgFoldAttenuation)
+                          : static_cast<int>(kCutAttenuation);
   const int sustain_att = std::min(sustain_attenuation(op.sl), end_att);
 
   const int ar = detail::effective_rate(op.ar & 0x1F, ksv);
   const int dr = detail::effective_rate(op.dr & 0x1F, ksv);
   const int sr = detail::effective_rate(op.sr & 0x1F, ksv);
 
-  PhaseDurations phases;
   phases.attack_ms = detail::attack_ms(ar, eg_hz);
   phases.decay_ms = detail::linear_phase_ms(dr, 0, sustain_att, ssg, eg_hz);
   phases.sustain_ms =
@@ -249,19 +263,9 @@ inline PhaseDurations phase_durations(const OperatorParams &op, NotePitch pitch,
   return phases;
 }
 
-/**
- * The visible period of an SSG-EG loop at `pitch`, in ms.
- *
- * Zero when the patch is not a looping mode -- SSG-EG off, or a hold mode,
- * which latches instead of folding. Infinite when it is a looping mode whose
- * ramp never finishes because a phase never advances (DR = 0 below the
- * sustain level, SR = 0 above it, or AR = 0 after the fold) -- the case
- * sample_curve() names SsgNeverLoops.
- *
- * One ramp is the attenuation climbing from 0 to the fold at 0x200 plus the
- * attack that follows; the alternating modes (bit 1 of the SSG register)
- * invert on every fold, so two ramps make one visible period.
- */
+/// The visible period of an SSG-EG loop at `pitch`, in ms, as sample_curve()
+/// measures a held key.  Zero for a mode that latches instead of looping, and
+/// infinite for a loop that stops before its third fold (SsgNeverLoops).
 inline double ssg_loop_period_ms(const OperatorParams &op, NotePitch pitch,
                                  double clock_hz = kNtscClockHz) {
   // Enabled and hold clear: the ramp restarts instead of latching.
@@ -269,14 +273,10 @@ inline double ssg_loop_period_ms(const OperatorParams &op, NotePitch pitch,
   if (!loops) {
     return 0.0;
   }
-  const int ksv = key_scale_value(op, pitch);
-  const double ramp = detail::ssg_ramp_ms(
-      detail::effective_rate(op.ar & 0x1F, ksv),
-      detail::effective_rate(op.dr & 0x1F, ksv),
-      detail::effective_rate(op.sr & 0x1F, ksv), sustain_attenuation(op.sl),
-      eg_rate_hz(clock_hz));
+  // The alternating modes invert on every fold: two ramps to a period.
   const double ramps_per_period = (op.ssg & 0x02) != 0 ? 2.0 : 1.0;
-  return ramp * ramps_per_period;
+  return detail::loop_ramp_samples(op, pitch, kMaxAttenuation) *
+         ramps_per_period * 1000.0 / sample_rate_hz(clock_hz);
 }
 
 } // namespace ym2612_eg

@@ -91,13 +91,11 @@ inline double window_for_timeline_ms(const PhaseDurations &phases) {
   return std::clamp(whole, floor_ms, kMaxSpanMs);
 }
 
-/// How much of the held envelope is worth seeing at `pitch`, in ms: about
-/// kSsgLoopPeriods periods of an SSG loop, or otherwise the envelope's own
-/// phase durations via window_for_timeline_ms(). A scale, not a length: the
-/// envelope is drawn across the whole axis chosen from it. Nothing here is a
-/// key-off.
-inline double choose_held_ms(const OperatorParams &op, NotePitch pitch) {
-  const double period = ssg_loop_period_ms(op, pitch);
+namespace detail {
+
+/// choose_held_ms() for an SSG-EG loop period already computed.
+inline double held_ms_for_period(const OperatorParams &op, NotePitch pitch,
+                                 double period) {
   // An infinite period is not a slow loop but no loop: the fold never comes,
   // and what the graph has to show is the phase that stalled.
   if (period > 0.0 && std::isfinite(period)) {
@@ -109,6 +107,17 @@ inline double choose_held_ms(const OperatorParams &op, NotePitch pitch) {
     return std::clamp(held, std::min(kMinHeldMs, held), ceiling);
   }
   return window_for_timeline_ms(phase_durations(op, pitch));
+}
+
+} // namespace detail
+
+/// How much of the held envelope is worth seeing at `pitch`, in ms: about
+/// kSsgLoopPeriods periods of an SSG loop, or otherwise the envelope's own
+/// phase durations via window_for_timeline_ms(). A scale, not a length: the
+/// envelope is drawn across the whole axis chosen from it. Nothing here is a
+/// key-off.
+inline double choose_held_ms(const OperatorParams &op, NotePitch pitch) {
+  return detail::held_ms_for_period(op, pitch, ssg_loop_period_ms(op, pitch));
 }
 
 namespace detail {
@@ -241,7 +250,7 @@ inline EnvelopeCurve build_envelope_curve(const OperatorParams &op,
   // 1. What the axis has to hold, in closed form over the registers alone.
   const double period_ms = ssg_loop_period_ms(op, pitch);
   const bool loops = period_ms > 0.0 && std::isfinite(period_ms);
-  out.held_ms = choose_held_ms(op, pitch);
+  out.held_ms = detail::held_ms_for_period(op, pitch, period_ms);
 
   // 2. The release, on its own: keyed on at full volume and released at once,
   //    which routes it through the chip's real key-off rules -- the SSG
@@ -947,7 +956,11 @@ inline uint8_t solve_decay_rate(const OperatorParams &op, NotePitch pitch,
   OperatorParams probe = op;
   return detail::nearest_rate(1, 31, target_ms, [&](int rate) {
     probe.dr = static_cast<uint8_t>(rate);
-    return phase_durations(probe, pitch).decay_ms;
+    const PhaseDurations phases = phase_durations(probe, pitch);
+    // A decay that steps past the sustain window has no knee to answer with.
+    const bool passes = ym2612_eg::detail::window_can_be_skipped(probe, pitch) &&
+                        phases.sustain_ms == 0.0;
+    return passes ? std::numeric_limits<double>::infinity() : phases.decay_ms;
   });
 }
 

@@ -1694,6 +1694,18 @@ const NotePitch kSolverNotes[] = {NotePitch::from_midi(36),
                                   NotePitch::from_midi(60),
                                   NotePitch::from_midi(84)};
 
+/// A decay that steps past the sustain window never reaches a knee, so the
+/// decay solver does not answer with it.
+bool decay_has_no_knee(Phase phase, const OperatorParams &op, NotePitch pitch,
+                       int dr) {
+  if (phase != Phase::Decay)
+    return false;
+  OperatorParams probe = op;
+  probe.dr = static_cast<uint8_t>(dr);
+  return ym2612_eg::detail::window_can_be_skipped(probe, pitch) &&
+         phase_durations(probe, pitch).sustain_ms == 0.0;
+}
+
 /// Pins the round trip: the duration a register value produces solves back to
 /// a value that produces that same duration. Where two values quantise to one
 /// duration -- which the increment table does wherever the effective rate
@@ -1704,6 +1716,8 @@ void test_every_rate_solves_back_to_the_value_it_came_from() {
     for (const NotePitch &pitch : kSolverNotes) {
       for (Phase phase : kPhases) {
         for (int v = slowest_rate(phase); v <= fastest_rate(phase); ++v) {
+          if (decay_has_no_knee(phase, op, pitch, v))
+            continue;
           const double want = phase_ms(phase, op, pitch, v);
           const int got = solve_rate(phase, op, pitch, want);
           CHECK(got >= slowest_rate(phase));
@@ -1815,7 +1829,7 @@ void test_no_other_rate_is_nearer_the_target_in_ratio() {
         const double chosen = std::fabs(std::log(got_ms / target_ms));
         for (int v = slowest_rate(phase); v <= fastest_rate(phase); ++v) {
           const double ms = phase_ms(phase, op, kMiddleC, v);
-          if (ms > 0.0) {
+          if (ms > 0.0 && !decay_has_no_knee(phase, op, kMiddleC, v)) {
             CHECK(std::fabs(std::log(ms / target_ms)) >= chosen - 1e-12);
           }
         }

@@ -105,6 +105,13 @@ inline uint16_t loudest_attenuation(const OperatorParams &op) {
   return inverted ? kSsgFoldAttenuation : uint16_t{0};
 }
 
+namespace detail {
+struct HeldRun;
+inline HeldRun run_held(const OperatorParams &op, NotePitch pitch,
+                        uint16_t counter_phase, uint16_t start_att,
+                        uint32_t max_folds);
+} // namespace detail
+
 class EgSimulator {
 public:
   EgSimulator(const OperatorParams &params, NotePitch pitch,
@@ -330,6 +337,8 @@ public:
 
 private:
   friend CurveResult sample_curve(const CurveRequest &request);
+  friend detail::HeldRun detail::run_held(const OperatorParams &, NotePitch,
+                                          uint16_t, uint16_t, uint32_t);
 
   uint32_t step_events() const { return events_; }
 
