@@ -237,6 +237,25 @@ void test_ssg_hold_parks() {
   CHECK(std::isfinite(r5.park_ms));
 }
 
+// Under a slow attack the key-on starts at 0x3FF, above the fold, and the hold
+// latches only at the fold the decay reaches afterwards; modes 1 and 7 then cut
+// to silence.
+void test_a_slow_attack_hold_mode_reaches_silence() {
+  for (const uint8_t ssg : {uint8_t{0x09}, uint8_t{0x0F}}) {
+    CurveRequest req;
+    req.op = OperatorParams{10, 20, 10, 5, 4, 0, 0, ssg};
+    req.pitch = kC4;
+    req.gate_ms = -1.0;
+    req.max_ms = 4000.0;
+    const CurveResult r = sample_curve(req);
+    CHECK(has_marker(r, MarkerKind::SsgHold));
+    CHECK(marker_ms(r, MarkerKind::SsgHold) > marker_ms(r, MarkerKind::DecayEnd));
+    CHECK(has_marker(r, MarkerKind::Silence));
+    CHECK_EQ(r.points.back().att, kMaxAttenuation);
+    CHECK_EQ(r.points.back().out, kMaxAttenuation);
+  }
+}
+
 void test_warnings() {
   // AR = 0: the operator can never attack.
   {
@@ -486,6 +505,7 @@ int main() {
   RUN_TEST(test_ssg_loop_detection);
   RUN_TEST(test_ssg_alternate_counts_two_ramps);
   RUN_TEST(test_ssg_hold_parks);
+  RUN_TEST(test_a_slow_attack_hold_mode_reaches_silence);
   RUN_TEST(test_warnings);
   RUN_TEST(test_start_att_retrigger);
   RUN_TEST(test_ssg_key_off_segment);

@@ -517,7 +517,8 @@ private:
       events_ |= detail::kEvSsgFold;
 
     // Hold set -> the mode latches here, once.
-    if (in_fold && ssg_hold_ && phase_ != EgPhase::Attack && !ssg_held_) {
+    if (in_fold && ssg_hold_ && !kon_event && phase_ != EgPhase::Attack &&
+        !ssg_held_) {
       ssg_held_ = true;
       events_ |= detail::kEvSsgHold;
     }

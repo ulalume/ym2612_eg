@@ -432,9 +432,8 @@ void test_the_closed_forms_follow_the_sustain_window() {
                 }
                 if ((type & 1) != 0) {
                   // Mode 1 cuts to silence at the fold.
-                  if (ar == 31)
-                    CHECK((marker_ms(held, MarkerKind::Silence) >= 0.0) ==
-                          std::isfinite(phases.lifetime_ms()));
+                  CHECK((marker_ms(held, MarkerKind::Silence) >= 0.0) ==
+                        std::isfinite(phases.lifetime_ms()));
                   continue;
                 }
                 const double period = ssg_loop_period_ms(op, pitch);
