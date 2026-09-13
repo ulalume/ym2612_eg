@@ -100,28 +100,6 @@ inline int counter_shift_for_case(const EgSimulator &eg, bool *mixed) {
   return counter_shift_for_case(rate, mixed);
 }
 
-// EG_SPEC 6 [DIFF] / SSG_EG_SPEC 5.1.  Nuked tests Decay -> Sustain with an
-// equality on the top six bits ((level >> 4) == (sl5 << 1)), which is a 16-wide
-// window; this library uses att >= sustain_att, as ymfm does and as both specs
-// recommend.  A plain decay step is at most 8 so the window can never be
-// jumped, but SSG-EG quadruples the step and 4 * 4 already clears it.  So the
-// two only part company with SSG-EG on, a decay row that contains an increment
-// of 4 or more (rate >= 53), and a sustain level the ramp can actually reach
-// (SL 1..14; SL 0 matches at once and SL 15 sits above the 0x200 freeze).
-inline bool has_ssg_sustain_window_divergence(const OperatorParams &op,
-                                              const EgSimulator &eg) {
-  if (!(op.ssg & 0x08))
-    return false;
-  const int sustain = eg.sustain_attenuation();
-  if (sustain == 0 || sustain >= kSsgFoldAttenuation)
-    return false;
-  const int rate = eg.rate_of(EgPhase::Decay);
-  for (int i = 0; i < 8; ++i)
-    if (4 * detail::kIncTable[rate][i] > 15)
-      return true;
-  return false;
-}
-
 // Nuked reads eg_out one pipeline stage ahead of the level it belongs to:
 // OPN2_EnvelopeSSGEG runs at cycle `slot`, OPN2_EnvelopeGenerate at slot+1 and
 // OPN2_EnvelopeADSR only at slot+2, so eg_out pairs a level with the inversion

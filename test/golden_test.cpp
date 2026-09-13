@@ -93,9 +93,7 @@ void run_case(const jsonlite::Value &c) {
   // Combinations this library is known to disagree with must never reach a
   // vector.
   const char *excluded = nullptr;
-  if (has_ssg_sustain_window_divergence(op, eg))
-    excluded = "SSG-EG decay step wide enough to jump Nuked's sustain window";
-  else if (shift != 0 && counter_wraps(counter_phase, samples))
+  if (shift != 0 && counter_wraps(counter_phase, samples))
     excluded = "counter-shifted case that outlives one 12-bit counter sweep";
   if (excluded) {
     testing::fail(__FILE__, __LINE__,

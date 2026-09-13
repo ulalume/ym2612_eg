@@ -220,12 +220,6 @@ Verdict verify(const Case &c, const Trace &t, bool *out_differs) {
     shift = 0;
   v.shift = shift;
 
-  if (has_ssg_sustain_window_divergence(c.op, eg)) {
-    v.ok = false;
-    v.why = "SSG-EG with a decay step > 15 can jump Nuked's 16-wide "
-            "Decay->Sustain equality window";
-    return v;
-  }
   if (shift != 0 && counter_wraps(t.counter_phase, c.samples)) {
     v.ok = false;
     v.why = "a counter-shifted case must stay inside one sweep of the 12-bit "
@@ -726,6 +720,54 @@ Scenario key_alignment() {
   return s;
 }
 
+// 11. The Decay -> Sustain window: the level's top six bits have to equal the
+//     sustain level's.  At DR rates 57-59 the 4x SSG-EG decay step reaches 32
+//     and can land past that 16-wide window, and the decay then carries on at
+//     DR.  Which step lands where depends on the counter phase at key-on.
+Scenario sustain_window() {
+  Scenario s;
+  s.file = "sustain_window";
+  s.title = "Decay -> Sustain window";
+  s.description = "SSG-EG decays at DR rates 57-59, whose 4x step reaches 32 "
+                  "and can land past the sustain level's 16-wide window, after "
+                  "which the decay carries on at DR. Key-ons on different "
+                  "samples start the decay on different counter phases, so "
+                  "the window is hit in some cases and skipped in others.";
+  const NotePitch c4 = note(60);  // KS=0: ksv 2
+  const NotePitch block2{644, 2}; // ksv 1
+  const NotePitch block6{644, 6}; // ksv 3
+  // Every alignment to the EG tick, and a counter phase that moves on with k.
+  const auto on = [](int k) { return 9 + 3 * k + k % 3; };
+  for (int k = 0; k < 3; ++k)
+    s.cases.push_back({"SSG=$09 DR rate 58 SL=3, on " + num(on(k)),
+                       patch(31, 28, 0, 15, 3, 0, 0, 9), c4, 8000,
+                       {{on(k), true}, {6000 + k, false}}});
+  for (int k = 0; k < 6; ++k)
+    s.cases.push_back({"SSG=$09 DR rate 58 SL=4, on " + num(on(k)),
+                       patch(31, 28, 0, 15, 4, 0, 0, 9), c4, 8000,
+                       {{on(k), true}, {6000 + k % 3, false}}});
+  // SR rate 48: a ramp that hits the window climbs the rest of the way at SR.
+  for (int k = 0; k < 3; ++k)
+    s.cases.push_back({"SSG=$08 DR rate 58 SR rate 48 SL=4, on " + num(on(k)),
+                       patch(31, 28, 23, 15, 4, 0, 0, 8), c4, 12000,
+                       {{on(k), true}, {11000 + k, false}}});
+  // DR rate 57 with SR rate 49: the ramps go on alternating between a hit
+  // window and a skipped one.
+  for (int k = 0; k < 2; ++k)
+    s.cases.push_back({"SSG=$08 DR rate 57 SR rate 49 SL=4, on " + num(on(k)),
+                       patch(31, 28, 24, 15, 4, 0, 0, 8), block2, 12000,
+                       {{on(k), true}, {11000 + k, false}}});
+  for (int k = 0; k < 3; ++k)
+    s.cases.push_back({"SSG=$09 DR rate 57 SL=4, on " + num(on(k)),
+                       patch(31, 28, 0, 15, 4, 0, 0, 9), block2, 8000,
+                       {{on(k), true}, {6000 + k, false}}});
+  for (int k = 0; k < 3; ++k)
+    s.cases.push_back({"SSG=$09 DR rate 59 SL=4, on " + num(on(k)),
+                       patch(31, 28, 0, 15, 4, 0, 0, 9), block6, 8000,
+                       {{on(k), true}, {6000 + k, false}}});
+  return s;
+}
+
 } // namespace
 
 int main(int argc, char **argv) {
@@ -740,7 +782,8 @@ int main(int argc, char **argv) {
                                 sr_rr_sweep(),     ks_pitch(),
                                 ssg_modes(),       ssg_slow_attack(),
                                 retrigger(),       edge_anchors(),
-                                high_rate(),       key_alignment()};
+                                high_rate(),       key_alignment(),
+                                sustain_window()};
   bool ok = true;
   for (const Scenario &s : scenarios)
     ok &= emit(s, dir);

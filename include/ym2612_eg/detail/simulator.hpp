@@ -313,7 +313,7 @@ public:
     // A Decay that already satisfies the sustain test still has that
     // transition ahead of it, on the next sample: reporting rest here would
     // end a caller's run early and swallow the Decay -> Sustain event.
-    if (phase_ == EgPhase::Decay && att_ >= sustain_att_)
+    if (phase_ == EgPhase::Decay && at_sustain_level())
       return false;
     return rate_[static_cast<int>(phase_)] == 0;
   }
@@ -353,6 +353,11 @@ private:
     return ssg_enable_ && att_ >= kSsgFoldAttenuation && !ssg_hold_;
   }
 
+  // The Decay -> Sustain test: the level's top six bits equal the sustain
+  // level's, a window 16 wide.  A decay step that lands past it stays in
+  // Decay at DR.
+  bool at_sustain_level() const { return (att_ >> 4) == (sustain_att_ >> 4); }
+
   // True when ssg_step() at or above the fold level has nothing left to do:
   // every latch already set, every jump already taken, every event already
   // raised.  Only meaningful with SSG-EG on and att_ >= kSsgFoldAttenuation.
@@ -389,7 +394,7 @@ private:
     // A transition test that already holds fires on the very next sample,
     // whatever the rate does.
     if ((phase_ == EgPhase::Attack && att_ == 0) ||
-        (phase_ == EgPhase::Decay && att_ >= sustain_att_))
+        (phase_ == EgPhase::Decay && at_sustain_level()))
       return 0;
 
     // An EG tick lands on the samples whose divider reads 0 on entry.
@@ -544,7 +549,7 @@ private:
         next = EgPhase::Decay;
       else if (tick && keyed_on_ && rate_[0] < 62)
         attack_increment();
-    } else if (start == EgPhase::Decay && att_ >= sustain_att_) {
+    } else if (start == EgPhase::Decay && at_sustain_level()) {
       next = EgPhase::Sustain;
     } else if (tick && !eg_off) {
       // DR, SR and RR alike: 4x under SSG-EG, where eg_off freezes it at 0x200.

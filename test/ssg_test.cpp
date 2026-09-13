@@ -429,6 +429,35 @@ void test_sl15_leaves_dr_in_charge() {
   CHECK(!entered_sustain); // 0x3E0 is unreachable under the 0x200 freeze
 }
 
+// Decay -> Sustain needs the level's top six bits to equal the sustain
+// level's, a window 16 wide.  At DR rate 58 the 4x decay step alternates
+// between 16 and 32 with the counter's parity: from 0 it lands on 128 (SL=4)
+// on one parity and steps from 112 to 144 on the other, and that decay carries
+// on at DR to the fold, where mode 1 cuts it to silence.
+void test_sustain_window_hit_and_skipped() {
+  const OperatorParams op = ssg_patch(28, 0, 4, 0x09); // SR=0: Sustain holds
+  EgSimulator hit(op, kRks2), skipped(op, kRks2);
+  CHECK_EQ(hit.rate_of(EgPhase::Decay), 58);
+  CHECK_EQ(hit.sustain_attenuation(), 128);
+  hit.reset(1);
+  skipped.reset(0);
+  hit.key_on();
+  skipped.key_on();
+  bool in_window = false;
+  for (int i = 0; i < 300; ++i) {
+    hit.step();
+    skipped.step();
+    if (skipped.phase() == EgPhase::Decay && skipped.attenuation() >= 128 &&
+        skipped.attenuation() < 144)
+      in_window = true;
+  }
+  CHECK(hit.phase() == EgPhase::Sustain);
+  CHECK_EQ(hit.attenuation(), 128);
+  CHECK(!in_window);
+  CHECK(skipped.phase() == EgPhase::Release);
+  CHECK_EQ(skipped.attenuation(), 0x3FF);
+}
+
 void test_sl_below_15_always_under_fold() {
   for (int sl = 0; sl <= 14; ++sl) {
     EgSimulator sim(ssg_patch(31, 15, sl, 0x08), kRks0);
@@ -502,6 +531,7 @@ int main() {
   RUN_TEST(test_release_is_also_four_times_faster);
   RUN_TEST(test_key_off_is_edge_triggered);
   RUN_TEST(test_sl15_leaves_dr_in_charge);
+  RUN_TEST(test_sustain_window_hit_and_skipped);
   RUN_TEST(test_sl_below_15_always_under_fold);
   RUN_TEST(test_fold_is_reported_once_per_cycle);
   return testing::summary();

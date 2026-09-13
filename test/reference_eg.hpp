@@ -95,7 +95,7 @@ struct Reference {
       state = keyed ? kD : kR;
       return true;
     }
-    if (state == kD && att >= sustain) {
+    if (state == kD && (att >> 4) == (sustain >> 4)) {
       state = keyed ? kS : kR;
       return true;
     }

@@ -184,8 +184,9 @@ inline double ssg_ramp_ms(int ar, int dr, int sr, int sustain_att,
       }
     }
     while (att < kFold) {
-      // The chip compares against the raw sustain level, not one clamped to
-      // the fold, which is how SL = 15 (0x3E0) spends the whole ramp in decay.
+      // The decay hands over to SR at the sustain level, as it does when an
+      // increment lands in the sustain window.  SL = 15 (0x3E0) sits above
+      // the fold, so it spends the whole ramp in decay.
       const int rate = att < sustain_att ? dr : sr;
       if (!rate_advances(rate) || ++slots > kSlotLimit) {
         return forever;
@@ -209,7 +210,9 @@ inline double ssg_ramp_ms(int ar, int dr, int sr, int sustain_att,
 struct PhaseDurations {
   double attack_ms = 0.0;
   /// Full volume down to the sustain level.  Zero when SL = 0, where the
-  /// decay lasts one sample and adds nothing.
+  /// decay lasts one sample and adds nothing.  An SSG-EG decay at DR rates
+  /// 57-59 can step past the sustain window and keep decaying; this is the
+  /// length when it does not.
   double decay_ms = 0.0;
   /// The sustain level the rest of the way to silence -- or, with SSG-EG
   /// enabled, to the fold at 0x200.
