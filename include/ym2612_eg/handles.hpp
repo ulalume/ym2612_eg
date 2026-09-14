@@ -21,9 +21,6 @@ struct Point {
   float y = 0.0f;
 };
 
-/// Attenuation at the bottom of the graph; 0 (full volume) is at the top.
-inline constexpr double kFullScale = static_cast<double>(kMaxAttenuation);
-
 /// A handle is named for the part of the envelope it is grabbed by, and
 /// stands for the one or two parameters that part is made of.
 enum HandleIndex {

@@ -7,10 +7,13 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstddef>
 #include <cstdint>
+#include <initializer_list>
 #include <iostream>
 #include <limits>
 #include <string>
+#include <utility>
 #include <vector>
 
 using namespace ym2612_eg;
@@ -2323,6 +2326,371 @@ void test_a_held_line_past_its_trace_goes_on_at_its_phase_rate() {
   CHECK(held.held_tail_slope == 0.0);
 }
 
+// ------------------------------------------------------- the drawn traces
+
+/// A trace through `points`, each {ms, out}.
+CurveResult trace_of(std::initializer_list<std::pair<double, int>> points) {
+  CurveResult trace;
+  for (const auto &[ms, out] : points) {
+    trace.points.push_back(CurvePoint{static_cast<float>(ms),
+                                      static_cast<uint16_t>(out),
+                                      static_cast<uint16_t>(out)});
+  }
+  return trace;
+}
+
+bool vertex_is(const TraceVertex &vertex, double ms, double out) {
+  return std::fabs(vertex.ms - ms) < 1e-9 && std::fabs(vertex.out - out) < 1e-9;
+}
+
+/// The last vertex of a path: at `limit_ms`, or where the tail met the top or
+/// the bottom of the scale on the way there.
+bool ends_at(const std::vector<TraceVertex> &path, double limit_ms) {
+  const TraceVertex &end = path.back();
+  return std::fabs(end.ms - limit_ms) < 1e-9 ||
+         (end.ms < limit_ms &&
+          (end.out < 1e-6 || std::fabs(end.out - kFullScale) < 1e-6));
+}
+
+/// Plain and SSG-EG patches across the rates, at middle C.
+const std::vector<EnvelopeCurve> &sample_curves() {
+  static const std::vector<EnvelopeCurve> curves = [] {
+    std::vector<EnvelopeCurve> out;
+    for (const int ar : {0, 5, 31}) {
+      for (const int dr : {0, 12}) {
+        for (const int sl : {3, 15}) {
+          for (const int sr : {0, 9}) {
+            for (const int rr : {0, 3, 15}) {
+              for (const int ssg : {0x00, 0x08, 0x0C}) {
+                OperatorParams op = adsr(ar, dr, sl, sr, rr, 0);
+                op.tl = static_cast<uint8_t>(sl == 3 ? 40 : 0);
+                op.ssg = static_cast<uint8_t>(ssg);
+                out.push_back(build_envelope_curve(op, kMiddleC));
+              }
+            }
+          }
+        }
+      }
+    }
+    return out;
+  }();
+  return curves;
+}
+
+void test_a_trace_path_follows_the_trace_to_the_edge_of_the_axis() {
+  const CurveResult trace =
+      trace_of({{0.0, 1023}, {10.0, 0}, {50.0, 500}, {100.0, 500}});
+  std::vector<TraceVertex> path;
+  build_trace_path(path, trace, 0.0, 200.0);
+  CHECK_EQ(path.size(), 5u);
+  CHECK(vertex_is(path[0], 0.0, 1023.0));
+  CHECK(vertex_is(path[1], 10.0, 0.0));
+  CHECK(vertex_is(path[2], 50.0, 500.0));
+  CHECK(vertex_is(path[3], 100.0, 500.0));
+  CHECK(vertex_is(path[4], 200.0, 500.0));
+}
+
+void test_a_trace_path_goes_on_along_the_tail_slope() {
+  const CurveResult trace = trace_of({{0.0, 0}, {100.0, 500}});
+  std::vector<TraceVertex> path;
+  // Falling, it stops at the bottom of the scale.
+  build_trace_path(path, trace, 5.0, 1000.0);
+  CHECK_EQ(path.size(), 3u);
+  CHECK(vertex_is(path.back(), 100.0 + 523.0 / 5.0, kFullScale));
+  // Rising, at the top.
+  build_trace_path(path, trace, -2.0, 1000.0);
+  CHECK(vertex_is(path.back(), 350.0, 0.0));
+  // The edge of the axis comes first.
+  build_trace_path(path, trace, 1.0, 200.0);
+  CHECK(vertex_is(path.back(), 200.0, 600.0));
+  // Already at the bottom, a fall adds nothing.
+  build_trace_path(path, trace_of({{0.0, 0}, {100.0, 1023}}), 5.0, 1000.0);
+  CHECK_EQ(path.size(), 2u);
+  CHECK(vertex_is(path.back(), 100.0, kFullScale));
+}
+
+void test_a_trace_path_cuts_the_edges_that_cross_its_ends() {
+  const CurveResult trace =
+      trace_of({{0.0, 1023}, {10.0, 0}, {50.0, 500}, {300.0, 1000}});
+  std::vector<TraceVertex> path;
+  // Entered part way along the first edge, left part way along the second.
+  build_trace_path(path, trace, 0.0, 1000.0, 5.0, 30.0);
+  CHECK_EQ(path.size(), 3u);
+  CHECK(vertex_is(path[0], 5.0, 511.5));
+  CHECK(vertex_is(path[1], 10.0, 0.0));
+  CHECK(vertex_is(path[2], 30.0, 250.0));
+  // The axis ends before the trace does.
+  build_trace_path(path, trace, 0.0, 175.0);
+  CHECK(vertex_is(path.back(), 175.0, 750.0));
+  // Nothing is left between the two ends, or there is no trace.
+  build_trace_path(path, trace, 0.0, 1000.0, 30.0, 30.0);
+  CHECK(path.empty());
+  build_trace_path(path, CurveResult{}, 1.0, 1000.0);
+  CHECK(path.empty());
+}
+
+void test_a_trace_path_slides_along_the_axis() {
+  // Entered where the trace is at 250, drawn from 70 on the axis.
+  const CurveResult trace = trace_of({{0.0, 0}, {100.0, 1000}});
+  std::vector<TraceVertex> path;
+  build_trace_path(path, trace, 0.0, 1000.0, 25.0, 120.0, 45.0);
+  CHECK_EQ(path.size(), 2u);
+  CHECK(vertex_is(path[0], 70.0, 250.0));
+  CHECK(vertex_is(path[1], 120.0, 750.0));
+  // The limit is on the axis, so the axis still ends it.
+  build_trace_path(path, trace, 0.0, 100.0, 25.0, 120.0, 45.0);
+  CHECK(vertex_is(path[0], 70.0, 250.0));
+  CHECK(vertex_is(path.back(), 100.0, 550.0));
+  // Slid off the axis altogether.
+  build_trace_path(path, trace, 0.0, 100.0, 25.0, 120.0, 80.0);
+  CHECK(path.empty());
+}
+
+void test_every_drawn_trace_stays_on_its_axis() {
+  std::vector<TraceVertex> path;
+  int checked = 0;
+  for (const EnvelopeCurve &curve : sample_curves()) {
+    for (const double scale : {0.5, 1.0, 1.5}) {
+      const double span = curve.span_ms * scale;
+      for (const bool held : {true, false}) {
+        const CurveResult &trace = held ? curve.held : curve.release;
+        build_trace_path(path, trace,
+                         held ? curve.held_tail_slope
+                              : curve.release_tail_slope,
+                         span);
+        CHECK(path.size() >= 2);
+        if (path.empty()) {
+          continue;
+        }
+        CHECK(path.front().ms == 0.0);
+        bool inside = true;
+        for (std::size_t i = 0; i < path.size(); ++i) {
+          const TraceVertex &v = path[i];
+          inside = inside && v.ms >= 0.0 && v.ms <= span && v.out >= 0.0 &&
+                   v.out <= kFullScale && (i == 0 || v.ms >= path[i - 1].ms);
+        }
+        CHECK(inside);
+        CHECK(ends_at(path, span));
+        ++checked;
+      }
+    }
+  }
+  CHECK(checked > 1000);
+}
+
+void test_a_voice_is_drawn_from_where_its_key_came_up_to_its_cursor() {
+  std::vector<TraceVertex> path;
+  int released = 0;
+  for (const EnvelopeCurve &curve : sample_curves()) {
+    const double span = curve.span_ms;
+    for (const double held_share : {0.3, 0.6, 1.2}) {
+      for (const double off_share : {0.05, 0.4, 2.0}) {
+        const double off = span * off_share;
+        const VoiceCursor cursor =
+            cursor_for_voice(curve, span * held_share + off, off, span);
+
+        build_trace_path(path, curve.held, curve.held_tail_slope, span, 0.0,
+                         cursor.held_to_ms);
+        CHECK(!path.empty() &&
+              ends_at(path, std::min(cursor.held_to_ms, span)));
+
+        build_trace_path(path, curve.release, curve.release_tail_slope, span,
+                         cursor.release_from_ms, cursor.ms,
+                         cursor.release_origin_ms - cursor.release_from_ms);
+        if (cursor.release_origin_ms >= span) {
+          CHECK(path.empty());
+          continue;
+        }
+        CHECK(!path.empty());
+        if (path.empty()) {
+          continue;
+        }
+        CHECK(std::fabs(path.front().ms - cursor.release_origin_ms) < 1e-9);
+        CHECK(ends_at(path, std::min(cursor.ms, span)));
+        bool inside = true;
+        for (const TraceVertex &v : path) {
+          inside = inside && v.ms >= cursor.release_origin_ms - 1e-9 &&
+                   v.ms <= span + 1e-9;
+        }
+        CHECK(inside);
+        ++released;
+      }
+    }
+  }
+  CHECK(released > 500);
+}
+
+void test_the_held_line_belongs_to_the_phase_of_each_instant() {
+  EnvelopeCurve curve;
+  curve.attack_end_ms = 10.0;
+  curve.decay_end_ms = 40.0;
+  CHECK(held_phase_at(curve, 0.0) == EgPhase::Attack);
+  CHECK(held_phase_at(curve, 9.99) == EgPhase::Attack);
+  CHECK(held_phase_at(curve, 10.0) == EgPhase::Decay);
+  CHECK(held_phase_at(curve, 39.99) == EgPhase::Decay);
+  CHECK(held_phase_at(curve, 40.0) == EgPhase::Sustain);
+  CHECK(held_phase_at(curve, 1e9) == EgPhase::Sustain);
+  // A decay that never ends runs on.
+  curve.decay_end_ms = -1.0;
+  CHECK(held_phase_at(curve, 1e9) == EgPhase::Decay);
+  // An attack that never ends owns the whole line.
+  curve.attack_end_ms = -1.0;
+  curve.decay_end_ms = 40.0;
+  CHECK(held_phase_at(curve, 1e9) == EgPhase::Attack);
+  // A decay that ends no later than the attack has no stretch of its own.
+  curve.attack_end_ms = 10.0;
+  curve.decay_end_ms = 5.0;
+  CHECK(held_phase_at(curve, 7.0) == EgPhase::Attack);
+  CHECK(held_phase_at(curve, 10.0) == EgPhase::Sustain);
+}
+
+void test_the_held_line_splits_where_it_changes_phase() {
+  EnvelopeCurve curve;
+  curve.attack_end_ms = 10.0;
+  curve.decay_end_ms = 40.0;
+  std::vector<TraceVertex> path;
+  for (const double ms : {0.0, 5.0, 10.0, 20.0, 40.0, 60.0}) {
+    path.push_back(TraceVertex{ms, 0.0});
+  }
+  const PhaseRuns runs = held_phase_runs(curve, path);
+  CHECK_EQ(runs.count, 3);
+  CHECK(runs.items[0].phase == EgPhase::Attack);
+  CHECK_EQ(runs.items[0].first, 0u);
+  CHECK_EQ(runs.items[0].count, 3u);
+  CHECK(runs.items[1].phase == EgPhase::Decay);
+  CHECK_EQ(runs.items[1].first, 2u);
+  CHECK_EQ(runs.items[1].count, 3u);
+  CHECK(runs.items[2].phase == EgPhase::Sustain);
+  CHECK_EQ(runs.items[2].first, 4u);
+  CHECK_EQ(runs.items[2].count, 2u);
+
+  // An attack that never ends is one run.
+  curve.attack_end_ms = -1.0;
+  const PhaseRuns attack = held_phase_runs(curve, path);
+  CHECK_EQ(attack.count, 1);
+  CHECK(attack.items[0].phase == EgPhase::Attack);
+  CHECK_EQ(attack.items[0].count, path.size());
+
+  // No edge, no run.
+  path.resize(1);
+  CHECK_EQ(held_phase_runs(curve, path).count, 0);
+  path.clear();
+  CHECK_EQ(held_phase_runs(curve, path).count, 0);
+}
+
+void test_every_held_line_is_one_run_per_phase_in_order() {
+  std::vector<TraceVertex> path;
+  for (const EnvelopeCurve &curve : sample_curves()) {
+    build_trace_path(path, curve.held, curve.held_tail_slope, curve.span_ms);
+    const PhaseRuns runs = held_phase_runs(curve, path);
+    CHECK(runs.count >= 1 && runs.count <= 3);
+    std::size_t next = 0;
+    bool joined = true;
+    for (int r = 0; r < runs.count; ++r) {
+      const PhaseRun &run = runs.items[static_cast<std::size_t>(r)];
+      joined = joined && run.first == next && run.count >= 2 &&
+               (r == 0 ||
+                run.phase > runs.items[static_cast<std::size_t>(r - 1)].phase);
+      for (std::size_t e = run.first; e + 1 < run.first + run.count; ++e) {
+        joined = joined && held_phase_at(curve, path[e].ms) == run.phase;
+      }
+      next = run.first + run.count - 1;
+    }
+    CHECK(joined);
+    CHECK(next + 1 == path.size());
+  }
+}
+
+// --------------------------------------------------- what shows of a voice
+
+void test_a_voice_past_the_edge_loses_only_its_cursor() {
+  VoiceCursor cursor;
+  cursor.ms = 150.0;
+  const VoiceVisibility past = voice_visibility(cursor, 100.0);
+  CHECK(!past.cursor_on_axis);
+  CHECK(past.fade == 1.0);
+  CHECK(!past.finished);
+  // The axis is the one drawn, not the curve's own.
+  CHECK(voice_visibility(cursor, 200.0).cursor_on_axis);
+  cursor.ms = 100.0;
+  CHECK(voice_visibility(cursor, 100.0).cursor_on_axis);
+  cursor.ms = 0.0;
+  CHECK(voice_visibility(cursor, 100.0).cursor_on_axis);
+
+  const EnvelopeCurve curve = build_envelope_curve(worked_example(), kMiddleC);
+  const VoiceCursor far =
+      cursor_for_voice(curve, curve.span_ms * 2.0, -1.0, curve.span_ms);
+  const VoiceVisibility far_shown = voice_visibility(far, curve.span_ms);
+  CHECK(!far_shown.cursor_on_axis);
+  CHECK(far_shown.fade == 1.0);
+  CHECK(!far_shown.finished);
+  CHECK(voice_visibility(far, curve.span_ms * 2.5).cursor_on_axis);
+}
+
+void test_a_silent_voice_fades_and_then_is_finished() {
+  VoiceCursor cursor;
+  cursor.released = true;
+  cursor.silent_for_ms = kVoiceFadeMs * 0.5;
+  CHECK_ABS(voice_visibility(cursor, 100.0).fade, 0.5, 1e-12);
+  CHECK(!voice_visibility(cursor, 100.0).finished);
+  cursor.silent_for_ms = kVoiceFadeMs;
+  CHECK(voice_visibility(cursor, 100.0).fade == 0.0);
+  CHECK(voice_visibility(cursor, 100.0).finished);
+  // A key still down fades with its sound but is never over.
+  cursor.released = false;
+  CHECK(voice_visibility(cursor, 100.0).fade == 0.0);
+  CHECK(!voice_visibility(cursor, 100.0).finished);
+  // The fade time is the caller's.
+  cursor.released = true;
+  cursor.silent_for_ms = 100.0;
+  CHECK_ABS(voice_visibility(cursor, 100.0, 200.0).fade, 0.5, 1e-12);
+  CHECK(voice_visibility(cursor, 100.0, 100.0).finished);
+  // With no fade a voice goes the moment it is silent, and not before.
+  CHECK(voice_visibility(cursor, 100.0, 0.0).fade == 0.0);
+  CHECK(voice_visibility(cursor, 100.0, 0.0).finished);
+  cursor.silent_for_ms = 0.0;
+  CHECK(voice_visibility(cursor, 100.0, 0.0).fade == 1.0);
+  CHECK(!voice_visibility(cursor, 100.0, 0.0).finished);
+
+  // A real release: audible, then fading, then over.
+  const EnvelopeCurve curve = build_envelope_curve(worked_example(), kMiddleC);
+  const double key_off = 40.0;
+  const double to_silence =
+      curve.release_silence_ms -
+      release_entry_ms(curve.release, curve_out_at_ms(curve.held, key_off));
+  CHECK(std::isfinite(to_silence) && to_silence > 0.0);
+  const auto after = [&](double released_for) {
+    return voice_visibility(cursor_for_voice(curve, key_off + released_for,
+                                             released_for, curve.span_ms),
+                            curve.span_ms);
+  };
+  CHECK(after(to_silence * 0.5).fade == 1.0);
+  CHECK(!after(to_silence * 0.5).finished);
+  CHECK_ABS(after(to_silence + kVoiceFadeMs * 0.5).fade, 0.5, 0.01);
+  CHECK(!after(to_silence + kVoiceFadeMs * 0.5).finished);
+  CHECK(after(to_silence + kVoiceFadeMs + 1.0).finished);
+}
+
+void test_a_voice_expires_after_the_longest_release_and_its_fade() {
+  CHECK(!voice_expired(-1.0));
+  CHECK(!voice_expired(0.0));
+  CHECK(!voice_expired(release_max_ms() + kVoiceFadeMs));
+  CHECK(voice_expired(release_max_ms() + kVoiceFadeMs + 1.0));
+  CHECK(!voice_expired(release_max_ms() + 50.0, 50.0));
+  CHECK(voice_expired(release_max_ms() + 51.0, 50.0));
+
+  // A release that outlasts its simulation never goes silent on the graph,
+  // so expiry is what ends it.
+  const EnvelopeCurve slow =
+      build_envelope_curve(adsr(31, 10, 2, 5, 0, 0), kMiddleC);
+  CHECK(slow.release_truncated);
+  const double off = release_max_ms() + kVoiceFadeMs + 1.0;
+  const VoiceCursor cursor =
+      cursor_for_voice(slow, 100.0 + off, off, slow.span_ms);
+  CHECK(!voice_visibility(cursor, slow.span_ms).finished);
+  CHECK(voice_expired(off));
+}
+
 int main() {
   std::cout << "graph_test\n";
 
@@ -2420,6 +2788,20 @@ int main() {
   RUN_TEST(test_a_release_past_the_simulation_goes_on_at_its_own_slope);
   RUN_TEST(test_no_slow_release_bends_where_the_simulation_stops);
   RUN_TEST(test_a_held_line_past_its_trace_goes_on_at_its_phase_rate);
+
+  RUN_TEST(test_a_trace_path_follows_the_trace_to_the_edge_of_the_axis);
+  RUN_TEST(test_a_trace_path_goes_on_along_the_tail_slope);
+  RUN_TEST(test_a_trace_path_cuts_the_edges_that_cross_its_ends);
+  RUN_TEST(test_a_trace_path_slides_along_the_axis);
+  RUN_TEST(test_every_drawn_trace_stays_on_its_axis);
+  RUN_TEST(test_a_voice_is_drawn_from_where_its_key_came_up_to_its_cursor);
+  RUN_TEST(test_the_held_line_belongs_to_the_phase_of_each_instant);
+  RUN_TEST(test_the_held_line_splits_where_it_changes_phase);
+  RUN_TEST(test_every_held_line_is_one_run_per_phase_in_order);
+
+  RUN_TEST(test_a_voice_past_the_edge_loses_only_its_cursor);
+  RUN_TEST(test_a_silent_voice_fades_and_then_is_finished);
+  RUN_TEST(test_a_voice_expires_after_the_longest_release_and_its_fade);
 
   return testing::summary();
 }
