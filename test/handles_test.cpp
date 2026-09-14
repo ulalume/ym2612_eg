@@ -590,6 +590,64 @@ void test_dragging_the_peak_across_changes_the_attack_rate() {
 
 } // namespace
 
+void test_the_handle_and_field_values_are_fixed() {
+  CHECK_EQ(static_cast<int>(kAttackHandle), 0);
+  CHECK_EQ(static_cast<int>(kDecayHandle), 1);
+  CHECK_EQ(static_cast<int>(kSustainHandle), 2);
+  CHECK_EQ(static_cast<int>(kReleaseHandle), 3);
+  CHECK_EQ(static_cast<int>(kHandleCount), 4);
+  CHECK_EQ(static_cast<int>(HandleField::AttackRate), 0);
+  CHECK_EQ(static_cast<int>(HandleField::DecayRate), 1);
+  CHECK_EQ(static_cast<int>(HandleField::SustainLevel), 2);
+  CHECK_EQ(static_cast<int>(HandleField::SustainRate), 3);
+  CHECK_EQ(static_cast<int>(HandleField::ReleaseRate), 4);
+  CHECK_EQ(static_cast<int>(HandleField::TotalLevel), 5);
+}
+
+void test_each_handle_names_the_registers_it_sets() {
+  const HandleFields attack = handle_fields(kAttackHandle);
+  CHECK(attack.across == HandleField::AttackRate);
+  CHECK(attack.down == HandleField::TotalLevel);
+  const HandleFields decay = handle_fields(kDecayHandle);
+  CHECK(decay.across == HandleField::DecayRate);
+  CHECK(decay.down == HandleField::SustainLevel);
+  const HandleFields sustain = handle_fields(kSustainHandle);
+  CHECK(!sustain.across);
+  CHECK(sustain.down == HandleField::SustainRate);
+  const HandleFields release = handle_fields(kReleaseHandle);
+  CHECK(release.across == HandleField::ReleaseRate);
+  CHECK(!release.down);
+  const HandleFields none = handle_fields(kHandleCount);
+  CHECK(!none.across && !none.down);
+}
+
+void test_a_drag_writes_only_the_registers_its_handle_names() {
+  const Point moves[] = {{15.0f, 0.0f},  {-15.0f, 0.0f}, {0.0f, 12.0f},
+                         {0.0f, -12.0f}, {20.0f, 20.0f}, {-30.0f, 40.0f},
+                         {0.0f, -200.0f}};
+  int writes = 0;
+  for (const OperatorParams &op :
+       {worked_example(), adsr(18, 6, 9, 3, 4, 20), adsr(31, 0, 5, 0, 15, 0),
+        adsr(10, 20, 15, 12, 1, 60)}) {
+    const EnvelopeHandles handles = layout_of(curve_of(op));
+    for (int h = 0; h < kHandleCount; ++h) {
+      const HandleIndex handle = static_cast<HandleIndex>(h);
+      const HandleFields fields = handle_fields(handle);
+      const HandleGrab grab = grab_handle(handles, handle);
+      for (const Point moved : moves) {
+        const HandleEdit edit = drag_handle(grab, op, kMiddleC, moved);
+        for (int i = 0; i < edit.count; ++i) {
+          const HandleField field =
+              edit.writes[static_cast<std::size_t>(i)].field;
+          CHECK(field == fields.across || field == fields.down);
+          ++writes;
+        }
+      }
+    }
+  }
+  CHECK(writes > 50);
+}
+
 int main() {
   std::cout << "handles_test\n";
 
@@ -617,6 +675,10 @@ int main() {
   RUN_TEST(test_a_knee_dragged_down_solves_the_rate_against_the_new_level);
   RUN_TEST(test_a_release_tilted_level_or_upward_asks_for_the_slowest);
   RUN_TEST(test_dragging_the_peak_across_changes_the_attack_rate);
+
+  RUN_TEST(test_the_handle_and_field_values_are_fixed);
+  RUN_TEST(test_each_handle_names_the_registers_it_sets);
+  RUN_TEST(test_a_drag_writes_only_the_registers_its_handle_names);
 
   return testing::summary();
 }
