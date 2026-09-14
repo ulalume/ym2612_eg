@@ -113,6 +113,7 @@ void test_sr0_never_loops() {
   // SL <= 14 with SR = 0: the ramp parks at SL and never reaches 0x200.
   EgSimulator sim(ssg_patch(31, 0, 4, 0x08), kRks0);
   sim.key_on();
+  sim.step(); // the key-on sample
   const auto folds = ssg_fold_samples(sim, 3, 400000);
   CHECK_EQ(folds.size(), size_t{0});
   CHECK_EQ(sim.attenuation(), 128); // parked exactly at the sustain level
@@ -124,6 +125,7 @@ void test_dr0_never_loops() {
   // DR = 0 with SL > 0: decay never advances, so the operator sits at 0.
   EgSimulator sim(ssg_patch(0, 31, 4, 0x08), kRks0);
   sim.key_on();
+  sim.step(); // the key-on sample
   const auto folds = ssg_fold_samples(sim, 3, 400000);
   CHECK_EQ(folds.size(), size_t{0});
   CHECK_EQ(sim.attenuation(), 0);
@@ -135,6 +137,7 @@ void test_dr0_never_loops() {
 void test_one_sample_at_0x200_before_fold() {
   EgSimulator sim(ssg_patch(15, 0, 15, 0x08), kRks0);
   sim.key_on();
+  sim.step(); // the key-on sample
   int runs = 0;
   int current = 0;
   int max_run = 0;
@@ -178,6 +181,7 @@ void test_four_times_increment_and_freeze() {
   // where the plain envelope would run all the way to 0x3FF.
   EgSimulator loop(ssg_patch(15, 0, 15, 0x08), kRks0);
   loop.key_on();
+  loop.step(); // the key-on sample
   uint16_t peak = 0;
   for (uint64_t i = 0; i < 100000; ++i) {
     peak = std::max(peak, loop.attenuation());
@@ -238,6 +242,7 @@ void test_mode_shapes() {
   {
     EgSimulator sim(ssg_patch(15, 0, 15, 0x0A), kRks0);
     sim.key_on();
+    sim.step(); // the key-on sample
     CHECK(!sim.ssg_inverted());
     ssg_fold_samples(sim, 1, 200000);
     sim.step(); // consume the fold
@@ -275,6 +280,7 @@ void test_mode_shapes() {
   {
     EgSimulator sim(ssg_patch(15, 0, 15, 0x0E), kRks0);
     sim.key_on();
+    sim.step(); // the key-on sample
     CHECK(sim.ssg_inverted());
     ssg_fold_samples(sim, 1, 200000);
     sim.step();
@@ -383,6 +389,7 @@ void test_release_is_also_four_times_faster() {
     OperatorParams op = ssg_patch(15, 0, 15, ssg, 31, /*rr=*/6);
     EgSimulator sim(op, kRks0);
     sim.key_on();
+    sim.step(); // the key-on sample
     CHECK_EQ(sim.attenuation(), 0);
     sim.key_off();
     return ticks_until(
@@ -397,6 +404,7 @@ void test_release_is_also_four_times_faster() {
 void test_key_off_is_edge_triggered() {
   EgSimulator sim(ssg_patch(15, 0, 15, 0x0A), kRks0);
   sim.key_on();
+  sim.step(); // the key-on sample
   ssg_fold_samples(sim, 1, 200000);
   sim.step();
   while (sim.attenuation() < 128)
@@ -419,6 +427,33 @@ void test_sl15_leaves_dr_in_charge() {
       break;
   }
   CHECK(!entered_sustain); // 0x3E0 is unreachable under the 0x200 freeze
+}
+
+// Decay -> Sustain needs the level's top six bits to equal the sustain level's.
+// At DR rate 58 the 4x step alternates 16 and 32 with the counter's parity:
+// from 0 it lands on 128 (SL=4), or steps 112 -> 144 and decays to the fold.
+void test_sustain_window_hit_and_skipped() {
+  const OperatorParams op = ssg_patch(28, 0, 4, 0x09); // SR=0: Sustain holds
+  EgSimulator hit(op, kRks2), skipped(op, kRks2);
+  CHECK_EQ(hit.rate_of(EgPhase::Decay), 58);
+  CHECK_EQ(hit.sustain_attenuation(), 128);
+  hit.reset(0);
+  skipped.reset(1);
+  hit.key_on();
+  skipped.key_on();
+  bool in_window = false;
+  for (int i = 0; i < 300; ++i) {
+    hit.step();
+    skipped.step();
+    if (skipped.phase() == EgPhase::Decay && skipped.attenuation() >= 128 &&
+        skipped.attenuation() < 144)
+      in_window = true;
+  }
+  CHECK(hit.phase() == EgPhase::Sustain);
+  CHECK_EQ(hit.attenuation(), 128);
+  CHECK(!in_window);
+  CHECK(skipped.phase() == EgPhase::Release);
+  CHECK_EQ(skipped.attenuation(), 0x3FF);
 }
 
 void test_sl_below_15_always_under_fold() {
@@ -474,6 +509,47 @@ void test_fold_is_reported_once_per_cycle() {
   CHECK_REL(1000.0 / r.loop_hz, measured, 0.15);
 }
 
+// SsgHold is the hold mode latching with the key down. Wherever the key comes
+// up -- in a slow attack from 0x3FF, in the fold, before a release climbs to
+// it -- no sample with the key up raises it.
+void test_hold_latches_only_with_the_key_on() {
+  long latched = 0;
+  const auto run = [&latched](EgSimulator &sim, int samples) {
+    for (int i = 0; i < samples; ++i) {
+      sim.step();
+      if ((sim.step_events() & detail::kEvSsgHold) != 0) {
+        CHECK(sim.keyed_on());
+        ++latched;
+      }
+    }
+  };
+  for (const int ssg : {0x09, 0x0B, 0x0D, 0x0F})
+    for (const int ar : {31, 20, 10})
+      for (const int held : {1, 2, 3, 40, 400, 4000, 40000}) {
+        EgSimulator sim(ssg_patch(28, 20, 4, ssg, ar, 15), kRks2);
+        sim.key_on();
+        run(sim, held);
+        sim.key_off();
+        run(sim, 20000);
+      }
+  helpers::Rng rng(2612);
+  for (int n = 0; n < 150; ++n) {
+    const OperatorParams op =
+        ssg_patch(rng.in(0, 31), rng.in(0, 31), rng.in(0, 15),
+                  0x09 | (rng.in(0, 3) << 1), rng.in(1, 31), rng.in(0, 15));
+    EgSimulator sim(op, rng.in(0, 1) != 0 ? kRks2 : kRks0);
+    sim.reset(static_cast<uint16_t>(rng.in(0, 0x0FFF)));
+    for (int k = 0; k < 40; ++k) {
+      if (k % 2 == 0)
+        sim.key_on();
+      else
+        sim.key_off();
+      run(sim, rng.in(1, 3000));
+    }
+  }
+  CHECK(latched > 100);
+}
+
 } // namespace
 
 int main() {
@@ -494,7 +570,9 @@ int main() {
   RUN_TEST(test_release_is_also_four_times_faster);
   RUN_TEST(test_key_off_is_edge_triggered);
   RUN_TEST(test_sl15_leaves_dr_in_charge);
+  RUN_TEST(test_sustain_window_hit_and_skipped);
   RUN_TEST(test_sl_below_15_always_under_fold);
   RUN_TEST(test_fold_is_reported_once_per_cycle);
+  RUN_TEST(test_hold_latches_only_with_the_key_on);
   return testing::summary();
 }

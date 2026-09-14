@@ -1,25 +1,6 @@
-// Golden-vector test: replays a recorded Nuked-OPN2 scenario on EgSimulator and
-// compares tick by tick.
-//
-// The vectors in golden/*.json were produced by tools/golden_gen, which links
-// Nuked-OPN2 (LGPL 2.1).  Nothing here does -- this reads committed data.
-//
-//   ym2612_eg_golden_test <path-to-vector.json>
-//
-// Comparison policy:
-//   * eg_level vs attenuation()  -- exact, at every output sample.
-//   * eg_out   vs output()       -- exact, at every sample, allowing for
-//                                   Nuked's one-sample eg_out pipeline lag,
-//                                   which the generator already removed.
-//   * eg_state vs phase()        -- exact, but only on EG-tick samples.  Nuked
-//                                   runs its state machine once per output
-//                                   sample and moves one state per sample,
-//                                   while this library evaluates the whole
-//                                   transition chain at the top of an EG tick;
-//                                   the two agree at every tick.
-//   * counter_shift              -- recomputed here from the case's own rates
-//                                   and required to match what the file says,
-//                                   so a vector cannot ship a fitted alignment.
+// Replays a golden/*.json vector recorded by tools/golden_gen and requires
+// attenuation(), output() and phase() to equal the recorded level, output and
+// state at every sample. Usage: ym2612_eg_golden_test <path-to-vector.json>
 
 #include <ym2612_eg/ym2612_eg.hpp>
 
@@ -73,45 +54,8 @@ void run_case(const jsonlite::Value &c) {
 
   const int samples = static_cast<int>(c.integer("samples"));
   const int counter_phase = static_cast<int>(c.integer("counter_phase"));
-  const int stored_shift = static_cast<int>(c.integer("counter_shift"));
 
   EgSimulator eg(op, pitch);
-
-  // The alignment is a rule, not a fitted constant: derive it here and refuse
-  // the vector if it disagrees with what the generator recorded.
-  bool mixed = false;
-  int shift = counter_shift_for_case(eg, &mixed);
-  if (shift == kNoConstraint)
-    shift = 0;
-  if (mixed || shift != stored_shift) {
-    testing::fail(__FILE__, __LINE__,
-                  g_file + " / " + name + ": counter_shift " +
-                      std::to_string(stored_shift) + " is not the shift the " +
-                      "documented eg_timer_low_lock rule derives (" +
-                      (mixed ? std::string("mixed rates")
-                             : std::to_string(shift)) +
-                      ")");
-    return;
-  }
-  ++testing::g_checks;
-
-  // Combinations this library is known to disagree with must never reach a
-  // vector.
-  const char *excluded = nullptr;
-  if (has_sl0_instant_attack_divergence(eg))
-    excluded = "SL=0 with instant attack";
-  else if (has_ssg_sustain_window_divergence(op, eg))
-    excluded = "SSG-EG decay step wide enough to jump Nuked's sustain window";
-  else if (shift != 0 && counter_wraps(counter_phase, samples))
-    excluded = "counter-shifted case that outlives one 12-bit counter sweep";
-  if (excluded) {
-    testing::fail(__FILE__, __LINE__,
-                  g_file + " / " + name + ": " + excluded +
-                      " is a documented divergence and must not appear in a "
-                      "golden vector");
-    return;
-  }
-  ++testing::g_checks;
 
   const std::vector<int> level = expand(c.nums("level"), samples);
   const std::vector<int> state = expand(c.nums("state"), samples);
@@ -123,7 +67,7 @@ void run_case(const jsonlite::Value &c) {
       c.find("out") ? expand(c.nums("out"), samples) : level;
   const std::vector<double> &gate = c.nums("gate");
 
-  eg.reset(static_cast<uint16_t>(apply_counter_shift(counter_phase, shift)));
+  eg.reset(static_cast<uint16_t>(counter_phase));
 
   int bad_level = 0, bad_state = 0, bad_out = 0;
   int first_bad = -1;
@@ -151,8 +95,7 @@ void run_case(const jsonlite::Value &c) {
         first_bad = i;
       ++bad_out;
     }
-    if (i % 3 == 0 &&
-        static_cast<int>(eg.phase()) != state[static_cast<size_t>(i)]) {
+    if (static_cast<int>(eg.phase()) != state[static_cast<size_t>(i)]) {
       if (first_bad < 0)
         first_bad = i;
       ++bad_state;

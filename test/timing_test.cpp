@@ -1,10 +1,6 @@
-// phase_durations() and ssg_loop_period_ms(): the closed forms, cross-checked
-// against the simulator they exist to save.
-//
-// These two sweeps are the reason the closed forms are allowed to exist at
-// all. Everything else here is arithmetic that can be read off a register;
-// the sweeps are the claim that the arithmetic is the same answer the chip
-// arrives at by running.
+// The timing answers -- phase_durations(), ssg_loop_period_ms(),
+// sl_skip_probability() -- and the register arithmetic behind them, checked
+// against the envelope stepped sample by sample and drawn by sample_curve().
 
 #include "check.hpp"
 
@@ -14,6 +10,7 @@
 #include <cmath>
 #include <iostream>
 #include <limits>
+#include <vector>
 
 using namespace ym2612_eg;
 
@@ -50,9 +47,8 @@ double period_of(const OperatorParams &op, int midi = kReferenceMidiNote) {
   return ssg_loop_period_ms(op, note(midi));
 }
 
-/// A held-forever run: the thing the closed forms are checked against. It is
-/// the one job a simulation is better at than a formula -- where the envelope
-/// really parks, how fast the loop really runs.
+/// A held-forever sample_curve() run: the curve the timing answers are
+/// checked against.
 CurveResult simulate_held(const OperatorParams &op, NotePitch pitch,
                           double max_ms) {
   CurveRequest request;
@@ -104,9 +100,8 @@ void test_the_loudest_attenuation_follows_the_inversion() {
     const uint16_t want =
         (type & 0x04) != 0 ? kSsgFoldAttenuation : uint16_t{0};
     CHECK_EQ(loudest_attenuation(op), want);
-    // ... and it agrees with output(), which is what does the inverting. AR
-    // is zeroed exactly as a caller staging a release does it: key_on() snaps
-    // an instant attack straight to att = 0 and would throw the level away.
+    // ... and it agrees with output(), which does the inverting. AR is zeroed
+    // as for a release: the key-on sample would snap an instant attack to 0.
     OperatorParams released = op;
     released.ar = 0;
     EgSimulator sim(released, note(kReferenceMidiNote));
@@ -259,8 +254,8 @@ void test_a_rate_of_zero_lasts_forever() {
   CHECK(!std::isfinite(lifetime_of(adsr(31, 10, 2, 0, 7, 0))));  // SR = 0
   CHECK(!std::isfinite(lifetime_of(adsr(31, 0, 2, 5, 7, 0))));   // DR = 0, SL > 0
   CHECK(!std::isfinite(lifetime_of(adsr(0, 10, 2, 5, 7, 0))));   // AR = 0
-  // ... but SL = 0 skips the decay outright, exactly as the chip does, so
-  // DR = 0 costs nothing there.
+  // ... but SL = 0 leaves the decay on its first sample, with no update,
+  // exactly as the chip does, so DR = 0 costs nothing there.
   CHECK(std::isfinite(lifetime_of(adsr(31, 0, 0, 5, 7, 0))));
   // And a phase that never ends means the ones after it never start: it is
   // the phase itself that is infinite, not just the sum.
@@ -269,21 +264,11 @@ void test_a_rate_of_zero_lasts_forever() {
       phase_durations(adsr(31, 10, 2, 0, 7, 0), note(60)).sustain_start_ms()));
 }
 
-// ----------------------------------------------- the closed-form loop period
+// ------------------------------------------------------------ the loop period
 
-/**
- * The counterpart of the lifetime sweep, for ssg_loop_period_ms(): the period
- * computed from the registers is the period the chip actually runs at.
- *
- * Checked only where a simulation can answer at all -- sample_curve() needs
- * three folds before it will publish loop_hz, so a loop slower than a third
- * of the window here has no measurement to be compared against. That is
- * precisely the blindness the closed form exists to cure.
- *
- * Both fold conventions are covered: the alternating modes (types 2, 3, 6, 7)
- * count two ramps to a period and the rest one, and getting that wrong is a
- * clean factor of two rather than a few percent.
- */
+/// ssg_loop_period_ms() against the loop sample_curve() draws, wherever three
+/// folds fit in the horizon; the alternating modes count two ramps to a period
+/// and the rest one.
 void test_the_loop_period_agrees_with_the_simulator() {
   constexpr double kMeasurableMs = 12000.0;
   double worst = 0.0;
@@ -317,11 +302,9 @@ void test_the_loop_period_agrees_with_the_simulator() {
                   worst_instant_attack = std::max(worst_instant_attack, error);
                 }
                 ++compared;
-                // A few percent. What is left is not a modelling error but
-                // the loop's own shape: a ramp ends on a slot boundary of
-                // whichever rate carried it there, so successive ramps can
-                // differ by a slot, and the two answers average a different
-                // number of them.
+                // ssg_loop_period_ms() averages kMeasuredLoopPeriods periods;
+                // a slow loop reaches the end of kMeasurableMs first and so
+                // averages fewer.
                 CHECK(error < 0.04);
               }
             }
@@ -336,17 +319,9 @@ void test_the_loop_period_agrees_with_the_simulator() {
             << "%, " << worst_instant_attack * 100.0 << "% at AR = 31  ... ";
 }
 
-/**
- * A ramp with a phase that never advances never reaches the fold, so the
- * envelope never loops again -- which is not a slow loop but no loop.
- *
- * These are exactly the patches sample_curve() flags as SsgNeverLoops, and
- * the closed form arrives at the same three by arithmetic rather than by a
- * rule: an infinite phase makes the ramp infinite, and only the phases the
- * ramp actually needs are in the sum. SL = 0 skips the decay outright, so
- * DR = 0 costs nothing there; SL = 15 puts the sustain level above the fold,
- * so SR never runs and SR = 0 costs nothing.
- */
+/// A ramp through a phase that never advances never reaches the fold: no loop,
+/// which sample_curve() flags as SsgNeverLoops. SL = 0 leaves DR unused and
+/// SL = 15 leaves SR unused, so a zero rate there still loops.
 void test_a_ramp_that_never_finishes_is_no_loop_at_all() {
   CHECK(!std::isfinite(period_of(ssg_patch(0, 31, 0, 8, 8, 7, 0))));  // DR = 0
   CHECK(!std::isfinite(period_of(ssg_patch(0, 31, 15, 8, 0, 7, 0)))); // SR = 0
@@ -367,15 +342,214 @@ void test_a_ramp_that_never_finishes_is_no_loop_at_all() {
                   CurveWarning::SsgNeverLoops) != stalled.warnings.end());
 }
 
-/// The alternating modes fold twice per visible period, so they are exactly
-/// twice their own ramp -- a factor of two, not a few percent.
+/// The alternating modes fold twice per visible period, so their period is two
+/// of their own ramps: exactly twice the plain mode's where every ramp is the
+/// same length, and wherever the ramps vary, the period sample_curve() draws.
 void test_the_alternating_modes_count_two_ramps() {
+  // DR = 31 at SL = 15: every ramp is sixteen steps of 32.
+  const double plain = period_of(ssg_patch(0, 31, 31, 15, 8, 7, 0));
+  const double alternating = period_of(ssg_patch(2, 31, 31, 15, 8, 7, 0));
+  CHECK(plain > 0.0);
+  CHECK_REL(alternating, plain * 2.0, 1e-9);
   for (const int ar : {31, 20}) {
-    const double plain = period_of(ssg_patch(0, ar, 20, 4, 8, 7, 0));
-    const double alternating = period_of(ssg_patch(2, ar, 20, 4, 8, 7, 0));
-    CHECK(plain > 0.0);
-    CHECK_REL(alternating, plain * 2.0, 1e-9);
+    for (const int type : {0, 2}) {
+      const OperatorParams op = ssg_patch(type, ar, 20, 4, 8, 7, 0);
+      const CurveResult held =
+          simulate_held(op, note(kReferenceMidiNote), 60000.0);
+      CHECK(held.loop_hz > 0.0);
+      CHECK_REL(period_of(op), 1000.0 / held.loop_hz, 1e-9);
+    }
   }
+}
+
+/// At SSG-EG DR rates 57-59, whose 4x step reaches 32, phase_durations() and
+/// ssg_loop_period_ms() run the envelope from the key-on phase sample_curve()
+/// draws, and agree with the curve.
+void test_the_timing_follows_the_sustain_window() {
+  const auto first_ms = [](const CurveResult &curve, MarkerKind kind,
+                           double after) {
+    for (const Marker &m : curve.markers)
+      if (m.kind == kind && m.ms > after)
+        return static_cast<double>(m.ms);
+    return -1.0;
+  };
+  const auto near_ms = [](double a, double b) {
+    return std::fabs(a - b) <= 2e-3 + 1e-6 * std::fabs(b);
+  };
+  int skipped = 0, hit = 0, loops = 0;
+  for (const int midi : {48, 60, 72, 84})
+    for (const int ks : {0, 3})
+      for (const int dr : {27, 28, 29})
+        for (const int sl : {1, 2, 4, 9, 14})
+          for (const int ar : {31, 20})
+            for (const int type : {0, 1, 2})
+              for (const int sr : {0, 12}) {
+                const OperatorParams op = ssg_patch(type, ar, dr, sl, sr, 15, ks);
+                const NotePitch pitch = note(midi);
+                const int rate = detail::effective_rate(dr, key_scale_value(op, pitch));
+                if (rate < 57 || rate > 59)
+                  continue;
+                const CurveResult held = simulate_held(op, pitch, 60000.0);
+                const PhaseDurations phases = phase_durations(op, pitch);
+                // The first ramp ends at the first fold after the attack.
+                const double attack = first_ms(held, MarkerKind::AttackEnd, -1.0);
+                const double fold = first_ms(held, MarkerKind::SsgFold, attack);
+                double decay = first_ms(held, MarkerKind::DecayEnd, -1.0);
+                if (fold >= 0.0 && decay > fold)
+                  decay = -1.0;
+                CHECK(near_ms(attack, phases.attack_ms));
+                if (decay >= 0.0) {
+                  ++hit;
+                  CHECK(near_ms(decay, phases.sustain_start_ms()));
+                  CHECK(phases.sustain_ms > 0.0);
+                } else {
+                  ++skipped;
+                  CHECK(phases.sustain_ms == 0.0);
+                }
+                if ((type & 1) != 0) {
+                  // Mode 1 cuts to silence at the fold.
+                  CHECK((marker_ms(held, MarkerKind::Silence) >= 0.0) ==
+                        std::isfinite(phases.lifetime_ms()));
+                  continue;
+                }
+                const double period = ssg_loop_period_ms(op, pitch);
+                const bool never = std::find(held.warnings.begin(), held.warnings.end(),
+                                             CurveWarning::SsgNeverLoops) !=
+                                   held.warnings.end();
+                CHECK(never == !std::isfinite(period));
+                CHECK((held.loop_hz > 0.0) == std::isfinite(period));
+                if (held.loop_hz > 0.0) {
+                  ++loops;
+                  CHECK_REL(period, 1000.0 / held.loop_hz, 1e-9);
+                }
+              }
+  // The sweep reaches both outcomes, and loops among them.
+  CHECK(skipped > 20);
+  CHECK(hit > 20);
+  CHECK(loops > 20);
+  std::cout << "\n    first ramp hit " << hit << ", skipped " << skipped
+            << ", loops " << loops << "  ... ";
+}
+
+/// Keys on `alignment` samples into the EG tick that takes the counter past
+/// `phase` and steps to the end of the first decay: 1 when it steps past the
+/// sustain window, 0 when it lands in it, -1 when the counter wraps first.
+int first_ramp_outcome(const OperatorParams &op, NotePitch pitch, int phase,
+                       int alignment) {
+  EgSimulator sim(op, pitch);
+  sim.reset(static_cast<uint16_t>(phase));
+  for (int k = 0; k < alignment; ++k)
+    sim.step();
+  sim.key_on();
+  uint64_t samples = static_cast<uint64_t>(alignment);
+  bool decaying = false;
+  int outcome = -2;
+  while (outcome == -2 && samples < 1000000) {
+    sim.step();
+    ++samples;
+    if (!decaying)
+      decaying = sim.phase() == EgPhase::Decay;
+    else if (sim.phase() == EgPhase::Sustain)
+      outcome = 0;
+    else if (sim.attenuation() >= kSsgFoldAttenuation)
+      outcome = 1;
+  }
+  // The first step after reset() is an EG tick, and so is every third one.
+  const uint64_t ticks = (samples + 2) / 3;
+  return outcome != -2 && static_cast<uint64_t>(phase) + ticks > 0x0FFF
+             ? -1
+             : outcome;
+}
+
+/// Every key-on phase -- 4096 counter values, and the three samples of an EG
+/// tick -- stepped to the end of its first decay agrees with
+/// first_ramp_skips(), and sl_skip_probability() is the share that skips.
+void test_the_skip_probability_counts_every_key_on_phase() {
+  struct Case {
+    int ar, sl, type;
+    NotePitch pitch;
+  };
+  // DR28 at KS0 is rate 57 at block 2, 58 at block 4 and 59 at block 6.
+  const NotePitch r57{644, 2}, r58{644, 4}, r59{644, 6};
+  std::vector<Case> cases = {
+      {31, 4, 1, r58},  {31, 3, 1, r58}, {20, 1, 1, r58}, {20, 2, 1, r58},
+      {22, 1, 1, r58},  {23, 2, 1, r58}, {31, 4, 0, r58}, {22, 2, 2, r58},
+      {19, 4, 1, r57},  {21, 9, 1, r57}, {26, 7, 1, r59}, {22, 5, 5, r59},
+  };
+  for (int sl = 1; sl <= 14; ++sl) {
+    cases.push_back({31, sl, 1, r57});
+    cases.push_back({31, sl, 1, r59});
+  }
+  int decided = 0;
+  for (const Case &c : cases) {
+    const OperatorParams op = ssg_patch(c.type, c.ar, 28, c.sl, 0, 15, 0);
+    std::vector<int> outcome(4096 * 3);
+    int whole = 4096; // phases before the first ramp through the wrap
+    for (int phase = 0; phase < 4096; ++phase)
+      for (int a = 0; a < 3; ++a) {
+        const int o = first_ramp_outcome(op, c.pitch, phase, a);
+        CHECK(o != -2);
+        outcome[static_cast<size_t>(phase * 3 + a)] = o;
+        // A ramp that runs through the counter's wrap is left out.
+        if (o < 0) {
+          whole = std::min(whole, phase);
+          continue;
+        }
+        CHECK((o == 1) == detail::first_ramp_skips(op, c.pitch, phase + 1, a));
+      }
+    // Whole turns of the counter's low four bits, over which p is the share.
+    whole -= whole % 16;
+    CHECK(whole >= 3584);
+    int skips = 0;
+    for (int i = 0; i < whole * 3; ++i)
+      skips += outcome[static_cast<size_t>(i)];
+    const double p = sl_skip_probability(op, c.pitch);
+    CHECK(p == static_cast<double>(skips) / (3.0 * whole));
+    decided += p > 0.0 && p < 1.0;
+  }
+  CHECK(decided >= 10);
+}
+
+/// The patches measured on hardware: DR28 KS0 at block 4 / F-num 644, SSG-EG
+/// $09.
+void test_the_measured_patches_skip_as_measured() {
+  const NotePitch pitch{644, 4};
+  CHECK(sl_skip_probability(ssg_patch(1, 31, 28, 4, 0, 15, 0), pitch) == 0.5);
+  CHECK(sl_skip_probability(ssg_patch(1, 31, 28, 3, 0, 15, 0), pitch) == 0.0);
+  CHECK(sl_skip_probability(ssg_patch(1, 20, 28, 1, 0, 15, 0), pitch) == 1.0);
+  CHECK(sl_skip_probability(ssg_patch(1, 20, 28, 2, 0, 15, 0), pitch) == 0.0);
+}
+
+/// sample_curve() keys on at kCurveCounterPhase, or where the key-on decides
+/// the sustain window, at the first phase from it whose first decay lands in
+/// it; curve_counter_phase(op, pitch, true) is the first that skips.
+void test_the_curve_keys_on_at_the_first_phase_that_lands() {
+  int decided = 0;
+  for (const int midi : {36, 48, 60, 72, 84})
+    for (const int ks : {0, 3})
+      for (const int ar : {31, 26, 23, 22, 21, 20})
+        for (int sl = 1; sl <= 14; ++sl) {
+          const OperatorParams op = ssg_patch(1, ar, 28, sl, 0, 15, ks);
+          const NotePitch pitch = note(midi);
+          const double p = sl_skip_probability(op, pitch);
+          const int lands = detail::curve_counter_phase(op, pitch, false);
+          const int skips = detail::curve_counter_phase(op, pitch, true);
+          if (!(p > 0.0 && p < 1.0)) {
+            CHECK(lands == kCurveCounterPhase);
+            CHECK(skips == kCurveCounterPhase);
+            continue;
+          }
+          ++decided;
+          for (int phase = kCurveCounterPhase; phase <= lands; ++phase)
+            CHECK(detail::first_ramp_skips(op, pitch, phase + 1, 0) ==
+                  (phase != lands));
+          for (int phase = kCurveCounterPhase; phase <= skips; ++phase)
+            CHECK(detail::first_ramp_skips(op, pitch, phase + 1, 0) ==
+                  (phase == skips));
+          CHECK(phase_durations(op, pitch).sustain_ms > 0.0);
+        }
+  CHECK(decided > 20);
+  std::cout << "\n    decided by the key-on " << decided << "  ... ";
 }
 
 /// The clock is an argument, not a constant: PAL runs about 1% slower and
@@ -407,6 +581,10 @@ int main() {
   RUN_TEST(test_the_loop_period_agrees_with_the_simulator);
   RUN_TEST(test_a_ramp_that_never_finishes_is_no_loop_at_all);
   RUN_TEST(test_the_alternating_modes_count_two_ramps);
+  RUN_TEST(test_the_timing_follows_the_sustain_window);
+  RUN_TEST(test_the_skip_probability_counts_every_key_on_phase);
+  RUN_TEST(test_the_measured_patches_skip_as_measured);
+  RUN_TEST(test_the_curve_keys_on_at_the_first_phase_that_lands);
   RUN_TEST(test_the_clock_scales_every_duration);
   return testing::summary();
 }

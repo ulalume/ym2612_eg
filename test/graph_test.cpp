@@ -103,9 +103,8 @@ bool has_marker(const CurveResult &curve, MarkerKind kind) {
   return first_marker_ms(curve, kind) >= 0.0;
 }
 
-/// A held-forever simulation with a horizon, which the closed forms are
-/// checked AGAINST: where the decay really ends, where the envelope really
-/// parks, how fast the loop really runs.
+/// A held-forever sample_curve() run with a horizon: the curve the timing
+/// answers are checked against.
 CurveResult simulate_held(const OperatorParams &op, NotePitch pitch,
                           double max_ms = 12000.0) {
   CurveRequest request;
@@ -310,12 +309,12 @@ void test_only_a_non_standard_ssg_attack_earns_a_line() {
   const auto warning_for = [](const OperatorParams &op) {
     return build_envelope_curve(op, kMiddleC).warning;
   };
-  CHECK(warning_for(ssg_patch(0, 30, 15, 4, 8, 7, 0)) != nullptr);
-  CHECK(warning_for(ssg_patch(0, 31, 15, 4, 8, 7, 0)) == nullptr);
-  CHECK(warning_for(adsr(30, 15, 4, 8, 7, 0)) == nullptr);
+  CHECK(!warning_for(ssg_patch(0, 30, 15, 4, 8, 7, 0)).empty());
+  CHECK(warning_for(ssg_patch(0, 31, 15, 4, 8, 7, 0)).empty());
+  CHECK(warning_for(adsr(30, 15, 4, 8, 7, 0)).empty());
   for (int type = 0; type < 8; ++type) {
-    CHECK(warning_for(ssg_patch(type, 0, 15, 4, 8, 7, 0)) != nullptr);
-    CHECK(warning_for(ssg_patch(type, 31, 15, 4, 8, 7, 0)) == nullptr);
+    CHECK(!warning_for(ssg_patch(type, 0, 15, 4, 8, 7, 0)).empty());
+    CHECK(warning_for(ssg_patch(type, 31, 15, 4, 8, 7, 0)).empty());
   }
 }
 
@@ -663,7 +662,7 @@ void test_the_worked_examples_decay_lands_on_the_real_millisecond_axis() {
   CHECK(curve.span_ms >= curve.held_ms);
   CHECK(near_rel(content_ms(curve.held), curve.span_ms, 0.01));
   CHECK(!curve.held.points.empty());
-  CHECK(curve.warning == nullptr);
+  CHECK(curve.warning.empty());
 
   CHECK(!has_marker(curve.held, MarkerKind::KeyOff));
   CHECK(!curve.held_parked); // SR = 5 keeps crawling
@@ -934,9 +933,10 @@ void test_a_slow_release_is_simulated_to_the_end() {
 
 // -------------------------------------------------------------- warnings
 
-/// Pins that the only warning the graph draws is a non-standard SSG-EG
-/// attack (AR < 31); every other simulator defect is left to the curve shape.
-void test_the_only_warning_is_the_non_standard_ssg_attack() {
+/// Pins that outside a sustain window the key-on decides, the only warning the
+/// graph draws is a non-standard SSG-EG attack (AR < 31); every other
+/// simulator defect is left to the curve shape.
+void test_the_only_other_warning_is_the_non_standard_ssg_attack() {
   OperatorParams slow_attack;
   slow_attack.ar = 20;
   slow_attack.dr = 15;
@@ -945,15 +945,14 @@ void test_the_only_warning_is_the_non_standard_ssg_attack() {
   slow_attack.rr = 7;
   slow_attack.ssg = ssg_bits(0);
   const EnvelopeCurve slow = build_envelope_curve(slow_attack, kMiddleC);
-  CHECK(slow.warning != nullptr);
-  CHECK(std::string(slow.warning) == "AR<31: non-standard SSG-EG");
+  CHECK(slow.warning == "AR<31: non-standard SSG-EG");
   OperatorParams plain = slow_attack;
   plain.ssg = 0;
-  CHECK(build_envelope_curve(plain, kMiddleC).warning == nullptr);
+  CHECK(build_envelope_curve(plain, kMiddleC).warning.empty());
 
   OperatorParams frozen = worked_example();
   frozen.ar = 0;
-  CHECK(build_envelope_curve(frozen, kMiddleC).warning == nullptr);
+  CHECK(build_envelope_curve(frozen, kMiddleC).warning.empty());
 
   OperatorParams never_loops;
   never_loops.ar = 31;
@@ -963,7 +962,7 @@ void test_the_only_warning_is_the_non_standard_ssg_attack() {
   never_loops.rr = 7;
   never_loops.ssg = ssg_bits(0);
   const EnvelopeCurve stuck = build_envelope_curve(never_loops, kMiddleC);
-  CHECK(stuck.warning == nullptr);
+  CHECK(stuck.warning.empty());
 
   OperatorParams audio_rate;
   audio_rate.ar = 31;
@@ -973,9 +972,108 @@ void test_the_only_warning_is_the_non_standard_ssg_attack() {
   audio_rate.ssg = ssg_bits(0);
   const EnvelopeCurve fast = build_envelope_curve(audio_rate, kMiddleC);
   CHECK(fast.held.loop_hz > 100.0);
-  CHECK(fast.warning == nullptr);
+  CHECK(fast.warning.empty());
 
-  CHECK(build_envelope_curve(worked_example(), kMiddleC).warning == nullptr);
+  CHECK(build_envelope_curve(worked_example(), kMiddleC).warning.empty());
+}
+
+// ------------------------------------------------------- the sustain window
+
+/// The trace's vertex nearest `ms`.
+CurvePoint vertex_near(const CurveResult &curve, double ms) {
+  CurvePoint best = curve.points.front();
+  for (const CurvePoint &p : curve.points)
+    if (std::fabs(p.ms - ms) < std::fabs(best.ms - ms))
+      best = p;
+  return best;
+}
+
+/// Pins that where the key-on decides whether the first decay lands in the
+/// sustain window, the held line is a key-on that lands: it stops at SL, and
+/// the warning says how often a note does not.
+void test_a_key_on_that_decides_the_sustain_window_lands_in_it() {
+  // DR28 KS0 at middle C is DR rate 58, whose 4x steps alternate 16 and 32.
+  const OperatorParams split = ssg_patch(1, 31, 28, 4, 0, 15, 0);
+  const int window = sustain_attenuation(4) >> 4;
+  const EnvelopeCurve c = build_envelope_curve(split, kMiddleC);
+  CHECK(c.sl_skip_probability == 0.5);
+  CHECK(c.warning == "SL skipped on 50% of notes");
+  CHECK(c.decay_end_ms > 0.0);
+  CHECK((vertex_near(c.held, c.decay_end_ms).att >> 4) == window);
+  // SR = 0: from the knee on, the line holds in the window.
+  size_t held_at_sl = 0;
+  for (const CurvePoint &p : c.held.points) {
+    if (p.ms >= c.decay_end_ms) {
+      CHECK((p.att >> 4) == window);
+      ++held_at_sl;
+    }
+  }
+  CHECK(held_at_sl > 0);
+  CHECK(!has_marker(c.held, MarkerKind::SsgHold));
+
+  // p is 0 or 1 wherever the key-on does not decide it, with no SL line.
+  struct Fixed {
+    int ar, sl;
+    double p;
+  };
+  for (const Fixed f : {Fixed{31, 3, 0.0}, Fixed{20, 1, 1.0}, Fixed{20, 2, 0.0}}) {
+    const EnvelopeCurve one =
+        build_envelope_curve(ssg_patch(1, f.ar, 28, f.sl, 0, 15, 0), kMiddleC);
+    CHECK(one.sl_skip_probability == f.p);
+    CHECK(one.warning.rfind("SL skipped", 0) == std::string::npos);
+  }
+  CHECK(build_envelope_curve(worked_example(), kMiddleC).sl_skip_probability ==
+        0.0);
+
+  // p = 1 needs an attack that walks its row, so the AR < 31 line stays; the
+  // line drawn is the key-on that skips, past SL to the fold and the hold.
+  const EnvelopeCurve skips =
+      build_envelope_curve(ssg_patch(1, 20, 28, 1, 0, 15, 0), kMiddleC);
+  CHECK(skips.warning == "AR<31: non-standard SSG-EG");
+  CHECK(skips.decay_end_ms < 0.0);
+  CHECK(has_marker(skips.held, MarkerKind::SsgHold));
+}
+
+/// Pins that in a repeating SSG-EG mode the held line is a key-on that lands:
+/// with SR = 0 it holds at SL, where the key-on that skips, drawn through
+/// CurveRequest::counter_phase, goes on looping.
+void test_a_loop_whose_key_on_decides_the_window_lands_in_it() {
+  const OperatorParams loop = ssg_patch(0, 31, 28, 4, 0, 15, 0);
+  const EnvelopeCurve c = build_envelope_curve(loop, kMiddleC);
+  CHECK(c.sl_skip_probability == 0.5);
+  CHECK(c.decay_end_ms > 0.0);
+  CHECK(c.ssg_folds.empty());
+
+  CurveRequest skip;
+  skip.op = loop;
+  skip.pitch = kMiddleC;
+  skip.max_ms = 100.0;
+  skip.counter_phase =
+      ym2612_eg::detail::curve_counter_phase(loop, kMiddleC, true);
+  const CurveResult skipped = sample_curve(skip);
+  CHECK(std::count_if(skipped.markers.begin(), skipped.markers.end(),
+                      [](const Marker &m) {
+                        return m.kind == MarkerKind::SsgFold;
+                      }) >= 2);
+}
+
+/// Pins the warning for a sustain window the key-on decides: the share of
+/// notes that step past it, rounded, in place of the AR < 31 line.
+void test_the_sl_skip_warning_says_how_often() {
+  CHECK(build_envelope_curve(ssg_patch(1, 31, 28, 4, 0, 15, 0), kMiddleC)
+            .warning == "SL skipped on 50% of notes");
+  CHECK(build_envelope_curve(ssg_patch(1, 22, 28, 1, 0, 15, 0), kMiddleC)
+            .warning == "SL skipped on 25% of notes");
+  CHECK(build_envelope_curve(ssg_patch(1, 20, 28, 1, 0, 15, 0), kMiddleC)
+            .warning == "AR<31: non-standard SSG-EG");
+  CHECK(build_envelope_curve(ssg_patch(1, 31, 28, 3, 0, 15, 0), kMiddleC)
+            .warning.empty());
+
+  const CurveResult quiet;
+  CHECK(warning_line(quiet, 1.0 / 3.0) == "SL skipped on 33% of notes");
+  CHECK(warning_line(quiet, 2.0 / 3.0) == "SL skipped on 67% of notes");
+  CHECK(warning_line(quiet, 0.0).empty());
+  CHECK(warning_line(quiet, 1.0).empty());
 }
 
 // ----------------------------------------------------------------- cache
@@ -1694,6 +1792,18 @@ const NotePitch kSolverNotes[] = {NotePitch::from_midi(36),
                                   NotePitch::from_midi(60),
                                   NotePitch::from_midi(84)};
 
+/// A decay that steps past the sustain window never reaches a knee, so the
+/// decay solver does not answer with it.
+bool decay_has_no_knee(Phase phase, const OperatorParams &op, NotePitch pitch,
+                       int dr) {
+  if (phase != Phase::Decay)
+    return false;
+  OperatorParams probe = op;
+  probe.dr = static_cast<uint8_t>(dr);
+  return ym2612_eg::detail::window_can_be_skipped(probe, pitch) &&
+         phase_durations(probe, pitch).sustain_ms == 0.0;
+}
+
 /// Pins the round trip: the duration a register value produces solves back to
 /// a value that produces that same duration. Where two values quantise to one
 /// duration -- which the increment table does wherever the effective rate
@@ -1704,6 +1814,8 @@ void test_every_rate_solves_back_to_the_value_it_came_from() {
     for (const NotePitch &pitch : kSolverNotes) {
       for (Phase phase : kPhases) {
         for (int v = slowest_rate(phase); v <= fastest_rate(phase); ++v) {
+          if (decay_has_no_knee(phase, op, pitch, v))
+            continue;
           const double want = phase_ms(phase, op, pitch, v);
           const int got = solve_rate(phase, op, pitch, want);
           CHECK(got >= slowest_rate(phase));
@@ -1815,7 +1927,7 @@ void test_no_other_rate_is_nearer_the_target_in_ratio() {
         const double chosen = std::fabs(std::log(got_ms / target_ms));
         for (int v = slowest_rate(phase); v <= fastest_rate(phase); ++v) {
           const double ms = phase_ms(phase, op, kMiddleC, v);
-          if (ms > 0.0) {
+          if (ms > 0.0 && !decay_has_no_knee(phase, op, kMiddleC, v)) {
             CHECK(std::fabs(std::log(ms / target_ms)) >= chosen - 1e-12);
           }
         }
@@ -2252,7 +2364,10 @@ int main() {
   RUN_TEST(test_a_very_long_release_does_not_crush_the_held_trace);
   RUN_TEST(test_a_slow_release_is_simulated_to_the_end);
 
-  RUN_TEST(test_the_only_warning_is_the_non_standard_ssg_attack);
+  RUN_TEST(test_the_only_other_warning_is_the_non_standard_ssg_attack);
+  RUN_TEST(test_a_key_on_that_decides_the_sustain_window_lands_in_it);
+  RUN_TEST(test_a_loop_whose_key_on_decides_the_window_lands_in_it);
+  RUN_TEST(test_the_sl_skip_warning_says_how_often);
   RUN_TEST(test_the_cache_recomputes_only_on_a_real_change);
   RUN_TEST(test_the_throttle_spaces_a_rebuild_by_what_it_cost);
   RUN_TEST(test_a_cheap_curve_is_rebuilt_every_frame);

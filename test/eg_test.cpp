@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <cmath>
 #include <iostream>
+#include <vector>
 
 using namespace ym2612_eg;
 using helpers::eg_tick;
@@ -58,13 +59,14 @@ void test_increment_table() {
       CHECK_EQ(detail::kIncTable[r][i], want[i]);
   }
 
+  // Rates >= 48: the step the counter's low two bits pick (kStepHi).
   const uint8_t high[16][8] = {
-      {1, 1, 1, 1, 1, 1, 1, 1}, {1, 1, 1, 2, 1, 1, 1, 2},
-      {1, 2, 1, 2, 1, 2, 1, 2}, {1, 2, 2, 2, 1, 2, 2, 2},
-      {2, 2, 2, 2, 2, 2, 2, 2}, {2, 2, 2, 4, 2, 2, 2, 4},
-      {2, 4, 2, 4, 2, 4, 2, 4}, {2, 4, 4, 4, 2, 4, 4, 4},
-      {4, 4, 4, 4, 4, 4, 4, 4}, {4, 4, 4, 8, 4, 4, 4, 8},
-      {4, 8, 4, 8, 4, 8, 4, 8}, {4, 8, 8, 8, 4, 8, 8, 8},
+      {1, 1, 1, 1, 1, 1, 1, 1}, {2, 1, 1, 1, 2, 1, 1, 1},
+      {2, 1, 2, 1, 2, 1, 2, 1}, {2, 2, 2, 1, 2, 2, 2, 1},
+      {2, 2, 2, 2, 2, 2, 2, 2}, {4, 2, 2, 2, 4, 2, 2, 2},
+      {4, 2, 4, 2, 4, 2, 4, 2}, {4, 4, 4, 2, 4, 4, 4, 2},
+      {4, 4, 4, 4, 4, 4, 4, 4}, {8, 4, 4, 4, 8, 4, 4, 4},
+      {8, 4, 8, 4, 8, 4, 8, 4}, {8, 8, 8, 4, 8, 8, 8, 4},
       {8, 8, 8, 8, 8, 8, 8, 8}, {8, 8, 8, 8, 8, 8, 8, 8},
       {8, 8, 8, 8, 8, 8, 8, 8}, {8, 8, 8, 8, 8, 8, 8, 8}};
   for (int r = 48; r < 64; ++r)
@@ -108,7 +110,10 @@ void test_counter_skips_zero() {
   CHECK_EQ(sim.key_scale_value(), 0);
   CHECK_EQ(sim.rate_of(EgPhase::Decay), 2);
   sim.key_on();
-  CHECK_EQ(sim.attenuation(), 0); // AR=31 at ksv 0 -> rate 62 -> instant
+  // AR=31 at ksv 0 -> rate 62 -> instant: the key-on sample zeroes att.
+  EgSimulator key_on_sample = sim;
+  key_on_sample.step();
+  CHECK_EQ(key_on_sample.attenuation(), 0);
 
   const uint32_t first =
       ticks_until(sim, [](EgSimulator &s) { return s.attenuation() > 0; }, 9000);
@@ -151,12 +156,14 @@ void test_attack_formula_trajectory() {
 }
 
 // Rate 48 has increment 1 on every tick, so the simulator must walk exactly
-// the trajectory above and reach 0 on update 73.
+// the trajectory above and reach 0 on update 73.  The key-on sample is an EG
+// tick here and adds nothing, so the updates start on the next tick.
 void test_attack_trajectory_in_simulator() {
   OperatorParams op{24, 10, 5, 7, 2, 0, 0, 0}; // AR=24, ksv=0 -> rate 48
   EgSimulator sim(op, kBlock0);
   CHECK_EQ(sim.rate_of(EgPhase::Attack), 48);
   sim.key_on();
+  eg_tick(sim);
   CHECK_EQ(sim.attenuation(), 0x3FF); // no instant attack below rate 62
 
   const int expect[7][2] = {{1, 959},  {2, 899},  {4, 789}, {8, 607},
@@ -169,13 +176,14 @@ void test_attack_trajectory_in_simulator() {
     }
     CHECK_EQ(sim.attenuation(), e[1]);
   }
-  while (done < 73) {
+  while (done < 72) {
     eg_tick(sim);
     ++done;
   }
+  sim.step(); // update 73
   CHECK_EQ(sim.attenuation(), 0);
-  CHECK(sim.phase() == EgPhase::Attack); // transition is checked next tick
-  eg_tick(sim);
+  CHECK(sim.phase() == EgPhase::Attack); // the transition takes the next sample
+  sim.step();
   CHECK(sim.phase() == EgPhase::Decay);
 }
 
@@ -233,18 +241,21 @@ void test_keycode_and_key_scaling() {
 void test_worked_example() {
   EgSimulator sim(kWorked, kC4);
   sim.key_on();
-  // Instant attack: att forced to 0 at key-on, Decay entered on tick 1.
+  // Instant attack: the key-on sample forces att to 0, the next one enters
+  // Decay.
+  sim.step();
   CHECK_EQ(sim.attenuation(), 0);
   CHECK(sim.phase() == EgPhase::Attack);
-  eg_tick(sim);
+  sim.step();
   CHECK(sim.phase() == EgPhase::Decay);
 
-  // Decay 0 -> 64 (sustain level), tick 5440 = 306 ms.
+  // Decay 0 -> 64 (sustain level): the last update is on tick 5439 and
+  // Sustain begins on the sample after it, 306 ms.
   EgSimulator s2(kWorked, kC4);
   s2.key_on();
   const uint32_t d_end = ticks_until(
       s2, [](EgSimulator &s) { return s.phase() == EgPhase::Sustain; }, 20000);
-  CHECK_EQ(d_end, 5440u);
+  CHECK_EQ(d_end, 5439u);
   CHECK_EQ(s2.attenuation(), 64);
   CHECK_REL(ticks_to_ms(d_end), 306.4, 0.01);
 
@@ -259,8 +270,10 @@ void test_worked_example() {
 }
 
 void test_ks_sweep_durations() {
-  // EG_SPEC section 9 "Same patch, KS swept".
-  const uint32_t decay_ticks[4] = {5440, 4065, 2033, 509};
+  // The patch of EG_SPEC section 9 "Same patch, KS swept".  decay_ticks counts
+  // to the last decay update, one short of the spec: Sustain begins on the
+  // sample after it.
+  const uint32_t decay_ticks[4] = {5439, 4064, 2032, 508};
   const uint32_t quiet_ticks[4] = {488585, 326065, 163033, 40759};
   const double decay_ms[4] = {306.4, 228.9, 114.5, 28.7};
   const double sustain_s[4] = {27.5, 18.4, 9.2, 2.3};
@@ -319,14 +332,16 @@ void test_three_octaves() {
 }
 
 void test_attack_shape_anchors() {
-  // EG_SPEC section 9: DR/SL as the worked example, KS=0, C4 (ksv 2).
+  // The patches of EG_SPEC section 9 (DR/SL as the worked example, KS=0, C4).
+  // `ticks` counts to the last attack update, Attack -> Decay taking the sample
+  // after it, which is one short of the spec for AR=12..20.
   struct Case {
     int ar, rate;
     uint32_t ticks;
     double ms;
   };
-  const Case cases[6] = {{12, 26, 3105, 174.87}, {16, 34, 777, 43.76},
-                         {20, 42, 195, 10.98},   {24, 50, 52, 2.93},
+  const Case cases[6] = {{12, 26, 3104, 174.82}, {16, 34, 776, 43.70},
+                         {20, 42, 194, 10.93},   {24, 50, 52, 2.93},
                          {28, 58, 14, 0.79},     {31, 63, 1, 0.06}};
   for (const Case &c : cases) {
     OperatorParams op = kWorked;
@@ -347,18 +362,20 @@ void test_attack_shape_anchors() {
 void test_release_worked_example() {
   EgSimulator sim(kWorked, kC4);
   sim.key_on();
-  for (uint32_t t = 0; t < 5999; ++t) // key-off lands at the top of tick 6000
+  for (uint32_t t = 0; t < 5999; ++t) // the key-off sample is EG tick 6000
     eg_tick(sim);
   CHECK_EQ(sim.attenuation(), 65);
   sim.key_off();
-  CHECK(sim.phase() == EgPhase::Release);
   CHECK(!sim.keyed_on());
+  EgSimulator key_off_sample = sim;
+  key_off_sample.step();
+  CHECK(key_off_sample.phase() == EgPhase::Release);
 
   const uint32_t quiet = ticks_until(
       sim, [](EgSimulator &s) { return s.attenuation() >= 0x3F0; }, 60000);
   CHECK_EQ(quiet, 15076u);
   CHECK_REL(ticks_to_ms(quiet), 849.0, 0.01);
-  // Nuked behavior: 0x3F0 and 0x3FF now coincide.
+  // Nuked behavior: 0x3F0 and 0x3FF coincide.
   CHECK_EQ(sim.attenuation(), 0x3FF);
 
   // Without the snap (ymfm / jsgroth path) the tail creeps on to 862.5 ms.
@@ -400,13 +417,17 @@ void test_sustain_level_mapping() {
   }
 }
 
-// SL=0 must skip decay entirely, with zero decay updates.
-void test_sl0_skips_decay() {
+// SL=0 leaves Decay on the sample after entering it, with zero decay updates.
+void test_sl0_passes_through_decay() {
   OperatorParams op{31, 10, 5, 7, 0, 0, 0, 0};
   EgSimulator sim(op, kC4);
   sim.key_on();
+  sim.step(); // the key-on sample: instant attack
   CHECK_EQ(sim.attenuation(), 0);
-  eg_tick(sim); // Attack -> Decay -> Sustain, both on the same tick
+  CHECK(sim.phase() == EgPhase::Attack);
+  sim.step();
+  CHECK(sim.phase() == EgPhase::Decay);
+  sim.step();
   CHECK(sim.phase() == EgPhase::Sustain);
   CHECK_EQ(sim.attenuation(), 0);
 }
@@ -417,7 +438,7 @@ void test_sr0_holds_forever() {
   sim.key_on();
   const uint32_t d = ticks_until(
       sim, [](EgSimulator &s) { return s.phase() == EgPhase::Sustain; }, 20000);
-  CHECK_EQ(d, 5440u);
+  CHECK_EQ(d, 5439u);
   CHECK_EQ(sim.rate_of(EgPhase::Sustain), 0);
   CHECK(sim.is_static());
   const uint16_t held = sim.attenuation();
@@ -481,6 +502,7 @@ void test_key_edges_and_retrigger() {
 
   sim.key_on();
   CHECK(sim.keyed_on());
+  sim.step(); // the key-on sample; each eg_tick() below ends on a tick
   CHECK_EQ(sim.attenuation(), 0);
   ticks_until(sim, [](EgSimulator &s) { return s.attenuation() >= 300; },
               20000);
@@ -488,6 +510,7 @@ void test_key_edges_and_retrigger() {
 
   // Double key-on is a no-op: no instant-attack reset, no phase change.
   sim.key_on();
+  sim.step(); // not an EG tick
   CHECK_EQ(sim.attenuation(), mid);
   CHECK(sim.phase() == EgPhase::Decay || sim.phase() == EgPhase::Sustain);
 
@@ -501,6 +524,7 @@ void test_key_edges_and_retrigger() {
   ticks_until(s2, [](EgSimulator &s) { return s.attenuation() >= 700; }, 20000);
   const uint16_t before = s2.attenuation();
   s2.key_on();
+  s2.step(); // the key-on sample, an EG tick: no increment
   CHECK_EQ(s2.attenuation(), before); // attenuation untouched by key-on
   CHECK(s2.phase() == EgPhase::Attack);
   s2.step(3 * 16); // rate 34 updates once every 8 ticks
@@ -512,6 +536,7 @@ void test_key_off_from_any_phase() {
     OperatorParams op{16, 10, 5, 7, 2, 0, 0, 0};
     EgSimulator sim(op, kC4);
     sim.key_on();
+    sim.step(); // the key-on sample; each eg_tick() below ends on a tick
     if (phase_step >= 1)
       ticks_until(sim, [](EgSimulator &s) { return s.phase() == EgPhase::Decay; },
                   20000);
@@ -521,8 +546,76 @@ void test_key_off_from_any_phase() {
                   20000);
     const uint16_t att = sim.attenuation();
     sim.key_off();
+    sim.step(); // the key-off sample, not an EG tick
     CHECK(sim.phase() == EgPhase::Release);
     CHECK_EQ(sim.attenuation(), att); // untouched on the non-SSG path
+  }
+}
+
+// A key-on sample adds no increment, even on an EG tick: it starts in
+// Release, and Attack begins with it.
+void test_key_on_sample_adds_no_increment() {
+  OperatorParams op{24, 10, 5, 7, 2, 0, 0, 0}; // AR=24, ksv=0 -> rate 48
+  EgSimulator sim(op, kBlock0);
+  sim.key_on();
+  sim.step(); // the key-on sample is EG tick 1, whose increment is 1
+  CHECK_EQ(sim.attenuation(), 0x3FF);
+  CHECK(sim.phase() == EgPhase::Attack);
+  sim.step(2);
+  CHECK_EQ(sim.attenuation(), 0x3FF);
+  sim.step(); // EG tick 2: the first update
+  CHECK_EQ(sim.attenuation(), 959);
+}
+
+// A key-off sample on an EG tick still takes the increment of the phase it
+// starts in, at that phase's rate; Release begins with it.
+void test_key_off_sample_takes_the_old_phase_increment() {
+  // SR=31 at C4 -> rate 63, 8 on every tick; RR=0 -> rate 4, whose updates
+  // are 1024 ticks apart.
+  const OperatorParams op{31, 31, 31, 0, 1, 0, 0, 0};
+  EgSimulator sim(op, kC4);
+  CHECK_EQ(sim.rate_of(EgPhase::Sustain), 63);
+  CHECK_EQ(sim.rate_of(EgPhase::Release), 4);
+  sim.key_on();
+  sim.step(30); // EG ticks 1..10: instant attack, decay to SL=1, sustain
+  CHECK(sim.phase() == EgPhase::Sustain);
+  const int before = sim.attenuation();
+  sim.key_off();
+  sim.step(); // the key-off sample is EG tick 11
+  CHECK(sim.phase() == EgPhase::Release);
+  CHECK_EQ(sim.attenuation(), before + 8);
+  sim.step(3); // EG tick 12 is a Release tick at rate 4: no update
+  CHECK_EQ(sim.attenuation(), before + 8);
+}
+
+// SSG-EG $08 with every rate at 63 (KS=3 at C4) ramps 0 -> 0x200 in 16 EG
+// ticks: the loop is 48 samples at SL=1 and 51 at SL=0, where Decay -> Sustain
+// takes the EG tick after the fold's key-on and Attack -> Decay.
+void test_ssg_loop_period_sl0_vs_sl1() {
+  for (const int sl : {0, 1}) {
+    const OperatorParams op{31, 31, 31, 15, static_cast<uint8_t>(sl), 0, 3, 0x08};
+    EgSimulator sim(op, kC4);
+    for (const EgPhase p : {EgPhase::Attack, EgPhase::Decay, EgPhase::Sustain,
+                            EgPhase::Release})
+      CHECK_EQ(sim.rate_of(p), 63);
+    sim.key_on();
+    // Samples on which the level falls from the fold back below it.
+    std::vector<uint64_t> restarts;
+    uint16_t previous = sim.attenuation();
+    for (uint64_t i = 0; i < 6000; ++i) {
+      sim.step();
+      const uint16_t now = sim.attenuation();
+      if (previous >= kSsgFoldAttenuation && now < kSsgFoldAttenuation)
+        restarts.push_back(i);
+      previous = now;
+    }
+    CHECK(restarts.size() > 100);
+    // The first interval runs from the real key-on.
+    const uint64_t want = sl == 0 ? 51 : 48;
+    bool every = true;
+    for (size_t k = 2; k < restarts.size(); ++k)
+      every = every && restarts[k] - restarts[k - 1] == want;
+    CHECK(every);
   }
 }
 
@@ -701,6 +794,108 @@ void test_alternating_run_matches_stepping() {
   CHECK(crossed > 20000);
 }
 
+// Crossing a span with the skip API has to leave the same trace as stepping
+// through it, whichever sample of the EG tick the key events land on --
+// including the transitions that fire between ticks.
+void test_skip_matches_stepping_on_every_alignment() {
+  struct Obs {
+    uint16_t att, out;
+    uint8_t phase;
+    bool on, inverted, at_rest;
+    bool operator==(const Obs &o) const {
+      return att == o.att && out == o.out && phase == o.phase && on == o.on &&
+             inverted == o.inverted && at_rest == o.at_rest;
+    }
+  };
+  const auto look = [](const EgSimulator &s) {
+    return Obs{s.attenuation(), s.output(), static_cast<uint8_t>(s.phase()),
+               s.keyed_on(), s.ssg_inverted(), s.is_static()};
+  };
+  const OperatorParams patches[] = {
+      {31, 10, 5, 7, 0, 0, 0, 0},      // SL=0, instant attack
+      {31, 31, 31, 15, 0, 0, 3, 0x08}, // SSG-EG repeat, SL=0
+      {31, 31, 31, 15, 1, 0, 3, 0x08}, // SSG-EG repeat, SL=1
+      {20, 31, 31, 15, 0, 0, 3, 0x08}, // an attack that starts in the fold
+      {24, 23, 23, 1, 2, 20, 0, 0},    // rate-48 phases
+      {16, 12, 6, 5, 4, 0, 1, 0},
+      {31, 14, 6, 5, 6, 0, 0, 0x0A},
+      {14, 18, 14, 0, 9, 0, 0, 0x0E}, // an alternate band under a slow attack
+      {31, 20, 10, 4, 0, 0, 0, 0x0D}, // hold-up at SL=0
+      {31, 20, 10, 4, 0, 0, 0, 0x09},
+  };
+  const uint64_t kSpan = 12000;
+  size_t skipped = 0, banded = 0;
+  bool ok = true;
+  for (const OperatorParams &op : patches)
+    for (uint64_t on = 0; on < 3 && ok; ++on)
+      for (uint64_t off = 0; off < 3 && ok; ++off) {
+        // Key-on, key-off, a retrigger and a second key-off.
+        const uint64_t events[4] = {on, 6000 + off, 6600 + (on + off) % 3,
+                                    9000 + on};
+        const auto gate = [&events](EgSimulator &s, uint64_t i) {
+          for (size_t e = 0; e < 4; ++e)
+            if (events[e] == i) {
+              if (e % 2 == 0)
+                s.key_on();
+              else
+                s.key_off();
+            }
+        };
+
+        EgSimulator stepped(op, kC4);
+        std::vector<Obs> want;
+        for (uint64_t i = 0; i < kSpan; ++i) {
+          gate(stepped, i);
+          stepped.step();
+          want.push_back(look(stepped));
+        }
+
+        EgSimulator jumped(op, kC4);
+        std::vector<Obs> got;
+        for (uint64_t i = 0; i < kSpan;) {
+          gate(jumped, i);
+          uint64_t room = kSpan - i;
+          for (const uint64_t e : events)
+            if (e > i && e - i < room)
+              room = e - i;
+          const Obs held = look(jumped);
+          const uint64_t n =
+              std::min<uint64_t>(jumped.skippable_samples(), room);
+          if (n > 0) {
+            got.insert(got.end(), static_cast<size_t>(n), held);
+            jumped.skip(static_cast<uint32_t>(n));
+            skipped += static_cast<size_t>(n);
+            i += n;
+            continue;
+          }
+          uint16_t first = 0, second = 0;
+          const uint64_t band =
+              std::min<uint64_t>(jumped.alternating_samples(first, second), room);
+          if (band > 0) {
+            // The inversion flag flips on every sample of the run.
+            for (uint64_t k = 0; k < band; ++k) {
+              Obs o = held;
+              o.out = (k & 1) ? second : first;
+              o.inverted = (k & 1) ? held.inverted : !held.inverted;
+              got.push_back(o);
+            }
+            jumped.skip(static_cast<uint32_t>(band));
+            banded += static_cast<size_t>(band);
+            i += band;
+            continue;
+          }
+          jumped.step();
+          got.push_back(look(jumped));
+          ++i;
+        }
+        ok = got == want;
+      }
+  CHECK(ok);
+  // The sweep has to actually exercise both.
+  CHECK(skipped > 500000);
+  CHECK(banded > 3000);
+}
+
 // ---------------------------------------------------------------- section 2
 
 void test_tl_and_units() {
@@ -708,6 +903,7 @@ void test_tl_and_units() {
   op.tl = 64;
   EgSimulator sim(op, kC4);
   sim.key_on();
+  sim.step(); // the key-on sample
   CHECK_EQ(sim.attenuation(), 0);
   CHECK_EQ(sim.output(), 64 * 8); // TL is added to the output, not to state
   op.tl = 127;
@@ -850,16 +1046,20 @@ int main() {
   RUN_TEST(test_attack_shape_anchors);
   RUN_TEST(test_release_worked_example);
   RUN_TEST(test_sustain_level_mapping);
-  RUN_TEST(test_sl0_skips_decay);
+  RUN_TEST(test_sl0_passes_through_decay);
   RUN_TEST(test_sr0_holds_forever);
   RUN_TEST(test_dr0_holds);
   RUN_TEST(test_attack_freeze_rates_62_63);
   RUN_TEST(test_attack_freeze_rate_zero);
   RUN_TEST(test_key_edges_and_retrigger);
   RUN_TEST(test_key_off_from_any_phase);
+  RUN_TEST(test_key_on_sample_adds_no_increment);
+  RUN_TEST(test_key_off_sample_takes_the_old_phase_increment);
+  RUN_TEST(test_ssg_loop_period_sl0_vs_sl1);
   RUN_TEST(test_counter_phase_reset);
   RUN_TEST(test_skip_matches_stepping);
   RUN_TEST(test_alternating_run_matches_stepping);
+  RUN_TEST(test_skip_matches_stepping_on_every_alignment);
   RUN_TEST(test_tl_and_units);
   RUN_TEST(test_from_midi_uses_the_note_table);
   RUN_TEST(test_from_midi_is_standard_pitch);

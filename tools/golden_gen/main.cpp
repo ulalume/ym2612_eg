@@ -102,10 +102,8 @@ struct Scenario {
   std::vector<Case> cases;
 };
 
-// Nuked's state machine needs one spare output sample after a key transition
-// before the next EG tick, otherwise the tick is spent on a state transition
-// instead of an increment.  EG ticks sit on samples that are multiples of 3, so
-// an effective key event must land on sample % 3 == 1.
+// The first sample at or after `sample` that follows an EG tick.  EG ticks sit
+// on samples that are multiples of 3, so that is sample % 3 == 1.
 int align_gate(int sample) {
   while (sample % 3 != 1)
     ++sample;
@@ -204,44 +202,12 @@ Trace record(const Case &c) {
 struct Verdict {
   bool ok = true;
   std::string why;
-  int shift = 0;
 };
 
 Verdict verify(const Case &c, const Trace &t, bool *out_differs) {
   Verdict v;
   EgSimulator eg(c.op, c.pitch);
-
-  bool mixed = false;
-  int shift = counter_shift_for_case(eg, &mixed);
-  if (mixed) {
-    v.ok = false;
-    v.why = "phases demand different eg_timer_low_lock shifts (mixed <48/>=48)";
-    return v;
-  }
-  if (shift == kNoConstraint)
-    shift = 0;
-  v.shift = shift;
-
-  if (has_sl0_instant_attack_divergence(eg)) {
-    v.ok = false;
-    v.why = "SL=0 with instant attack: Nuked spends the first EG tick on the "
-            "second state transition";
-    return v;
-  }
-  if (has_ssg_sustain_window_divergence(c.op, eg)) {
-    v.ok = false;
-    v.why = "SSG-EG with a decay step > 15 can jump Nuked's 16-wide "
-            "Decay->Sustain equality window";
-    return v;
-  }
-  if (shift != 0 && counter_wraps(t.counter_phase, c.samples)) {
-    v.ok = false;
-    v.why = "a counter-shifted case must stay inside one sweep of the 12-bit "
-            "EG counter; shorten `samples`";
-    return v;
-  }
-
-  eg.reset(static_cast<uint16_t>(apply_counter_shift(t.counter_phase, shift)));
+  eg.reset(static_cast<uint16_t>(t.counter_phase));
   size_t g = 0;
   *out_differs = false;
   const bool check_out = output_comparable(c.op);
@@ -261,9 +227,9 @@ Verdict verify(const Case &c, const Trace &t, bool *out_differs) {
               std::to_string(t.level[i]);
       return v;
     }
-    if (i % 3 == 0 && static_cast<int>(eg.phase()) != t.state[i]) {
+    if (static_cast<int>(eg.phase()) != t.state[i]) {
       v.ok = false;
-      v.why = "state mismatch at EG tick " + std::to_string(i) + ": ours " +
+      v.why = "state mismatch at sample " + std::to_string(i) + ": ours " +
               std::to_string(static_cast<int>(eg.phase())) + " vs Nuked " +
               std::to_string(t.state[i]);
       return v;
@@ -315,8 +281,7 @@ void write_changes(std::string &json, const char *key,
   json += "],\n";
 }
 
-std::string case_json(const Case &c, const Trace &t, const Verdict &v,
-                      bool out_differs) {
+std::string case_json(const Case &c, const Trace &t, bool out_differs) {
   std::string j;
   j += "    {\n";
   j += "      \"name\": \"" + c.name + "\",\n";
@@ -331,8 +296,7 @@ std::string case_json(const Case &c, const Trace &t, const Verdict &v,
   j += "      \"fnum\": " + std::to_string(c.pitch.fnum) +
        ", \"block\": " + std::to_string(c.pitch.block) + ",\n";
   j += "      \"samples\": " + std::to_string(c.samples) +
-       ", \"counter_phase\": " + std::to_string(t.counter_phase) +
-       ", \"counter_shift\": " + std::to_string(v.shift) + ",\n";
+       ", \"counter_phase\": " + std::to_string(t.counter_phase) + ",\n";
   j += "      \"gate\": [";
   for (size_t i = 0; i < t.gate.size(); ++i) {
     if (i)
@@ -380,7 +344,7 @@ bool emit(const Scenario &s, const std::string &dir) {
     }
     if (i)
       j += ",\n";
-    j += case_json(c, t, v, out_differs);
+    j += case_json(c, t, out_differs);
   }
   j += "\n  ]\n}\n";
 
@@ -609,10 +573,9 @@ Scenario edge_anchors() {
   Scenario s;
   s.file = "edge_anchors";
   s.title = "Edge anchors";
-  s.description = "SL=0 skip-decay (with a real attack -- SL=0 plus the "
-                  "instant attack is a documented divergence), SL=15, instant "
-                  "attack, AR=0, DR=0, SR=0, and TL well above zero.";
-  s.cases.push_back({"SL=0 skip decay", patch(16, 10, 5, 7, 0, 0, 0, 0),
+  s.description = "SL=0 under a real attack, SL=15, instant attack, AR=0, "
+                  "DR=0, SR=0, and TL well above zero.";
+  s.cases.push_back({"SL=0", patch(16, 10, 5, 7, 0, 0, 0, 0),
                      note(60), 40000, hold(6, 25000)});
   s.cases.push_back({"SL=0, KS=2", patch(14, 12, 7, 6, 0, 0, 2, 0), note(60),
                      40000, hold(6, 25000)});
@@ -635,21 +598,15 @@ Scenario edge_anchors() {
   return s;
 }
 
-// 9. The rate >= 48 regime, where Nuked's latched timer bits rotate the
-//    increment row by one EG tick.  Every case here keeps all of its
-//    non-constant rows on the same side of that rotation, so the comparison
-//    stays exact once the documented counter shift is applied.
+// 9. The rate >= 48 regime, where the step comes from the low two bits of the
+//    timer Nuked latches on the previous tick (eg_timer_low_lock).
 Scenario high_rate() {
   Scenario s;
   s.file = "high_rate";
-  s.title = "Rates >= 48 (eg_timer_low_lock rotation)";
-  s.description = "Cases whose non-constant increment rows are all >= 48. The "
-                  "library follows the published table, Nuked latches the "
-                  "timer's low bits one tick late, so these are compared with "
-                  "the documented one-EG-tick counter shift -- exactly, not "
-                  "with a tolerance.";
-  // ksv = 2 at C4/KS=0, so every rate is 0 or 2 mod 4: the 2 mod 4 rows all
-  // want the same -1 shift and the 0 mod 4 rows are constant.
+  s.title = "Rates >= 48";
+  s.description = "Rates >= 48, whose step comes from the low two bits of the "
+                  "EG timer as latched on the previous tick.";
+  // ksv = 2 at C4/KS=0, so every rate is 0 or 2 mod 4.
   s.cases.push_back({"AR=28 (rate 58)", patch(28, 26, 24, 15, 4, 0, 0, 0),
                      note(60), 11000, hold(6, 7000)});
   s.cases.push_back({"AR=26 (rate 54)", patch(26, 26, 24, 15, 4, 0, 0, 0),
@@ -669,14 +626,136 @@ Scenario high_rate() {
   // to reach rate % 4 == 1 and 3.  fnum 960 -> fn_note 1, block 6 -> kcode 25,
   // KS=3 -> ksv 25.
   const NotePitch odd{960, 6};
-  s.cases.push_back({"rates 51/55/59 (+1 shift)",
+  s.cases.push_back({"rates 51/55/59",
                      patch(13, 15, 17, 7, 4, 0, 3, 0), odd, 11000,
                      hold(6, 7000)});
-  s.cases.push_back({"rates 49/53/57 (-1 shift)",
+  s.cases.push_back({"rates 49/53/57",
                      patch(12, 14, 16, 10, 4, 0, 3, 0), odd, 11000,
                      hold(6, 7000)});
   s.cases.push_back({"rates 51/55/59, SL=1", patch(13, 15, 17, 7, 1, 0, 3, 0),
                      odd, 11000, hold(6, 7000)});
+  return s;
+}
+
+// 10. Key events on every alignment to the EG tick.  Sample 0 of a vector is
+//     an EG tick, so a key event on sample % 3 == 0 lands on a tick and 1 and
+//     2 on the two samples after it.
+Scenario key_alignment() {
+  Scenario s;
+  s.file = "key_alignment";
+  s.title = "Key events on every EG-tick alignment";
+  s.description = "Key-on and key-off on samples 0, 1 and 2 mod 3, named in "
+                  "each case: SL=0 with the instant attack, SSG-EG $08 at "
+                  "SL=0 and SL=1 with every rate 63 and at SL=1 with DR rate "
+                  "52, a rate-48 attack from release, key-off in decay and in "
+                  "sustain, and a retrigger during the attack.";
+  for (int a = 0; a < 3; ++a) {
+    const int b = (a + 1) % 3;
+    const int c = (a + 2) % 3;
+    const std::string at = ", on " + num(a) + " off " + num(b);
+    s.cases.push_back({"SL=0 instant attack" + at,
+                       patch(31, 10, 5, 7, 0, 0, 0, 0), note(60), 20000,
+                       {{9 + a, true}, {15000 + b, false}}});
+    // KS=3 at C4: ksv 16.
+    s.cases.push_back({"SSG=$08 SL=0 rates 63" + at,
+                       patch(31, 31, 31, 15, 0, 0, 3, 8), note(60), 6000,
+                       {{9 + a, true}, {5100 + b, false}}});
+    // DR rate 52 keeps the 4x decay step at 8, inside the sustain window.
+    s.cases.push_back({"SSG=$08 SL=1 DR rate 52" + at,
+                       patch(31, 18, 31, 15, 1, 0, 3, 8), note(60), 6000,
+                       {{9 + a, true}, {5100 + b, false}}});
+    s.cases.push_back({"SSG=$08 SL=1 rates 63" + at,
+                       patch(31, 31, 31, 15, 1, 0, 3, 8), note(60), 6000,
+                       {{9 + a, true}, {5100 + b, false}}});
+    // Block 0: ksv 0, so AR=24 is rate 48, an update on every tick.
+    s.cases.push_back({"AR rate 48 from release" + at + " on " + num(c),
+                       patch(24, 10, 5, 7, 2, 0, 0, 0), NotePitch{644, 0},
+                       12000,
+                       {{9 + a, true},
+                        {3000 + b, false},
+                        {6000 + c, true},
+                        {9000 + a, false}}});
+    s.cases.push_back({"key-off in decay, DR rate 48" + at,
+                       patch(31, 23, 4, 1, 8, 0, 0, 0), note(60), 6000,
+                       {{9 + a, true}, {402 + b, false}}});
+    s.cases.push_back({"key-off in sustain, SR rate 48" + at,
+                       patch(31, 23, 23, 1, 2, 0, 0, 0), note(60), 6000,
+                       {{9 + a, true}, {1500 + b, false}}});
+    // AR=12 at C4: rate 26, an attack of ~9300 samples; the key comes back
+    // 1, 2 or 3 samples after the key-off.
+    s.cases.push_back({"retrigger during attack" + at + " on " +
+                           num((b + 1 + a) % 3),
+                       patch(12, 8, 4, 6, 6, 0, 0, 0), note(60), 24000,
+                       {{9 + a, true},
+                        {3000 + b, false},
+                        {3001 + b + a, true},
+                        {20000 + c, false}}});
+  }
+  return s;
+}
+
+// 11. The Decay -> Sustain window: the level's top six bits have to equal the
+//     sustain level's, and a 4x SSG-EG step of 32 (DR rates 57-59) can land
+//     past it, depending on the counter phase at key-on.
+Scenario sustain_window() {
+  Scenario s;
+  s.file = "sustain_window";
+  s.title = "Decay -> Sustain window";
+  s.description = "SSG-EG decays at DR rates 57-59, whose 4x step reaches 32 "
+                  "and can land past the sustain level's 16-wide window, after "
+                  "which the decay carries on at DR. Key-ons on different "
+                  "samples start the decay on different counter phases, so "
+                  "the window is hit in some cases and skipped in others. "
+                  "Slow attacks end on a counter aligned to their stride.";
+  const NotePitch c4 = note(60);  // KS=0: ksv 2
+  const NotePitch block2{644, 2}; // ksv 1
+  const NotePitch block6{644, 6}; // ksv 3
+  // Every alignment to the EG tick, and a counter phase that moves on with k.
+  const auto on = [](int k) { return 9 + 3 * k + k % 3; };
+  for (int k = 0; k < 3; ++k)
+    s.cases.push_back({"SSG=$09 DR rate 58 SL=3, on " + num(on(k)),
+                       patch(31, 28, 0, 15, 3, 0, 0, 9), c4, 8000,
+                       {{on(k), true}, {6000 + k, false}}});
+  for (int k = 0; k < 6; ++k)
+    s.cases.push_back({"SSG=$09 DR rate 58 SL=4, on " + num(on(k)),
+                       patch(31, 28, 0, 15, 4, 0, 0, 9), c4, 8000,
+                       {{on(k), true}, {6000 + k % 3, false}}});
+  // SR rate 48: a ramp that hits the window climbs the rest of the way at SR.
+  for (int k = 0; k < 3; ++k)
+    s.cases.push_back({"SSG=$08 DR rate 58 SR rate 48 SL=4, on " + num(on(k)),
+                       patch(31, 28, 23, 15, 4, 0, 0, 8), c4, 12000,
+                       {{on(k), true}, {11000 + k, false}}});
+  // DR rate 57 with SR rate 49: the ramps go on alternating between a hit
+  // window and a skipped one.
+  for (int k = 0; k < 2; ++k)
+    s.cases.push_back({"SSG=$08 DR rate 57 SR rate 49 SL=4, on " + num(on(k)),
+                       patch(31, 28, 24, 15, 4, 0, 0, 8), block2, 12000,
+                       {{on(k), true}, {11000 + k, false}}});
+  for (int k = 0; k < 3; ++k)
+    s.cases.push_back({"SSG=$09 DR rate 57 SL=4, on " + num(on(k)),
+                       patch(31, 28, 0, 15, 4, 0, 0, 9), block2, 8000,
+                       {{on(k), true}, {6000 + k, false}}});
+  for (int k = 0; k < 3; ++k)
+    s.cases.push_back({"SSG=$09 DR rate 59 SL=4, on " + num(on(k)),
+                       patch(31, 28, 0, 15, 4, 0, 0, 9), block6, 8000,
+                       {{on(k), true}, {6000 + k, false}}});
+  // A slow attack ends on a counter aligned to its stride, which fixes where
+  // in the rate-57/58/59 row the decay's first step falls.
+  for (int ar : {16, 20, 22})
+    for (int sl : {1, 2})
+      for (int k = 0; k < 4; ++k)
+        s.cases.push_back({"SSG=$09 AR=" + num(ar) + " DR rate 58 SL=" +
+                               num(sl) + ", on " + num(on(k)),
+                           patch(ar, 28, 0, 15, sl, 0, 0, 9), c4, 6000,
+                           {{on(k), true}, {5000 + k % 3, false}}});
+  for (const NotePitch pitch : {block2, block6})
+    for (int sl : {1, 2})
+      for (int k = 0; k < 2; ++k)
+        s.cases.push_back({"SSG=$09 AR=20 DR rate " +
+                               num(pitch.block == 2 ? 57 : 59) + " SL=" +
+                               num(sl) + ", on " + num(on(k)),
+                           patch(20, 28, 0, 15, sl, 0, 0, 9), pitch, 6000,
+                           {{on(k), true}, {5000 + k, false}}});
   return s;
 }
 
@@ -694,7 +773,8 @@ int main(int argc, char **argv) {
                                 sr_rr_sweep(),     ks_pitch(),
                                 ssg_modes(),       ssg_slow_attack(),
                                 retrigger(),       edge_anchors(),
-                                high_rate()};
+                                high_rate(),       key_alignment(),
+                                sustain_window()};
   bool ok = true;
   for (const Scenario &s : scenarios)
     ok &= emit(s, dir);

@@ -26,6 +26,11 @@ inline constexpr uint16_t kSilenceAttenuation = 0x340;
 // or a release covers only this much ground rather than the whole of it.
 inline constexpr uint16_t kCutAttenuation = 0x3F0;
 
+// The EG counter value sample_curve() presets before its key-on, unless the
+// first decay then steps past the sustain window and a later value lands in
+// it: then the first such value, counting up from this one.
+inline constexpr uint16_t kCurveCounterPhase = 0;
+
 // The attenuation SL names, i.e. where the decay stops and the sustain
 // begins.  SL = 15 becomes 0x3E0 (992), not 480.
 inline constexpr int sustain_attenuation(int sl) {

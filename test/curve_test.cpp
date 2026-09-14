@@ -81,7 +81,11 @@ std::vector<CurvePoint> raw_curve(const CurveRequest &req, double end_ms) {
   sim.reset(0, req.start_att);
   sim.key_on();
   std::vector<CurvePoint> raw;
-  raw.push_back(CurvePoint{0.0f, sim.output(), sim.attenuation()});
+  // sample_curve() starts at the level the key-on sample leaves.
+  EgSimulator key_on_sample = sim;
+  key_on_sample.step();
+  raw.push_back(
+      CurvePoint{0.0f, key_on_sample.output(), key_on_sample.attenuation()});
   while (sim.time_ms() < end_ms) {
     sim.step();
     const uint16_t o = sim.output();
@@ -128,7 +132,7 @@ void test_points_and_marker_ordering() {
   CHECK(has_marker(r, MarkerKind::Silence));
   CHECK(!has_marker(r, MarkerKind::SsgFold));
 
-  // Fires on EG tick 1, i.e. the very first output sample.
+  // Fires on the sample after the key-on sample, inside EG tick 1.
   CHECK(marker_ms(r, MarkerKind::AttackEnd) > 0.0);
   CHECK(marker_ms(r, MarkerKind::AttackEnd) <= 0.0564);
   CHECK_REL(marker_ms(r, MarkerKind::DecayEnd), 306.4, 0.01);
@@ -231,6 +235,25 @@ void test_ssg_hold_parks() {
   CHECK_EQ(r5.points.back().att, 0x200);
   CHECK_EQ(r5.points.back().out, 0);
   CHECK(std::isfinite(r5.park_ms));
+}
+
+// Under a slow attack the key-on starts at 0x3FF, above the fold, and the hold
+// latches only at the fold the decay reaches afterwards; modes 1 and 7 then cut
+// to silence.
+void test_a_slow_attack_hold_mode_reaches_silence() {
+  for (const uint8_t ssg : {uint8_t{0x09}, uint8_t{0x0F}}) {
+    CurveRequest req;
+    req.op = OperatorParams{10, 20, 10, 5, 4, 0, 0, ssg};
+    req.pitch = kC4;
+    req.gate_ms = -1.0;
+    req.max_ms = 4000.0;
+    const CurveResult r = sample_curve(req);
+    CHECK(has_marker(r, MarkerKind::SsgHold));
+    CHECK(marker_ms(r, MarkerKind::SsgHold) > marker_ms(r, MarkerKind::DecayEnd));
+    CHECK(has_marker(r, MarkerKind::Silence));
+    CHECK_EQ(r.points.back().att, kMaxAttenuation);
+    CHECK_EQ(r.points.back().out, kMaxAttenuation);
+  }
 }
 
 void test_warnings() {
@@ -482,6 +505,7 @@ int main() {
   RUN_TEST(test_ssg_loop_detection);
   RUN_TEST(test_ssg_alternate_counts_two_ramps);
   RUN_TEST(test_ssg_hold_parks);
+  RUN_TEST(test_a_slow_attack_hold_mode_reaches_silence);
   RUN_TEST(test_warnings);
   RUN_TEST(test_start_att_retrigger);
   RUN_TEST(test_ssg_key_off_segment);

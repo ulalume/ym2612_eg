@@ -59,23 +59,40 @@ inline constexpr uint8_t kIncTable[64][8] = {
     /*45*/ {0, 1, 0, 1, 1, 1, 0, 1},
     /*46*/ {0, 1, 1, 1, 0, 1, 1, 1},
     /*47*/ {0, 1, 1, 1, 1, 1, 1, 1},
+    // Rows 48-63 spell out kStepHi below, so they repeat every four entries.
     /*48*/ {1, 1, 1, 1, 1, 1, 1, 1},
-    /*49*/ {1, 1, 1, 2, 1, 1, 1, 2},
-    /*50*/ {1, 2, 1, 2, 1, 2, 1, 2},
-    /*51*/ {1, 2, 2, 2, 1, 2, 2, 2},
+    /*49*/ {2, 1, 1, 1, 2, 1, 1, 1},
+    /*50*/ {2, 1, 2, 1, 2, 1, 2, 1},
+    /*51*/ {2, 2, 2, 1, 2, 2, 2, 1},
     /*52*/ {2, 2, 2, 2, 2, 2, 2, 2},
-    /*53*/ {2, 2, 2, 4, 2, 2, 2, 4},
-    /*54*/ {2, 4, 2, 4, 2, 4, 2, 4},
-    /*55*/ {2, 4, 4, 4, 2, 4, 4, 4},
+    /*53*/ {4, 2, 2, 2, 4, 2, 2, 2},
+    /*54*/ {4, 2, 4, 2, 4, 2, 4, 2},
+    /*55*/ {4, 4, 4, 2, 4, 4, 4, 2},
     /*56*/ {4, 4, 4, 4, 4, 4, 4, 4},
-    /*57*/ {4, 4, 4, 8, 4, 4, 4, 8},
-    /*58*/ {4, 8, 4, 8, 4, 8, 4, 8},
-    /*59*/ {4, 8, 8, 8, 4, 8, 8, 8},
+    /*57*/ {8, 4, 4, 4, 8, 4, 4, 4},
+    /*58*/ {8, 4, 8, 4, 8, 4, 8, 4},
+    /*59*/ {8, 8, 8, 4, 8, 8, 8, 4},
     /*60*/ {8, 8, 8, 8, 8, 8, 8, 8},
     /*61*/ {8, 8, 8, 8, 8, 8, 8, 8},
     /*62*/ {8, 8, 8, 8, 8, 8, 8, 8},
     /*63*/ {8, 8, 8, 8, 8, 8, 8, 8},
 };
+
+// At rate >= 48 the step is picked by the counter's low two bits:
+// 1 << (min(kStepHi[rate & 3][counter & 3] + (rate >> 2) - 11, 4) - 1).
+inline constexpr uint8_t kStepHi[4][4] = {
+    {0, 0, 0, 0}, {1, 0, 0, 0}, {1, 0, 1, 0}, {1, 1, 1, 0}};
+
+inline constexpr bool high_rows_follow_step_hi() {
+  for (int rate = 48; rate < 64; ++rate)
+    for (int i = 0; i < 8; ++i) {
+      const int e = kStepHi[rate & 3][i & 3] + (rate >> 2) - 11;
+      if (kIncTable[rate][i] != (1 << ((e < 4 ? e : 4) - 1)))
+        return false;
+    }
+  return true;
+}
+static_assert(high_rows_follow_step_hi(), "rows 48-63 must follow kStepHi");
 
 // Rates >= 44 must all give shift 0.
 inline constexpr int rate_shift(int rate) {

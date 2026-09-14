@@ -4,6 +4,7 @@
 // the event markers and warnings a musician-facing graph needs.
 
 #include "simulator.hpp"
+#include "timing.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -51,6 +52,10 @@ struct CurveRequest {
   double max_ms = 2000.0;
   double clock_hz = kNtscClockHz;
   uint16_t start_att = kMaxAttenuation; // retrigger support
+  // EG counter value preset before the key-on; negative picks
+  // curve_counter_phase(op, pitch, false), the phase phase_durations() and
+  // ssg_loop_period_ms() run the envelope from.
+  int counter_phase = -1;
 };
 
 struct CurveResult {
@@ -206,7 +211,11 @@ inline CurveResult sample_curve(const CurveRequest &request) {
   const double ms_per_sample = 1000.0 / fs;
 
   EgSimulator sim(request.op, request.pitch, request.clock_hz);
-  sim.reset(0, request.start_att);
+  const uint16_t counter_phase =
+      request.counter_phase >= 0
+          ? static_cast<uint16_t>(request.counter_phase & 0x0FFF)
+          : detail::curve_counter_phase(request.op, request.pitch, false);
+  sim.reset(counter_phase, request.start_att);
   sim.key_on();
 
   const bool ssg_enabled = (request.op.ssg & 0x08) != 0;
@@ -215,8 +224,9 @@ inline CurveResult sample_curve(const CurveRequest &request) {
   const bool looping_mode = ssg_enabled && !ssg_hold;
   // Modes 2 and 6 (alternate, no hold) draw two ramps per visible period.
   const int ramps_per_period = ssg_alternate ? 2 : 1;
-  // Each fold ends one ramp, so five periods is 5 * ramps_per_period folds.
-  const size_t fold_limit = static_cast<size_t>(5 * ramps_per_period);
+  // Each fold ends one ramp, so a held loop stops after this many folds.
+  const size_t fold_limit =
+      static_cast<size_t>(detail::kMeasuredLoopPeriods * ramps_per_period);
 
   const bool gate_forever = request.gate_ms < 0.0;
   const double max_ms = request.max_ms > 0.0 ? request.max_ms : 0.0;
@@ -257,9 +267,16 @@ inline CurveResult sample_curve(const CurveRequest &request) {
     return true;
   };
 
-  push_point(0.0, true);
+  // The note starts on the key-on sample, the first step() below, so the curve
+  // starts at the level that sample leaves.
+  EgSimulator key_on_sample = sim;
+  if (!gate_forever && gate_sample == 0)
+    key_on_sample.key_off();
+  key_on_sample.step();
+  emit(0.0, key_on_sample.output(), key_on_sample.attenuation(), true);
 
-  double silence_start_ms = sim.output() >= kSilenceAttenuation ? 0.0 : -1.0;
+  double silence_start_ms =
+      key_on_sample.output() >= kSilenceAttenuation ? 0.0 : -1.0;
   size_t silence_index = 0;
 
   // The run into silence has to be unbroken, so any louder sample restarts it.
@@ -374,7 +391,7 @@ inline CurveResult sample_curve(const CurveRequest &request) {
     }
     if (parked && key_off_done)
       break;
-    // Held-forever SSG loop: five full periods is all a graph needs.
+    // Held-forever SSG loop: a few full periods is all a graph needs.
     if (looping_mode && gate_forever && fold_samples.size() >= fold_limit)
       break;
   }
@@ -382,20 +399,10 @@ inline CurveResult sample_curve(const CurveRequest &request) {
   // Close the polyline at the end of the simulated span.
   push_point(sim.time_ms(), true);
 
-  // Loop frequency: mean of the fold-to-fold intervals, skipping the first
-  // (it still carries the initial attack / start_att offset).
-  if (looping_mode && fold_samples.size() >= 3) {
-    double sum = 0.0;
-    size_t n = 0;
-    for (size_t k = 2; k < fold_samples.size(); ++k) {
-      sum += static_cast<double>(fold_samples[k] - fold_samples[k - 1]);
-      ++n;
-    }
-    const double ramp_samples = sum / static_cast<double>(n);
-    const double period_s = ramp_samples * ramps_per_period / fs;
-    if (period_s > 0.0)
-      res.loop_hz = 1.0 / period_s;
-  }
+  // Loop frequency from the mean fold-to-fold interval.
+  const double ramp_samples = detail::mean_fold_interval(fold_samples);
+  if (looping_mode && ramp_samples > 0.0)
+    res.loop_hz = 1.0 / (ramp_samples * ramps_per_period / fs);
 
   // Silence: the moment the output went above the hardware mute floor and
   // stayed there.  Only meaningful once the envelope has come to rest.
@@ -410,8 +417,12 @@ inline CurveResult sample_curve(const CurveRequest &request) {
     res.warnings.push_back(CurveWarning::AttackFrozen);
   if (ssg_enabled && request.op.ar < 31)
     res.warnings.push_back(CurveWarning::SsgArBelow31);
-  if (looping_mode && ((request.op.sr == 0 && request.op.sl <= 14) ||
-                       (request.op.dr == 0 && request.op.sl > 0)))
+  // Every fold happens with the key held, so three drawn folds already show
+  // the loop runs; fewer are settled by following the held key.
+  if (looping_mode && fold_samples.size() < 3 &&
+      !std::isfinite(detail::loop_ramp_samples(request.op, request.pitch,
+                                               request.start_att,
+                                               counter_phase)))
     res.warnings.push_back(CurveWarning::SsgNeverLoops);
   if (res.loop_hz > 20.0)
     res.warnings.push_back(CurveWarning::SsgAudioRate);

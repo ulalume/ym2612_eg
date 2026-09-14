@@ -1,10 +1,8 @@
 #pragma once
 
-// A second, deliberately independent implementation of the base (non-SSG)
-// envelope generator, written as an EG-tick loop straight from the pseudocode
-// in EG_SPEC.md ("Reference tick loop") rather than as a per-sample machine.
-// Used to cross-check EgSimulator, and to produce the ymfm-style numbers for
-// the anchors that predate Nuked's "envelope off" snap.
+// An independent base (non-SSG) envelope generator written as an EG-tick loop:
+// a tick() is the tick's sample and the two after it, and a key edge, a phase
+// transition or the envelope-off snap takes one of them.  A cross-check.
 
 #include "ym2612_eg/ym2612_eg.hpp"
 
@@ -27,6 +25,7 @@ struct Reference {
   int counter = 0;
   int state = kR;
   bool keyed = false;
+  bool seen = false; // the key state the envelope has acted on
   uint32_t ticks = 0;
 
   void configure() {
@@ -39,21 +38,9 @@ struct Reference {
     sustain = (sl | ((sl + 1) & 0x10)) << 5;
   }
 
-  void key_on() {
-    if (keyed)
-      return;
-    keyed = true;
-    state = kA;
-    if (rate[kA] >= 62)
-      att = 0;
-  }
-
-  void key_off() {
-    if (!keyed)
-      return;
-    keyed = false;
-    state = kR;
-  }
+  // Edge-triggered; the edge reaches the envelope on the next tick.
+  void key_on() { keyed = true; }
+  void key_off() { keyed = false; }
 
   void tick() {
     ++ticks;
@@ -61,29 +48,54 @@ struct Reference {
     if (counter == 0)
       counter = 1;
 
-    if (state == kA && att == 0)
-      state = kD;
-    if (state == kD && att >= sustain)
-      state = kS;
-
-    const int r = rate[state];
-    const int shift = r >= 44 ? 0 : 11 - (r >> 2);
-    if (counter & ((1 << shift) - 1))
-      return;
-    const int inc = ym2612_eg::detail::kIncTable[r][(counter >> shift) & 7];
-
-    if (state == kA) {
-      if (r < 62 && inc != 0)
-        att += (~att * inc) >> 4;
-      return;
+    // The tick's own sample.
+    const bool key_on_edge = keyed && !seen;
+    seen = keyed;
+    if (key_on_edge) {
+      state = kA;
+      if (rate[kA] >= 62)
+        att = 0;
+    } else if (!settle()) {
+      const int r = rate[state];
+      const int shift = r >= 44 ? 0 : 11 - (r >> 2);
+      const int inc =
+          (counter & ((1 << shift) - 1))
+              ? 0
+              : ym2612_eg::detail::kIncTable[r][(counter >> shift) & 7];
+      if (state == kA) {
+        if (keyed && r < 62)
+          att += (~att * inc) >> 4;
+      } else {
+        att += inc;
+        if (att > 0x3FF)
+          att = 0x3FF;
+      }
+      if (!keyed)
+        state = kR;
     }
-    att += inc;
-    if (att > 0x3FF)
-      att = 0x3FF;
-    if (snap && (att & 0x3F0) == 0x3F0) {
+    // The two samples before the next tick.
+    settle();
+    settle();
+  }
+
+  // One output sample off the tick: the snap or the transition that is due,
+  // if any.  Returns whether one was.
+  bool settle() {
+    if (snap && state != kA && (att & 0x3F0) == 0x3F0 &&
+        !(state == kR && att == 0x3FF)) {
       att = 0x3FF;
       state = kR;
+      return true;
     }
+    if (state == kA && att == 0) {
+      state = keyed ? kD : kR;
+      return true;
+    }
+    if (state == kD && (att >> 4) == (sustain >> 4)) {
+      state = keyed ? kS : kR;
+      return true;
+    }
+    return false;
   }
 
   int output() const {

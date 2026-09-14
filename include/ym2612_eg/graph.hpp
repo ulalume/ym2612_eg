@@ -23,6 +23,7 @@
 #include <cstdint>
 #include <iterator>
 #include <limits>
+#include <string>
 #include <vector>
 
 namespace ym2612_eg::graph {
@@ -91,13 +92,11 @@ inline double window_for_timeline_ms(const PhaseDurations &phases) {
   return std::clamp(whole, floor_ms, kMaxSpanMs);
 }
 
-/// How much of the held envelope is worth seeing at `pitch`, in ms: about
-/// kSsgLoopPeriods periods of an SSG loop, or otherwise the envelope's own
-/// phase durations via window_for_timeline_ms(). A scale, not a length: the
-/// envelope is drawn across the whole axis chosen from it. Nothing here is a
-/// key-off.
-inline double choose_held_ms(const OperatorParams &op, NotePitch pitch) {
-  const double period = ssg_loop_period_ms(op, pitch);
+namespace detail {
+
+/// choose_held_ms() for an SSG-EG loop period already computed.
+inline double held_ms_for_period(const OperatorParams &op, NotePitch pitch,
+                                 double period) {
   // An infinite period is not a slow loop but no loop: the fold never comes,
   // and what the graph has to show is the phase that stalled.
   if (period > 0.0 && std::isfinite(period)) {
@@ -109,6 +108,15 @@ inline double choose_held_ms(const OperatorParams &op, NotePitch pitch) {
     return std::clamp(held, std::min(kMinHeldMs, held), ceiling);
   }
   return window_for_timeline_ms(phase_durations(op, pitch));
+}
+
+} // namespace detail
+
+/// How much of the held envelope is worth seeing at `pitch`, in ms: about
+/// kSsgLoopPeriods periods of an SSG loop, or else window_for_timeline_ms() of
+/// its phase durations.  A scale for the axis, not a key-off.
+inline double choose_held_ms(const OperatorParams &op, NotePitch pitch) {
+  return detail::held_ms_for_period(op, pitch, ssg_loop_period_ms(op, pitch));
 }
 
 namespace detail {
@@ -167,16 +175,22 @@ inline double grid_step_ms(double span_ms) {
   return detail::kGridSteps[std::size(detail::kGridSteps) - 1];
 }
 
-/// The one warning worth showing, or nullptr: an SSG-EG mode driven by an
-/// attack rate the hardware convention says should be 31. Everything else the
-/// simulator flags is already visible in the shape of the curve.
-inline const char *warning_line(const CurveResult &curve) {
+/// The warning worth showing, or empty: how often the sustain level is skipped
+/// where the key-on decides it, else an SSG-EG mode on an attack rate below the
+/// 31 the hardware convention expects. The rest shows in the curve's shape.
+inline std::string warning_line(const CurveResult &curve,
+                                double sl_skip_probability = 0.0) {
+  if (sl_skip_probability > 0.0 && sl_skip_probability < 1.0) {
+    return "SL skipped on " +
+           std::to_string(std::lround(sl_skip_probability * 100.0)) +
+           "% of notes";
+  }
   for (const CurveWarning w : curve.warnings) {
     if (w == CurveWarning::SsgArBelow31) {
       return "AR<31: non-standard SSG-EG";
     }
   }
-  return nullptr;
+  return {};
 }
 
 /// Everything the graph needs for one operator.
@@ -221,52 +235,44 @@ struct EnvelopeCurve {
   uint16_t peak_out = 0;    ///< output attenuation at full volume (TL * 8)
   uint16_t sustain_out = 0; ///< output attenuation the decay aims at (SL + TL)
 
-  const char *warning = nullptr;
+  /// The fraction of key-on phases whose first decay steps past the sustain
+  /// window; strictly between 0 and 1 only where the key-on decides it.
+  double sl_skip_probability = 0.0;
+  std::string warning; ///< empty when there is none
 };
 
-/// Two passes over the simulator: a release from full volume, which shares
-/// only the time axis with the other; and -- once the window policy and the
-/// release have decided how wide the axis is -- the held trace, simulated
-/// across the whole of it so a loop keeps looping to the right edge.
-/// `min_span_ms` is the axis the curve will actually be DRAWN on, which for a
-/// voice overlay is another curve's rather than its own; the held trace is
-/// simulated across at least that much, because a sawtooth extrapolated along
-/// the slope of its last ramp is not a sawtooth. A pure function of the
-/// operator and the note.
+/// One operator's curves at `pitch`: a release from full volume and the held
+/// trace on one time axis. The held trace covers at least `min_span_ms`.
 inline EnvelopeCurve build_envelope_curve(const OperatorParams &op,
                                           NotePitch pitch,
                                           double min_span_ms = 0.0) {
   EnvelopeCurve out;
 
-  // 1. What the axis has to hold, in closed form over the registers alone.
+  // 1. What the axis has to hold: the loop period, or the phase durations.
   const double period_ms = ssg_loop_period_ms(op, pitch);
   const bool loops = period_ms > 0.0 && std::isfinite(period_ms);
-  out.held_ms = choose_held_ms(op, pitch);
+  out.held_ms = detail::held_ms_for_period(op, pitch, period_ms);
 
-  // 2. The release, on its own: keyed on at full volume and released at once,
-  //    which routes it through the chip's real key-off rules -- the SSG
-  //    inversion latch, the 4x increments, the hard cut at 0x200. The gate is
-  //    a sample rather than zero because a key write takes a sample to reach
-  //    the envelope; released on sample zero the note never starts.
-  //
-  //    "Full volume" is one step short of loudest_attenuation(), not 0: with
-  //    an inverted SSG-EG mode 0 is the quiet end of the ramp, and the loudest
-  //    attenuation is the fold level itself, which an operator only ever
-  //    passes through. AR is zeroed for this run alone -- key_on() snaps an
-  //    instant attack straight to att = 0 and would throw the start level
-  //    away, and the release rate does not depend on AR.
+  // 2. The release on its own, keyed on at full volume and released at once,
+  //    so it takes the chip's key-off rules: the SSG inversion latch, the 4x
+  //    increments, the hard cut at 0x200.
   CurveRequest release;
   release.op = op;
+  // The key-on sample would snap an instant attack to att = 0, and the
+  // release rate does not depend on AR.
   release.op.ar = 0;
   release.pitch = pitch;
+  // The key comes up two samples in; released on the sample it went down, it
+  // never starts.
   release.gate_ms = 2000.0 / sample_rate_hz(kNtscClockHz);
   release.max_ms = release_max_ms();
+  // Full volume is one step short of loudest_attenuation(): for an inverted
+  // SSG-EG mode that is the fold level, which an operator only passes through.
   const uint16_t loudest = loudest_attenuation(op);
   release.start_att = loudest > 0 ? static_cast<uint16_t>(loudest - 1) : 0;
   out.release = sample_curve(release);
-  // The key reaches the envelope one sample after the write, so the samples
-  // before that carry a level the note never sounds at: drop them and put the
-  // first sounding one at the origin.
+  // The release is drawn from the end of the key-on sample: points before it
+  // are dropped and the first at or after it becomes the origin.
   {
     const float settled =
         static_cast<float>(1000.0 / sample_rate_hz(kNtscClockHz));
@@ -314,6 +320,8 @@ inline EnvelopeCurve build_envelope_curve(const OperatorParams &op,
   CurveRequest request;
   request.op = op;
   request.pitch = pitch;
+  // A voice overlay is drawn on another curve's axis, and a loop has to be
+  // simulated across it rather than extrapolated along its last ramp.
   request.max_ms = std::max({out.span_ms, out.held_ms, min_span_ms});
   request.gate_ms = loops ? request.max_ms + 1.0 : -1.0;
   out.held = sample_curve(request);
@@ -361,7 +369,8 @@ inline EnvelopeCurve build_envelope_curve(const OperatorParams &op,
       std::min(sustain_attenuation(op.sl) + tl_att,
                static_cast<int>(kMaxAttenuation)));
 
-  out.warning = warning_line(out.held);
+  out.sl_skip_probability = sl_skip_probability(op, pitch);
+  out.warning = warning_line(out.held, out.sl_skip_probability);
   return out;
 }
 
@@ -831,9 +840,9 @@ inline const EnvelopeCurve &EnvelopeCurveCache::get(const OperatorParams &op,
 
 namespace detail {
 
-/// Half an EG tick, in ms: the shortest length the closed forms tell apart.
-/// A phase they report as zero is not instantaneous but over within one tick,
-/// and a ratio match needs a positive length to stand in for it.
+/// Half an EG tick, in ms: what a phase length reported as zero stands for in
+/// a ratio match. Such a phase is not instantaneous but over within one tick,
+/// and the match needs a positive length.
 inline constexpr double kInstantMs = 500.0 / eg_rate_hz(kNtscClockHz);
 
 /// The candidate in `slowest`..`fastest` whose phase lasts closest to
@@ -947,7 +956,11 @@ inline uint8_t solve_decay_rate(const OperatorParams &op, NotePitch pitch,
   OperatorParams probe = op;
   return detail::nearest_rate(1, 31, target_ms, [&](int rate) {
     probe.dr = static_cast<uint8_t>(rate);
-    return phase_durations(probe, pitch).decay_ms;
+    const PhaseDurations phases = phase_durations(probe, pitch);
+    // A decay that steps past the sustain window has no knee to answer with.
+    const bool passes = ym2612_eg::detail::window_can_be_skipped(probe, pitch) &&
+                        phases.sustain_ms == 0.0;
+    return passes ? std::numeric_limits<double>::infinity() : phases.decay_ms;
   });
 }
 
