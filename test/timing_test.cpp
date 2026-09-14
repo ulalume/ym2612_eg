@@ -521,8 +521,8 @@ void test_the_measured_patches_skip_as_measured() {
 }
 
 /// sample_curve() keys on at kCurveCounterPhase, or where the key-on decides
-/// the sustain window, at the first phase counting up from it whose first
-/// decay lands in it; the second path starts from the first that skips.
+/// the sustain window, at the first phase from it whose first decay lands in
+/// it; curve_counter_phase(op, pitch, true) is the first that skips.
 void test_the_curve_keys_on_at_the_first_phase_that_lands() {
   int decided = 0;
   for (const int midi : {36, 48, 60, 72, 84})

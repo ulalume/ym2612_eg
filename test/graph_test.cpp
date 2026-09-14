@@ -989,31 +989,29 @@ CurvePoint vertex_near(const CurveResult &curve, double ms) {
 }
 
 /// Pins that where the key-on decides whether the first decay lands in the
-/// sustain window, both outcomes are drawn: the held line lands in it, and a
-/// second path leaves that line at its knee and goes on past SL.
-void test_a_key_on_that_decides_the_sustain_window_draws_both() {
+/// sustain window, the held line is a key-on that lands: it stops at SL, and
+/// the warning says how often a note does not.
+void test_a_key_on_that_decides_the_sustain_window_lands_in_it() {
   // DR28 KS0 at middle C is DR rate 58, whose 4x steps alternate 16 and 32.
   const OperatorParams split = ssg_patch(1, 31, 28, 4, 0, 15, 0);
   const int window = sustain_attenuation(4) >> 4;
   const EnvelopeCurve c = build_envelope_curve(split, kMiddleC);
   CHECK(c.sl_skip_probability == 0.5);
+  CHECK(c.warning == "SL skipped on 50% of notes");
   CHECK(c.decay_end_ms > 0.0);
-  CHECK(c.held_skip.size() >= 3);
-  const CurvePoint knee = vertex_near(c.held, c.decay_end_ms);
-  CHECK((knee.att >> 4) == window);
-  CHECK(std::fabs(c.held_skip.front().ms - c.decay_end_ms) < 1e-3);
-  CHECK(c.held_skip.front().out == knee.out);
-  CHECK(c.held_skip.front().att == knee.att);
-  uint16_t highest = 0;
-  for (size_t i = 1; i < c.held_skip.size(); ++i) {
-    CHECK(c.held_skip[i].ms >= c.held_skip[i - 1].ms);
-    CHECK((c.held_skip[i].att >> 4) != window);
-    highest = std::max(highest, c.held_skip[i].att);
+  CHECK((vertex_near(c.held, c.decay_end_ms).att >> 4) == window);
+  // SR = 0: from the knee on, the line holds in the window.
+  size_t held_at_sl = 0;
+  for (const CurvePoint &p : c.held.points) {
+    if (p.ms >= c.decay_end_ms) {
+      CHECK((p.att >> 4) == window);
+      ++held_at_sl;
+    }
   }
-  CHECK(highest >= kSsgFoldAttenuation);
-  CHECK(c.held_skip.back().ms <= c.span_ms);
+  CHECK(held_at_sl > 0);
+  CHECK(!has_marker(c.held, MarkerKind::SsgHold));
 
-  // One line wherever the key-on does not decide it.
+  // p is 0 or 1 wherever the key-on does not decide it, with no SL line.
   struct Fixed {
     int ar, sl;
     double p;
@@ -1022,25 +1020,29 @@ void test_a_key_on_that_decides_the_sustain_window_draws_both() {
     const EnvelopeCurve one =
         build_envelope_curve(ssg_patch(1, f.ar, 28, f.sl, 0, 15, 0), kMiddleC);
     CHECK(one.sl_skip_probability == f.p);
-    CHECK(one.held_skip.empty());
+    CHECK(one.warning.rfind("SL skipped", 0) == std::string::npos);
   }
-  CHECK(build_envelope_curve(worked_example(), kMiddleC).held_skip.empty());
+  CHECK(build_envelope_curve(worked_example(), kMiddleC).sl_skip_probability ==
+        0.0);
+
+  // p = 1 needs an attack that walks its row, so the AR < 31 line stays; the
+  // line drawn is the key-on that skips, past SL to the fold and the hold.
+  const EnvelopeCurve skips =
+      build_envelope_curve(ssg_patch(1, 20, 28, 1, 0, 15, 0), kMiddleC);
+  CHECK(skips.warning == "AR<31: non-standard SSG-EG");
+  CHECK(skips.decay_end_ms < 0.0);
+  CHECK(has_marker(skips.held, MarkerKind::SsgHold));
 }
 
-/// Pins that in a repeating SSG-EG mode the second path ends with its first
-/// loop: it climbs from the knee to the fold and stops before the ramp starts
-/// over, which the key-on it comes from goes on to do.
-void test_the_second_path_of_a_loop_stops_at_its_first_fold() {
+/// Pins that in a repeating SSG-EG mode the held line is a key-on that lands:
+/// with SR = 0 it holds at SL, where the key-on that skips, drawn through
+/// CurveRequest::counter_phase, goes on looping.
+void test_a_loop_whose_key_on_decides_the_window_lands_in_it() {
   const OperatorParams loop = ssg_patch(0, 31, 28, 4, 0, 15, 0);
   const EnvelopeCurve c = build_envelope_curve(loop, kMiddleC);
   CHECK(c.sl_skip_probability == 0.5);
-  CHECK(c.held_skip.size() >= 3);
-  for (size_t i = 1; i < c.held_skip.size(); ++i) {
-    CHECK(c.held_skip[i].ms >= c.held_skip[i - 1].ms);
-    CHECK(c.held_skip[i].att >= c.held_skip[i - 1].att);
-  }
-  CHECK(c.held_skip.back().att >= kSsgFoldAttenuation);
-  CHECK(c.held_skip.back().ms <= c.span_ms);
+  CHECK(c.decay_end_ms > 0.0);
+  CHECK(c.ssg_folds.empty());
 
   CurveRequest skip;
   skip.op = loop;
@@ -2363,8 +2365,8 @@ int main() {
   RUN_TEST(test_a_slow_release_is_simulated_to_the_end);
 
   RUN_TEST(test_the_only_other_warning_is_the_non_standard_ssg_attack);
-  RUN_TEST(test_a_key_on_that_decides_the_sustain_window_draws_both);
-  RUN_TEST(test_the_second_path_of_a_loop_stops_at_its_first_fold);
+  RUN_TEST(test_a_key_on_that_decides_the_sustain_window_lands_in_it);
+  RUN_TEST(test_a_loop_whose_key_on_decides_the_window_lands_in_it);
   RUN_TEST(test_the_sl_skip_warning_says_how_often);
   RUN_TEST(test_the_cache_recomputes_only_on_a_real_change);
   RUN_TEST(test_the_throttle_spaces_a_rebuild_by_what_it_cost);

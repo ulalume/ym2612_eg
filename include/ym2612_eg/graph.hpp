@@ -163,47 +163,6 @@ inline double linear_phase_slope(int rate) {
          eg_rate_hz(kNtscClockHz) / 1000.0;
 }
 
-/// The part of `skipped` after its attack that lies past the sustain level,
-/// moved so it crosses SL at `knee_ms`; a repeating SSG-EG mode only as far as
-/// its first fold.
-inline std::vector<CurvePoint> skip_tail(const CurveResult &skipped,
-                                         const OperatorParams &op,
-                                         double knee_ms) {
-  const std::vector<CurvePoint> &points = skipped.points;
-  const double attack_end = first_marker_ms(skipped, MarkerKind::AttackEnd);
-  const int sustain = sustain_attenuation(op.sl);
-  size_t leave = 0;
-  while (leave < points.size() &&
-         (points[leave].ms < attack_end || points[leave].att < sustain)) {
-    ++leave;
-  }
-  if (attack_end < 0.0 || leave == 0 || leave >= points.size()) {
-    return {};
-  }
-  const CurvePoint &below = points[leave - 1];
-  const CurvePoint &above = points[leave];
-  const double rise = static_cast<double>(above.att) - below.att;
-  const double u =
-      rise > 0.0 ? std::clamp((sustain - below.att) / rise, 0.0, 1.0) : 1.0;
-  const double cross = below.ms + (static_cast<double>(above.ms) - below.ms) * u;
-  float end = std::numeric_limits<float>::infinity();
-  if ((op.ssg & 0x01) == 0) {
-    for (const Marker &m : skipped.markers) {
-      if (m.kind == MarkerKind::SsgFold && m.ms >= above.ms) {
-        end = m.ms;
-        break;
-      }
-    }
-  }
-  std::vector<CurvePoint> tail;
-  for (size_t i = leave; i < points.size() && points[i].ms < end; ++i) {
-    CurvePoint p = points[i];
-    p.ms = static_cast<float>(p.ms - cross + knee_ms);
-    tail.push_back(p);
-  }
-  return tail;
-}
-
 } // namespace detail
 
 /// The grid/label interval for a given span: a round number, 3-6 divisions.
@@ -279,16 +238,11 @@ struct EnvelopeCurve {
   /// The fraction of key-on phases whose first decay steps past the sustain
   /// window; strictly between 0 and 1 only where the key-on decides it.
   double sl_skip_probability = 0.0;
-  /// Where it is strictly between 0 and 1, the held envelope of a key-on that
-  /// steps past the window, from the knee on; a loop only to its first fold.
-  std::vector<CurvePoint> held_skip;
-
   std::string warning; ///< empty when there is none
 };
 
 /// One operator's curves at `pitch`: a release from full volume and the held
-/// trace on one time axis, plus the key-on that skips the sustain window where
-/// the key-on decides it. The held trace covers at least `min_span_ms`.
+/// trace on one time axis. The held trace covers at least `min_span_ms`.
 inline EnvelopeCurve build_envelope_curve(const OperatorParams &op,
                                           NotePitch pitch,
                                           double min_span_ms = 0.0) {
@@ -357,26 +311,6 @@ inline EnvelopeCurve build_envelope_curve(const OperatorParams &op,
   }
   out.span_ms = std::max(content, kMinSpanMs);
 
-  // 3b. Where the key-on decides whether the first decay lands in the sustain
-  //     window, the key-on that steps past it, simulated from the first phase
-  //     that does and drawn on from the main line's knee.
-  out.sl_skip_probability = sl_skip_probability(op, pitch);
-  double knee_ms = 0.0;
-  if (out.sl_skip_probability > 0.0 && out.sl_skip_probability < 1.0) {
-    CurveRequest skip;
-    skip.op = op;
-    skip.pitch = pitch;
-    skip.max_ms = kMaxSpanMs;
-    skip.counter_phase =
-        ym2612_eg::detail::curve_counter_phase(op, pitch, true);
-    knee_ms = phase_durations(op, pitch).sustain_start_ms();
-    out.held_skip = detail::skip_tail(sample_curve(skip), op, knee_ms);
-    if (!out.held_skip.empty()) {
-      out.span_ms =
-          std::max(out.span_ms, static_cast<double>(out.held_skip.back().ms));
-    }
-  }
-
   // 4. The held trace, simulated across the WHOLE axis rather than only as far
   //    as the window policy asked for. Still no key-off, so SR = 0 holds flat
   //    and SR > 0 shows its real decay. gate_ms < 0 means more to
@@ -435,23 +369,7 @@ inline EnvelopeCurve build_envelope_curve(const OperatorParams &op,
       std::min(sustain_attenuation(op.sl) + tl_att,
                static_cast<int>(kMaxAttenuation)));
 
-  // The skipping key-on leaves the main line at its knee, from the held
-  // trace's vertex there.
-  if (!out.held_skip.empty() && !out.held.points.empty()) {
-    const float knee = static_cast<float>(knee_ms);
-    const std::vector<CurvePoint> &held = out.held.points;
-    auto at = std::lower_bound(
-        held.begin(), held.end(), knee,
-        [](const CurvePoint &p, float ms) { return p.ms < ms; });
-    if (at != held.begin() &&
-        (at == held.end() || knee - (at - 1)->ms <= at->ms - knee)) {
-      --at;
-    }
-    CurvePoint start = *at;
-    start.ms = knee;
-    out.held_skip.insert(out.held_skip.begin(), start);
-  }
-
+  out.sl_skip_probability = sl_skip_probability(op, pitch);
   out.warning = warning_line(out.held, out.sl_skip_probability);
   return out;
 }
