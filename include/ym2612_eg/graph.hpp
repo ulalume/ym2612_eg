@@ -388,11 +388,9 @@ struct TraceVertex {
   double out = 0.0;
 };
 
-/// `trace` as the graph draws it, written into `path`: entered at `from_ms` on
-/// the trace, slid `shift_ms` along the axis, and ended at `limit_ms` on the
-/// axis or at `span_ms`, whichever is first. Past its last point the trace
-/// goes on along `tail_slope` until it meets the top or bottom of the scale.
-/// An edge that crosses either end is cut there.
+/// `trace` as drawn, into `path`: from `from_ms` on the trace, shifted by
+/// `shift_ms`, to min(`limit_ms`, `span_ms`) on the axis. Past its last point
+/// it follows `tail_slope` to the top or bottom; edges past either end are cut.
 inline void build_trace_path(
     std::vector<TraceVertex> &path, const CurveResult &trace, double tail_slope,
     double span_ms, double from_ms = 0.0,
