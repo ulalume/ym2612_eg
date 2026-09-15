@@ -30,7 +30,7 @@ const VoiceCursor v = cursor_for_voice(c, since_key_on_ms, since_key_off_ms, c.s
 include(FetchContent)
 FetchContent_Declare(ym2612_eg
   GIT_REPOSITORY https://github.com/ulalume/ym2612_eg.git
-  GIT_TAG v0.7.0)
+  GIT_TAG v0.7.1)
 FetchContent_MakeAvailable(ym2612_eg)
 target_link_libraries(your_target PRIVATE ym2612_eg)
 ```

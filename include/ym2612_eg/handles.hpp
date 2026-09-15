@@ -12,6 +12,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <optional>
 
 namespace ym2612_eg::graph {
 
@@ -21,17 +22,15 @@ struct Point {
   float y = 0.0f;
 };
 
-/// Attenuation at the bottom of the graph; 0 (full volume) is at the top.
-inline constexpr double kFullScale = static_cast<double>(kMaxAttenuation);
-
 /// A handle is named for the part of the envelope it is grabbed by, and
-/// stands for the one or two parameters that part is made of.
+/// stands for the one or two parameters that part is made of. The values are
+/// fixed, so a handle can be passed on as an integer.
 enum HandleIndex {
-  kAttackHandle = 0, ///< AttackRate across, TotalLevel down
-  kDecayHandle,      ///< DecayRate across, SustainLevel down
-  kSustainHandle,    ///< SustainRate down
-  kReleaseHandle,    ///< ReleaseRate across
-  kHandleCount,
+  kAttackHandle = 0,  ///< AttackRate across, TotalLevel down
+  kDecayHandle = 1,   ///< DecayRate across, SustainLevel down
+  kSustainHandle = 2, ///< SustainRate down
+  kReleaseHandle = 3, ///< ReleaseRate across
+  kHandleCount = 4,
 };
 
 /// The plot in pixels against the units the curve is drawn in: milliseconds
@@ -304,14 +303,38 @@ inline double dragged_out(const PlotArea &plot, double grabbed_out,
 
 // ------------------------------------------------ from a drag to a register
 
+/// The values are fixed, so a write can be passed on as an integer.
 enum class HandleField : uint8_t {
-  AttackRate,
-  DecayRate,
-  SustainLevel,
-  SustainRate,
-  ReleaseRate,
-  TotalLevel,
+  AttackRate = 0,
+  DecayRate = 1,
+  SustainLevel = 2,
+  SustainRate = 3,
+  ReleaseRate = 4,
+  TotalLevel = 5,
 };
+
+/// The registers a handle sets: `across` by moving along the time axis and
+/// `down` by moving up and down. The sustain and release handles set their
+/// one rate from an angle, under the axis their dot moves along.
+struct HandleFields {
+  std::optional<HandleField> across;
+  std::optional<HandleField> down;
+};
+
+inline HandleFields handle_fields(HandleIndex handle) {
+  switch (handle) {
+  case kAttackHandle:
+    return {HandleField::AttackRate, HandleField::TotalLevel};
+  case kDecayHandle:
+    return {HandleField::DecayRate, HandleField::SustainLevel};
+  case kSustainHandle:
+    return {std::nullopt, HandleField::SustainRate};
+  case kReleaseHandle:
+    return {HandleField::ReleaseRate, std::nullopt};
+  default:
+    return {};
+  }
+}
 
 struct HandleWrite {
   HandleField field;

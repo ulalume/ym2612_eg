@@ -28,6 +28,9 @@
 
 namespace ym2612_eg::graph {
 
+/// Attenuation at the bottom of the graph; 0 (full volume) is at the top.
+inline constexpr double kFullScale = static_cast<double>(kMaxAttenuation);
+
 /// How wide the time axis may get, in ms: kMinSpanMs is the narrowest axis
 /// worth drawing whatever the content says, kMinHeldMs the narrowest a loop is
 /// given, kMaxHeldMs the widest an envelope that finishes is drawn at.
@@ -51,6 +54,8 @@ inline constexpr double kSsgSpanBudget = 2.0;
 /// How long a release is simulated for. RR = 0 never reaches silence at all,
 /// so there has to be a ceiling.
 inline constexpr double kMaxReleaseMs = 10000.0;
+/// How long a voice takes to fade from the graph once it is silent.
+inline constexpr double kVoiceFadeMs = 400.0;
 
 /// The first marker of `kind` on a trace, in ms, or negative when it has none.
 inline double first_marker_ms(const CurveResult &curve, MarkerKind kind) {
@@ -374,6 +379,143 @@ inline EnvelopeCurve build_envelope_curve(const OperatorParams &op,
   return out;
 }
 
+// ------------------------------------------------------- the drawn traces
+
+/// One vertex of a trace as it is drawn: where on the graph's time axis, in
+/// ms, and the output attenuation there.
+struct TraceVertex {
+  double ms = 0.0;
+  double out = 0.0;
+};
+
+/// `trace` as drawn, into `path`: from `from_ms` on the trace, shifted by
+/// `shift_ms`, to min(`limit_ms`, `span_ms`) on the axis. Past its last point
+/// it follows `tail_slope` to the top or bottom; edges past either end are cut.
+inline void build_trace_path(
+    std::vector<TraceVertex> &path, const CurveResult &trace, double tail_slope,
+    double span_ms, double from_ms = 0.0,
+    double limit_ms = std::numeric_limits<double>::infinity(),
+    double shift_ms = 0.0) {
+  path.clear();
+  const std::vector<CurvePoint> &points = trace.points;
+  if (points.empty()) {
+    return;
+  }
+  // In the trace's own time until a vertex is written.
+  const double limit = std::min(limit_ms, span_ms) - shift_ms;
+  if (!(limit > from_ms)) {
+    return;
+  }
+
+  // One more edge past the last point, stopped where the slope meets the top
+  // or the bottom of the scale.
+  const CurvePoint &last = points.back();
+  double tail_ms = limit;
+  double tail_out = last.out;
+  bool has_tail = last.ms < limit;
+  if (has_tail && tail_slope > 0.0) {
+    tail_ms = std::min(tail_ms, last.ms + (kFullScale - last.out) / tail_slope);
+  } else if (has_tail && tail_slope < 0.0) {
+    tail_ms = std::min(tail_ms, last.ms + (0.0 - last.out) / tail_slope);
+  }
+  if (has_tail) {
+    tail_out = std::clamp(last.out + tail_slope * (tail_ms - last.ms), 0.0,
+                          kFullScale);
+    has_tail = tail_ms > last.ms;
+  }
+
+  const std::size_t edges = points.size() - 1 + (has_tail ? 1 : 0);
+  path.reserve(edges + 1);
+  for (std::size_t i = 0; i < edges; ++i) {
+    double ms0 = points[i].ms;
+    double out0 = points[i].out;
+    double ms1 = tail_ms;
+    double out1 = tail_out;
+    if (i + 1 < points.size()) {
+      ms1 = points[i + 1].ms;
+      out1 = points[i + 1].out;
+    }
+    if (ms1 <= from_ms) {
+      continue;
+    }
+    if (ms0 >= limit) {
+      break;
+    }
+    if (ms0 < from_ms) {
+      const double dt = ms1 - ms0;
+      const double t = dt > 0.0 ? (from_ms - ms0) / dt : 0.0;
+      out0 = out0 + (out1 - out0) * t;
+      ms0 = from_ms;
+    }
+    if (ms1 > limit) {
+      const double dt = ms1 - ms0;
+      const double t = dt > 0.0 ? (limit - ms0) / dt : 0.0;
+      out1 = out0 + (out1 - out0) * t;
+      ms1 = limit;
+    }
+    if (path.empty()) {
+      path.push_back(TraceVertex{ms0 + shift_ms, out0});
+    }
+    path.push_back(TraceVertex{ms1 + shift_ms, out1});
+    if (ms1 >= limit) {
+      break;
+    }
+  }
+}
+
+/// Which register's phase the held trace is in at `ms`. A phase that never
+/// ends runs on, and with no key-off on the trace the sustain owns everything
+/// past the decay.
+inline EgPhase held_phase_at(const EnvelopeCurve &curve, double ms) {
+  constexpr double kNever = std::numeric_limits<double>::infinity();
+  const double attack_end =
+      curve.attack_end_ms >= 0.0 ? curve.attack_end_ms : kNever;
+  const double decay_end = std::max(
+      curve.decay_end_ms >= 0.0 ? curve.decay_end_ms : kNever, attack_end);
+  if (ms < attack_end) {
+    return EgPhase::Attack;
+  }
+  if (ms < decay_end) {
+    return EgPhase::Decay;
+  }
+  return EgPhase::Sustain;
+}
+
+/// A stretch of the held line one phase owns: `count` vertices from `first`,
+/// the last of them shared with the next run.
+struct PhaseRun {
+  EgPhase phase = EgPhase::Attack;
+  std::size_t first = 0;
+  std::size_t count = 0;
+};
+
+struct PhaseRuns {
+  std::array<PhaseRun, 3> items{};
+  int count = 0;
+};
+
+/// The held trace's `path`, built with no shift, cut where it changes phase:
+/// each edge belongs to the phase at the vertex it starts from.
+inline PhaseRuns held_phase_runs(const EnvelopeCurve &curve,
+                                 const std::vector<TraceVertex> &path) {
+  PhaseRuns runs;
+  const std::size_t edges = path.size() < 2 ? 0 : path.size() - 1;
+  std::size_t start = 0;
+  while (start < edges) {
+    const EgPhase phase = held_phase_at(curve, path[start].ms);
+    std::size_t end = start + 1;
+    // An edge never goes back to an earlier phase, so there are three runs at
+    // most.
+    while (end < edges && held_phase_at(curve, path[end].ms) <= phase) {
+      ++end;
+    }
+    runs.items[static_cast<std::size_t>(runs.count++)] =
+        PhaseRun{phase, start, end - start + 1};
+    start = end;
+  }
+  return runs;
+}
+
 // ------------------------------------------------------- the live cursor
 
 /// The polyline's internal attenuation at `ms`, linearly interpolated and
@@ -587,6 +729,39 @@ inline VoiceCursor cursor_for_voice(const EnvelopeCurve &curve,
   cursor.held_to_ms =
       std::clamp(cursor.held_to_ms, 0.0, std::max(axis_span_ms, 0.0));
   return cursor;
+}
+
+/// How much of a voice a graph still shows.
+struct VoiceVisibility {
+  /// 1 while the voice can be heard, falling to 0 over the fade time once it
+  /// is silent.
+  double fade = 1.0;
+  /// Released and silent for the whole fade time: nothing of it shows again.
+  bool finished = false;
+  /// The cursor is on the axis. Past the right-hand edge only the cursor
+  /// goes; the voice's curve and release stay until it has faded.
+  bool cursor_on_axis = false;
+};
+
+/// `span_ms` is the axis actually drawn, which need not be the curve's own.
+inline VoiceVisibility voice_visibility(const VoiceCursor &cursor,
+                                        double span_ms,
+                                        double fade_ms = kVoiceFadeMs) {
+  VoiceVisibility out;
+  const double silent = cursor.silent_for_ms;
+  out.fade =
+      silent > 0.0 ? std::clamp(1.0 - silent / fade_ms, 0.0, 1.0) : 1.0;
+  out.finished = cursor.released && silent > 0.0 && silent >= fade_ms;
+  out.cursor_on_axis = cursor.ms >= 0.0 && cursor.ms <= span_ms;
+  return out;
+}
+
+/// Whether a voice let go `since_key_off_ms` ago (negative while held) has
+/// nothing left on any graph: a release is simulated for release_max_ms() at
+/// most, and its fade is over `fade_ms` after that.
+inline bool voice_expired(double since_key_off_ms,
+                          double fade_ms = kVoiceFadeMs) {
+  return since_key_off_ms > release_max_ms() + fade_ms;
 }
 
 /// The curves of the notes being played, keyed on (registers, ksv) rather
