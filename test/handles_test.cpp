@@ -47,7 +47,7 @@ PlotArea plot_over(const EnvelopeCurve &curve) {
 HandleMetrics metrics() { return HandleMetrics{}; }
 
 EnvelopeHandles layout_of(const EnvelopeCurve &curve) {
-  return handle_layout(curve, plot_over(curve), false, metrics());
+  return handle_layout(curve, plot_over(curve), metrics());
 }
 
 bool near_abs(double a, double b, double tolerance) {
@@ -190,7 +190,7 @@ void test_the_whole_dot_stays_inside_the_plot() {
   const EnvelopeCurve curve = curve_of(worked_example());
   const PlotArea plot = plot_over(curve);
   const HandleMetrics sizes = metrics();
-  const EnvelopeHandles handles = handle_layout(curve, plot, false, sizes);
+  const EnvelopeHandles handles = handle_layout(curve, plot, sizes);
 
   for (int i = 0; i < kHandleCount; ++i) {
     const EnvelopeHandle &handle = handles.items[i];
@@ -204,18 +204,164 @@ void test_the_whole_dot_stays_inside_the_plot() {
   }
 }
 
-// ------------------------------------------------- what is not drawn at all
+// ------------------------------------------------------------------ SSG-EG
 
-void test_ssg_eg_leaves_no_handle_behind() {
-  OperatorParams op = worked_example();
-  op.ssg = 0x08 | 0x04; // enabled, attack
-  const EnvelopeCurve curve = curve_of(op);
-  const EnvelopeHandles handles =
-      handle_layout(curve, plot_over(curve), true, metrics());
-  for (int i = 0; i < kHandleCount; ++i) {
-    CHECK(!handles.items[i].shown);
+/// Fine enough for a drag to name any register value.
+PlotArea fine_plot(double span_ms) {
+  PlotArea plot;
+  plot.min = Point{0.0f, 0.0f};
+  plot.max = Point{4000.0f, 2000.0f};
+  plot.span_ms = span_ms;
+  return plot;
+}
+
+OperatorParams ssg_patch(int mode, int ar, int tl) {
+  OperatorParams op = adsr(ar, 10, 4, 5, 7, tl);
+  op.ssg = static_cast<uint8_t>(0x08 | mode);
+  return op;
+}
+
+void test_every_ssg_dot_stands_on_the_line_it_edits() {
+  for (int mode = 0; mode < 8; ++mode) {
+    for (int ar : {31, 28, 20, 10}) {
+      for (int tl : {0, 8, 33}) {
+        const OperatorParams op = ssg_patch(mode, ar, tl);
+        const EnvelopeCurve curve = curve_of(op);
+        const PlotArea plot = plot_over(curve);
+        const EnvelopeHandles handles = handle_layout(curve, plot, metrics());
+        CHECK(handles.items[kAttackHandle].shown);
+        CHECK(handles.items[kDecayHandle].shown);
+        CHECK(handles.items[kSustainHandle].shown);
+        CHECK(handles.items[kReleaseHandle].shown);
+        for (const HandleIndex index :
+             {kAttackHandle, kDecayHandle, kSustainHandle}) {
+          const EnvelopeHandle &handle = handles.items[index];
+          const float line =
+              plot.y_of(curve_out_at_ms(curve.held, handle.at_ms));
+          CHECK(near_abs(handle.pos.y, line, metrics().radius + 2.0));
+          // On the first ramp.
+          CHECK(handle.at_ms <= curve.ramp_end_ms + 1.0 || handle.parked);
+        }
+        const EnvelopeHandle &release = handles.items[kReleaseHandle];
+        // Just before the cut.
+        CHECK(near_abs(
+            release.pos.y,
+            plot.y_of(curve_out_at_ms(curve.release, release.at_ms - 0.1)),
+            metrics().radius + 2.0));
+      }
+    }
   }
 }
+
+void test_a_ramp_with_no_sustain_ends_in_its_decay() {
+  OperatorParams op = ssg_patch(2, 31, 8);
+  op.sl = 15;
+  const EnvelopeCurve curve = curve_of(op);
+  CHECK(curve.decay_end_ms < 0.0);
+  const EnvelopeHandles handles = layout_of(curve);
+  CHECK(!handles.items[kSustainHandle].shown);
+  const EnvelopeHandle &decay = handles.items[kDecayHandle];
+  CHECK(decay.shown);
+  CHECK(!decay.parked);
+  CHECK(near_abs(decay.at_ms, curve.ramp_end_ms, 1e-9));
+  CHECK(near_abs(decay.out, curve.ramp_end_out, 1e-9));
+}
+
+void test_an_attack_past_the_axis_waits_at_its_edge() {
+  const OperatorParams op = ssg_patch(0, 6, 8);
+  const EnvelopeCurve curve = curve_of(op);
+  PlotArea plot = plot_over(curve);
+  plot.span_ms = curve.attack_ms * 0.25;
+  const EnvelopeHandles handles = handle_layout(curve, plot, metrics());
+  const EnvelopeHandle &attack = handles.items[kAttackHandle];
+  CHECK(attack.shown);
+  CHECK(attack.parked);
+  CHECK(near_abs(attack.at_ms, plot.span_ms, 1e-9));
+  CHECK(near_abs(attack.ms, curve.attack_ms, 1e-9));
+}
+
+void test_a_knee_pulled_onto_an_ssg_peak_keeps_the_loop_running() {
+  const OperatorParams op = ssg_patch(0, 31, 8);
+  const EnvelopeCurve curve = curve_of(op);
+  const PlotArea plot = fine_plot(curve.span_ms);
+  const EnvelopeHandles handles = handle_layout(curve, plot, metrics());
+  const HandleGrab grab = grab_handle(handles, kDecayHandle);
+  const HandleEdit edit =
+      drag_handle(grab, op, kMiddleC, Point{0.0f, -2000.0f});
+  CHECK(edit.count == 1);
+  CHECK(edit.writes[0].field == HandleField::SustainLevel);
+  CHECK(edit.writes[0].value == 0);
+}
+
+/// The drag from `from`'s dot to `to`'s.
+Point moved_to(const EnvelopeHandles &from, const EnvelopeHandles &to,
+               HandleIndex index) {
+  const Point a = from.plot.at(from.items[index].at_ms, from.items[index].out);
+  const Point b = to.plot.at(to.items[index].at_ms, to.items[index].out);
+  return Point{b.x - a.x, b.y - a.y};
+}
+
+/// A drag to another value's dot asks for that value, in every mode.
+void test_a_drag_to_another_values_dot_asks_for_that_value() {
+  for (int mode = 0; mode < 8; ++mode) {
+    // AR stays below 31: from 31 an alternate mode flips.
+    const OperatorParams op = ssg_patch(mode, 22, 8);
+    const auto layout_for = [&](const OperatorParams &patch, double span) {
+      return handle_layout(curve_of(patch), fine_plot(span), metrics());
+    };
+    const double span = curve_of(op).span_ms * 2.0;
+    const EnvelopeHandles from = layout_for(op, span);
+
+    const auto check_value = [&](HandleIndex index, HandleField field,
+                                 const OperatorParams &target, int value) {
+      const EnvelopeHandles to = layout_for(target, span);
+      const HandleEdit edit = drag_handle(grab_handle(from, index), op, kMiddleC,
+                                          moved_to(from, to, index));
+      bool found = false;
+      for (int i = 0; i < edit.count; ++i) {
+        const HandleWrite write = edit.writes[static_cast<std::size_t>(i)];
+        if (write.field == field) {
+          found = true;
+          CHECK(write.value == value);
+        }
+      }
+      CHECK(found);
+    };
+
+    OperatorParams target = op;
+    target.ar = 20;
+    check_value(kAttackHandle, HandleField::AttackRate, target, 20);
+    target = op;
+    target.tl = 20;
+    check_value(kAttackHandle, HandleField::TotalLevel, target, 20);
+    target = op;
+    target.dr = 12;
+    check_value(kDecayHandle, HandleField::DecayRate, target, 12);
+    target = op;
+    target.sl = 7;
+    check_value(kDecayHandle, HandleField::SustainLevel, target, 7);
+    target = op;
+    target.rr = 9;
+    check_value(kReleaseHandle, HandleField::ReleaseRate, target, 9);
+
+    // The level the line reaches under the dot, with SR 6 still on its first
+    // ramp there.
+    target = op;
+    target.sr = 6;
+    const EnvelopeCurve tilted = curve_of(target);
+    const EnvelopeHandle &dot = from.items[kSustainHandle];
+    const Point moved{
+        0.0f, from.plot.y_of(curve_out_at_ms(tilted.held, dot.at_ms)) -
+                  from.plot.y_of(dot.out)};
+    const HandleEdit edit =
+        drag_handle(grab_handle(from, kSustainHandle), op, kMiddleC, moved);
+    CHECK(edit.count == 1);
+    CHECK(edit.writes[0].field == HandleField::SustainRate);
+    CHECK(edit.writes[0].value == 6);
+  }
+}
+
+// ------------------------------------------------- what is not drawn at all
 
 void test_the_release_dot_stands_where_the_release_reaches_the_floor() {
   // TL lifts the whole envelope, so the output saturates while the release
@@ -659,7 +805,12 @@ int main() {
   RUN_TEST(test_the_release_dot_stands_where_the_release_reaches_the_floor);
   RUN_TEST(test_a_line_handle_carries_the_end_it_is_pinned_at);
 
-  RUN_TEST(test_ssg_eg_leaves_no_handle_behind);
+  RUN_TEST(test_every_ssg_dot_stands_on_the_line_it_edits);
+  RUN_TEST(test_a_ramp_with_no_sustain_ends_in_its_decay);
+  RUN_TEST(test_an_attack_past_the_axis_waits_at_its_edge);
+  RUN_TEST(test_a_knee_pulled_onto_an_ssg_peak_keeps_the_loop_running);
+  RUN_TEST(test_a_drag_to_another_values_dot_asks_for_that_value);
+
   RUN_TEST(test_the_knee_stands_clear_of_the_peak_when_it_has_nowhere_to_be);
   RUN_TEST(test_a_parked_handle_says_so);
   RUN_TEST(test_the_pointer_answers_the_handle_it_is_nearest);

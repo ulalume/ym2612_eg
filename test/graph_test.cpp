@@ -253,6 +253,163 @@ void test_an_ssg_loop_shows_a_few_periods() {
   CHECK(periods <= 4.0);
 }
 
+/// A loop's axis holds the first ramp and a second fold.
+void test_a_loop_axis_shows_the_first_ramp_and_a_second_fold() {
+  for (int mode : {0, 2, 4, 6}) {
+    for (int ar : {31, 20}) {
+      for (int rate : {3, 8, 14, 22, 31}) {
+        OperatorParams op;
+        op.ar = static_cast<uint8_t>(ar);
+        op.dr = static_cast<uint8_t>(rate);
+        op.sl = 4;
+        op.sr = static_cast<uint8_t>(rate);
+        op.rr = 15;
+        op.ssg = ssg_bits(mode);
+        const EnvelopeCurve curve = build_envelope_curve(op, kMiddleC);
+        const double ramp = ssg_loop_period_ms(op, kMiddleC) /
+                            ((op.ssg & 0x02) != 0 ? 2.0 : 1.0);
+        const double window = curve.ramp_end_ms + kSsgRampsPastFold * ramp;
+        CHECK(curve.ramp_end_ms > 0.0);
+        if (window > kMaxHeldMs || curve.release_content_ms > window) {
+          continue;
+        }
+        CHECK(near_rel(curve.span_ms, window, 1e-9));
+        int folds = 0;
+        for (const float fold : curve.ssg_folds) {
+          folds += fold > curve.attack_end_ms && fold <= curve.span_ms ? 1 : 0;
+        }
+        CHECK(folds >= 2);
+        CHECK(curve.held.loop_hz > 0.0);
+      }
+    }
+  }
+}
+
+/// A release widens a loop's axis to twice its width at most.
+void test_a_release_widens_a_loop_axis_only_so_far() {
+  OperatorParams op;
+  op.ar = 31;
+  op.dr = 25;
+  op.sl = 4;
+  op.sr = 25;
+  op.ssg = ssg_bits(0);
+  op.rr = 15;
+  const EnvelopeCurve shortest = build_envelope_curve(op, kMiddleC);
+  const double ramp = ssg_loop_period_ms(op, kMiddleC);
+  const double window = shortest.ramp_end_ms + kSsgRampsPastFold * ramp;
+  CHECK(near_rel(shortest.span_ms, window, 1e-9));
+
+  op.rr = 0;
+  const EnvelopeCurve longest = build_envelope_curve(op, kMiddleC);
+  CHECK(longest.release_content_ms > window * kSsgSpanBudget);
+  CHECK(near_rel(longest.span_ms, window * kSsgSpanBudget, 1e-9));
+}
+
+/// A cached loop is simulated across a wider axis; other traces are not.
+void test_a_held_axis_is_simulated_across() {
+  EnvelopeCurveCache cache;
+  OperatorParams loop;
+  loop.ar = 31;
+  loop.dr = 20;
+  loop.sl = 4;
+  loop.sr = 20;
+  loop.rr = 15;
+  loop.ssg = ssg_bits(0);
+  const double own = cache.get(loop, kMiddleC).simulated_ms;
+  CHECK(cache.rebuild_count() == 1);
+  const double wider = own * 4.0;
+  cache.get(loop, kMiddleC); // settled
+  const EnvelopeCurve &reaching = cache.get(loop, kMiddleC, wider);
+  CHECK(cache.rebuild_count() == 2);
+  CHECK(reaching.simulated_ms >= wider);
+  CHECK(reaching.held.points.back().ms >= wider * 0.99);
+  CHECK(cache.get(loop, kMiddleC, wider * 0.5).simulated_ms >= wider);
+  CHECK(cache.rebuild_count() == 2);
+
+  EnvelopeCurveCache plain;
+  const OperatorParams still = adsr(31, 10, 2, 5, 7, 0);
+  plain.get(still, kMiddleC);
+  plain.get(still, kMiddleC, 19000.0);
+  CHECK(plain.rebuild_count() == 1);
+}
+
+/// A cursor wraps between the folds past the attack.
+void test_a_cursor_wraps_on_the_folds_of_the_ramps() {
+  OperatorParams op;
+  op.ar = 15;
+  op.dr = 20;
+  op.sl = 4;
+  op.sr = 20;
+  op.rr = 15;
+  op.ssg = ssg_bits(2); // alternate
+  const EnvelopeCurve curve = build_envelope_curve(op, kMiddleC, 2000.0);
+  CHECK(!curve.ssg_folds.empty());
+  CHECK(curve.ssg_folds.front() < curve.attack_end_ms);
+  const double wrapped = wrapped_into_loop_ms(curve, 1999.0, curve.span_ms);
+  CHECK(wrapped > curve.attack_end_ms);
+  CHECK(wrapped <= curve.span_ms);
+}
+
+/// The named levels stand on the trace in every mode.
+void test_the_named_levels_stand_on_the_trace() {
+  for (int mode = 0; mode < 8; ++mode) {
+    for (int ar : {31, 28, 20, 10}) {
+      for (int tl : {0, 8, 33}) {
+        OperatorParams op;
+        op.ar = static_cast<uint8_t>(ar);
+        op.dr = 10;
+        op.sl = 4;
+        op.sr = 5;
+        op.rr = 7;
+        op.tl = static_cast<uint8_t>(tl);
+        op.ssg = ssg_bits(mode);
+        const EnvelopeCurve curve = build_envelope_curve(op, kMiddleC);
+        CHECK(curve.ssg);
+        CHECK(std::fabs(curve_out_at_ms(curve.held, curve.attack_end_ms) -
+                        curve.peak_out) <= 8.0);
+        CHECK(std::fabs(curve_out_at_ms(curve.held, curve.decay_end_ms) -
+                        curve.sustain_out) <= 16.0);
+        CHECK(std::fabs(curve_out_at_ms(curve.held, curve.ramp_end_ms) -
+                        curve.ramp_end_out) <= 8.0);
+      }
+    }
+  }
+  // SSG-EG off.
+  const EnvelopeCurve plain = build_envelope_curve(adsr(31, 10, 15, 5, 7, 0), kMiddleC);
+  CHECK(!plain.ssg && !plain.mirrored);
+  CHECK(plain.sustain_out == sustain_attenuation(15));
+  CHECK(plain.ramp_end_ms < 0.0);
+}
+
+/// With SL past the fold, SR has no effect.
+void test_an_ssg_ramp_with_no_sustain_ignores_the_sustain_rate() {
+  for (int mode = 0; mode < 8; ++mode) {
+    OperatorParams op;
+    op.ar = 31;
+    op.dr = 12;
+    op.sl = 15;
+    op.rr = 7;
+    op.ssg = ssg_bits(mode);
+    op.sr = 0;
+    CurveRequest slowest;
+    slowest.op = op;
+    slowest.pitch = kMiddleC;
+    slowest.gate_ms = 400.0;
+    slowest.max_ms = 800.0;
+    const CurveResult base = sample_curve(slowest);
+    for (int sr : {1, 14, 31}) {
+      CurveRequest request = slowest;
+      request.op.sr = static_cast<uint8_t>(sr);
+      const CurveResult other = sample_curve(request);
+      CHECK(other.points.size() == base.points.size());
+      for (std::size_t i = 0;
+           i < base.points.size() && i < other.points.size(); ++i) {
+        CHECK(other.points[i].out == base.points[i].out);
+      }
+    }
+  }
+}
+
 /// Pins that an SSG loop's reported rate is musical (Hz), not the sample rate
 /// a naive per-sample fold count would give for a slow attack.
 void test_a_slow_attack_ssg_loop_reports_a_musical_rate() {
@@ -642,7 +799,7 @@ void test_the_span_does_not_depend_on_where_the_axis_has_been() {
 /// Pins that grid_step_ms() gives 1-6 divisions across every span the width
 /// policy can hand it.
 void test_the_grid_step_divides_the_span_sensibly() {
-  for (double span = kMinSpanMs; span <= kLoopMaxAxisMs; span += 5.0) {
+  for (double span = 1.0; span <= kLoopMaxAxisMs; span += span < 50.0 ? 0.25 : 5.0) {
     const double step = grid_step_ms(span);
     CHECK(step > 0.0);
     CHECK(span / step <= 6.0 || step == 10000.0);
@@ -769,7 +926,7 @@ void test_an_inverted_ssg_release_is_as_long_as_the_upright_one() {
   CHECK(near_rel(up.release_content_ms, 229.8, 0.02));
   CHECK(near_rel(inv.release_content_ms, up.release_content_ms, 0.01));
   CHECK(inv.release_content_ms > 100.0);
-  CHECK(inv.release.points.front().out == inv.peak_out + 1);
+  CHECK(inv.release.points.front().out == up.peak_out + 1);
   CHECK(inv.release.points.back().out == kMaxAttenuation);
   CHECK(!inv.release_truncated);
   double previous_out = -1.0;
@@ -1180,10 +1337,14 @@ void test_an_expensive_curve_is_deferred_while_the_value_moves() {
     drawn_peak = cache.get(op, kMiddleC).peak_out;
   }
   CHECK(cache.rebuild_count() == 20); // frames 0, 3, 6 ... 57
-  CHECK(drawn_peak == 57 * 8);
+  OperatorParams settled = op;
+  settled.tl = 57;
+  CHECK(drawn_peak == build_envelope_curve(settled, kMiddleC).peak_out);
 
   g_clock.now_ms = 60 * kFrameMs;
-  CHECK(cache.get(op, kMiddleC).peak_out == 59 * 8);
+  settled.tl = 59;
+  CHECK(cache.get(op, kMiddleC).peak_out ==
+        build_envelope_curve(settled, kMiddleC).peak_out);
   CHECK(cache.rebuild_count() == 21);
 }
 
@@ -2066,7 +2227,8 @@ double sustain_out(const OperatorParams &op, NotePitch pitch, int sr,
                    double elapsed_ms) {
   OperatorParams probe = op;
   probe.sr = static_cast<uint8_t>(sr);
-  return ym2612_eg::graph::detail::sustain_out_at_ms(probe, pitch, elapsed_ms);
+  return ym2612_eg::graph::detail::sustain_out_at_ms(
+      probe, pitch, elapsed_ms, first_ramp(probe, pitch).mirrored);
 }
 
 /// Where a sustain at `sr` is probed: early in its fall, half way down, and
@@ -2700,6 +2862,12 @@ int main() {
   RUN_TEST(test_an_envelope_longer_than_the_ceiling_is_cut_at_the_ceiling);
   RUN_TEST(test_a_hold_that_never_ends_takes_a_fixed_share);
   RUN_TEST(test_an_ssg_loop_shows_a_few_periods);
+  RUN_TEST(test_a_loop_axis_shows_the_first_ramp_and_a_second_fold);
+  RUN_TEST(test_a_release_widens_a_loop_axis_only_so_far);
+  RUN_TEST(test_a_held_axis_is_simulated_across);
+  RUN_TEST(test_a_cursor_wraps_on_the_folds_of_the_ramps);
+  RUN_TEST(test_the_named_levels_stand_on_the_trace);
+  RUN_TEST(test_an_ssg_ramp_with_no_sustain_ignores_the_sustain_rate);
   RUN_TEST(test_a_slow_attack_ssg_loop_reports_a_musical_rate);
   RUN_TEST(test_the_release_budget_is_its_own);
 
