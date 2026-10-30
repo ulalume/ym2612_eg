@@ -109,9 +109,11 @@ inline double mean_fold_interval(const std::vector<uint64_t> &folds) {
 
 /// A held envelope as sample_curve() steps it: the labels of the samples its
 /// first Attack -> Decay and Decay -> Sustain land on and where the level first
-/// runs out of scale after the attack (-1 for never), and every SSG-EG fold.
+/// runs out of scale after the attack (-1 for never), every SSG-EG fold, and
+/// whether the output was inverted when the attack ended.
 struct HeldRun {
   int64_t attack_end = -1;
+  bool inverted_after_attack = false;
   int64_t decay_end = -1;
   int64_t ramp_end = -1;
   std::vector<uint64_t> folds;
@@ -149,8 +151,10 @@ inline HeldRun run_held(const OperatorParams &op, NotePitch pitch,
     sim.step();
     const uint32_t ev = sim.step_events();
     const int64_t label = static_cast<int64_t>(i) + 1;
-    if ((ev & kEvAttackEnd) && run.attack_end < 0)
+    if ((ev & kEvAttackEnd) && run.attack_end < 0) {
       run.attack_end = label;
+      run.inverted_after_attack = sim.ssg_inverted();
+    }
     if ((ev & kEvDecayEnd) && run.decay_end < 0)
       run.decay_end = label;
     if (run.attack_end >= 0 && run.ramp_end < 0 && sim.attenuation() >= end_att)
@@ -321,6 +325,34 @@ inline PhaseDurations phase_durations(const OperatorParams &op, NotePitch pitch,
   phases.sustain_ms =
       detail::linear_phase_ms(sr, sustain_att, end_att, ssg, eg_hz);
   return phases;
+}
+
+/// An SSG-EG envelope's first ramp.
+struct FirstRamp {
+  /// Where the level reaches 0x200, in ms; negative if it never does.
+  double end_ms = -1.0;
+  /// Drawn upside down. An alternating mode whose attack starts above 0x200 is
+  /// the opposite of what bit 2 says.
+  bool mirrored = false;
+};
+
+/// The defaults for a patch with SSG-EG off.
+inline FirstRamp first_ramp(const OperatorParams &op, NotePitch pitch,
+                            double clock_hz = kNtscClockHz) {
+  FirstRamp ramp;
+  if ((op.ssg & 0x08) == 0) {
+    return ramp;
+  }
+  const detail::HeldRun run =
+      detail::run_held(op, pitch, detail::curve_counter_phase(op, pitch, false),
+                       kMaxAttenuation, 0);
+  ramp.mirrored =
+      run.attack_end >= 0 ? run.inverted_after_attack : (op.ssg & 0x04) != 0;
+  if (run.ramp_end >= 0) {
+    ramp.end_ms =
+        static_cast<double>(run.ramp_end) * 1000.0 / sample_rate_hz(clock_hz);
+  }
+  return ramp;
 }
 
 /// The visible period of an SSG-EG loop at `pitch`, in ms, as sample_curve()

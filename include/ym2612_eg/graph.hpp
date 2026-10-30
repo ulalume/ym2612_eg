@@ -46,8 +46,10 @@ inline constexpr double kMaxSpanMs = 20000.0;
 inline constexpr double kLoopVisiblePeriods = 1.2;
 inline constexpr double kLoopMaxAxisMs = 20000.0;
 
-/// Roughly this many SSG loop periods are drawn.
+/// Roughly this many SSG loop periods are simulated.
 inline constexpr double kSsgLoopPeriods = 3.5;
+/// How many ramps a loop's axis shows past its first fold.
+inline constexpr double kSsgRampsPastFold = 1.2;
 /// How much of a looping graph the release may claim; past this the axis keeps
 /// the loop's scale and the release runs off the right edge instead.
 inline constexpr double kSsgSpanBudget = 2.0;
@@ -99,6 +101,12 @@ inline double window_for_timeline_ms(const PhaseDurations &phases) {
 
 namespace detail {
 
+/// The widest axis for a loop: room for one period, up to kLoopMaxAxisMs.
+inline double loop_axis_ceiling_ms(double period) {
+  return std::min(std::max(kMaxHeldMs, kLoopVisiblePeriods * period),
+                  kLoopMaxAxisMs);
+}
+
 /// choose_held_ms() for an SSG-EG loop period already computed.
 inline double held_ms_for_period(const OperatorParams &op, NotePitch pitch,
                                  double period) {
@@ -106,29 +114,28 @@ inline double held_ms_for_period(const OperatorParams &op, NotePitch pitch,
   // and what the graph has to show is the phase that stalled.
   if (period > 0.0 && std::isfinite(period)) {
     const double held = kSsgLoopPeriods * period;
-    // A loop carries its own time scale, so the periods are the floor; and the
-    // ceiling gives way for a loop too slow to fit one period on it.
-    const double ceiling = std::min(
-        std::max(kMaxHeldMs, kLoopVisiblePeriods * period), kLoopMaxAxisMs);
-    return std::clamp(held, std::min(kMinHeldMs, held), ceiling);
+    // A loop carries its own time scale, so the periods are the floor.
+    return std::clamp(held, std::min(kMinHeldMs, held),
+                      loop_axis_ceiling_ms(period));
   }
   return window_for_timeline_ms(phase_durations(op, pitch));
 }
 
 } // namespace detail
 
-/// How much of the held envelope is worth seeing at `pitch`, in ms: about
+/// How much of the held envelope is worth simulating at `pitch`, in ms: about
 /// kSsgLoopPeriods periods of an SSG loop, or else window_for_timeline_ms() of
-/// its phase durations.  A scale for the axis, not a key-off.
+/// its phase durations, which is also how wide its axis is.  Not a key-off.
 inline double choose_held_ms(const OperatorParams &op, NotePitch pitch) {
   return detail::held_ms_for_period(op, pitch, ssg_loop_period_ms(op, pitch));
 }
 
 namespace detail {
 
-inline constexpr double kGridSteps[] = {5.0,    10.0,   25.0,   50.0,
-                                        100.0,  250.0,  500.0,  1000.0,
-                                        2500.0, 5000.0, 10000.0};
+inline constexpr double kGridSteps[] = {0.5,    1.0,    2.5,    5.0,
+                                        10.0,   25.0,   50.0,   100.0,
+                                        250.0,  500.0,  1000.0, 2500.0,
+                                        5000.0, 10000.0};
 
 /// The Silence marker as a time, or infinity when the trace never gets there.
 inline double silence_or_never(const CurveResult &curve) {
@@ -207,7 +214,9 @@ struct EnvelopeCurve {
 
   /// The width of the time axis the curve was simulated for.
   double span_ms = 0.0;
-  double held_ms = 0.0; ///< the window the axis width was chosen from
+  double held_ms = 0.0; ///< see choose_held_ms()
+  /// How far the held trace was simulated.
+  double simulated_ms = 0.0;
   /// Where the release polyline ends: silence, unless its budget ran out
   /// first. The axis is sized from it.
   double release_content_ms = 0.0;
@@ -235,10 +244,22 @@ struct EnvelopeCurve {
   double decay_end_ms = -1.0;
 
   /// Every instant the held trace folds, in order -- an SSG-EG loop's teeth.
+  /// An attack that starts above the fold level folds at key-on as well.
   std::vector<float> ssg_folds;
 
-  uint16_t peak_out = 0;    ///< output attenuation at full volume (TL * 8)
-  uint16_t sustain_out = 0; ///< output attenuation the decay aims at (SL + TL)
+  bool ssg = false;      ///< SSG-EG is on
+  bool mirrored = false; ///< the first ramp is drawn upside down
+  /// The attack's length.
+  double attack_ms = 0.0;
+  /// Where the first ramp ends: ms, negative if it never does, and level.
+  double ramp_end_ms = -1.0;
+  uint16_t ramp_end_out = 0;
+
+  /// Output attenuation at full volume: TL * 8, plus 0x200 on a mirrored ramp.
+  uint16_t peak_out = 0;
+  /// Output attenuation the decay aims at: SL + TL, stopped at the fold with
+  /// SSG-EG and mirrored with the ramp.
+  uint16_t sustain_out = 0;
 
   /// The fraction of key-on phases whose first decay steps past the sustain
   /// window; strictly between 0 and 1 only where the key-on decides it.
@@ -257,6 +278,7 @@ inline EnvelopeCurve build_envelope_curve(const OperatorParams &op,
   const double period_ms = ssg_loop_period_ms(op, pitch);
   const bool loops = period_ms > 0.0 && std::isfinite(period_ms);
   out.held_ms = detail::held_ms_for_period(op, pitch, period_ms);
+  const FirstRamp first_ramp_of_op = first_ramp(op, pitch);
 
   // 2. The release on its own, keyed on at full volume and released at once,
   //    so it takes the chip's key-off rules: the SSG inversion latch, the 4x
@@ -310,11 +332,17 @@ inline EnvelopeCurve build_envelope_curve(const OperatorParams &op,
   //    loop keeps its own scale, and a release much longer than the held
   //    envelope is allowed to run off the right edge rather than flatten the
   //    part being edited. The width is the content itself, at full precision.
-  double content = std::max(out.held_ms, out.release_content_ms);
-  if (loops && out.held_ms > 0.0) {
-    content = std::min(content, out.held_ms * kSsgSpanBudget);
+  if (loops && first_ramp_of_op.end_ms >= 0.0) {
+    const double ramp_ms = period_ms / ((op.ssg & 0x02) != 0 ? 2.0 : 1.0);
+    const double window =
+        std::min(first_ramp_of_op.end_ms + kSsgRampsPastFold * ramp_ms,
+                 detail::loop_axis_ceiling_ms(period_ms));
+    out.span_ms = std::min(std::max(window, out.release_content_ms),
+                           window * kSsgSpanBudget);
+  } else {
+    out.span_ms =
+        std::max(std::max(out.held_ms, out.release_content_ms), kMinSpanMs);
   }
-  out.span_ms = std::max(content, kMinSpanMs);
 
   // 4. The held trace, simulated across the WHOLE axis rather than only as far
   //    as the window policy asked for. Still no key-off, so SR = 0 holds flat
@@ -329,6 +357,7 @@ inline EnvelopeCurve build_envelope_curve(const OperatorParams &op,
   // simulated across it rather than extrapolated along its last ramp.
   request.max_ms = std::max({out.span_ms, out.held_ms, min_span_ms});
   request.gate_ms = loops ? request.max_ms + 1.0 : -1.0;
+  out.simulated_ms = request.max_ms;
   out.held = sample_curve(request);
   // A finite park is exactly "the trace ended because there was nothing left
   // to draw" -- continue it flat.
@@ -366,13 +395,26 @@ inline EnvelopeCurve build_envelope_curve(const OperatorParams &op,
         ym2612_eg::detail::effective_rate(2 * (op.rr & 0x0F) + 1, ksv));
   }
 
+  out.ssg = ssg;
+  out.mirrored = first_ramp_of_op.mirrored;
+  out.attack_ms = phase_durations(op, pitch).attack_ms;
+
+  // The levels the registers name, in the same output units as the curve.
+  const int fold = static_cast<int>(kSsgFoldAttenuation);
   const int tl_att = static_cast<int>(op.tl) * 8;
-  out.peak_out =
-      static_cast<uint16_t>(std::min(tl_att, static_cast<int>(kMaxAttenuation)));
-  // The level the decay aims at, in the same output units as the curve.
-  out.sustain_out = static_cast<uint16_t>(
-      std::min(sustain_attenuation(op.sl) + tl_att,
-               static_cast<int>(kMaxAttenuation)));
+  const int sustain_att = ssg ? std::min(sustain_attenuation(op.sl), fold)
+                              : sustain_attenuation(op.sl);
+  const auto drawn = [&](int att) {
+    return static_cast<uint16_t>(
+        std::min((out.mirrored ? fold - att : att) + tl_att,
+                 static_cast<int>(kMaxAttenuation)));
+  };
+  out.peak_out = drawn(0);
+  out.sustain_out = drawn(sustain_att);
+  if (ssg) {
+    out.ramp_end_ms = first_ramp_of_op.end_ms;
+    out.ramp_end_out = drawn(fold);
+  }
 
   out.sl_skip_probability = sl_skip_probability(op, pitch);
   out.warning = warning_line(out.held, out.sl_skip_probability);
@@ -638,14 +680,18 @@ inline double wrapped_into_loop_ms(const EnvelopeCurve &curve, double elapsed_ms
       curve.ssg_folds.empty()) {
     return elapsed_ms;
   }
+  // A fold before the attack ends belongs to the key-on.
+  const auto first = std::upper_bound(
+      curve.ssg_folds.begin(), curve.ssg_folds.end(), curve.attack_end_ms,
+      [](double edge, float fold) { return edge < fold; });
   // The folds are in order, so the last one on the axis is a search.
   const auto past_edge = std::upper_bound(
-      curve.ssg_folds.begin(), curve.ssg_folds.end(), axis_span_ms,
+      first, curve.ssg_folds.end(), axis_span_ms,
       [](double edge, float fold) { return edge < fold; });
-  if (past_edge == curve.ssg_folds.begin()) {
+  if (past_edge == first) {
     return elapsed_ms; // not even the first fold is on the axis
   }
-  const double first_fold = curve.ssg_folds.front();
+  const double first_fold = *first;
   const double last_fold = *(past_edge - 1);
   // Two folds bound at least one whole period; one bounds none.
   const double window = last_fold - first_fold;
@@ -947,7 +993,9 @@ inline double steady_now_ms() {
 /// moving, whatever the throttle says.
 class EnvelopeCurveCache {
 public:
-  const EnvelopeCurve &get(const OperatorParams &op, NotePitch pitch);
+  /// `min_span_ms` is the axis being drawn; a loop is simulated across it.
+  const EnvelopeCurve &get(const OperatorParams &op, NotePitch pitch,
+                           double min_span_ms = 0.0);
 
   /// The clock the throttle runs on. A rebuild's cost is the difference
   /// between a read taken when the cache is asked and one taken immediately
@@ -974,7 +1022,8 @@ private:
 };
 
 inline const EnvelopeCurve &EnvelopeCurveCache::get(const OperatorParams &op,
-                                                    NotePitch pitch) {
+                                                    NotePitch pitch,
+                                                    double min_span_ms) {
   const auto same_pitch = [](NotePitch lhs, NotePitch rhs) {
     return lhs.fnum == rhs.fnum && lhs.block == rhs.block;
   };
@@ -988,7 +1037,10 @@ inline const EnvelopeCurve &EnvelopeCurveCache::get(const OperatorParams &op,
   requested_pitch_ = pitch;
   requested_valid_ = true;
 
-  if (valid_ && same_envelope(op, params_) && same_pitch(pitch, pitch_)) {
+  const bool loops = (op.ssg & 0x08) != 0 && (op.ssg & 0x01) == 0;
+  const double need_ms = loops ? min_span_ms : 0.0;
+  if (valid_ && same_envelope(op, params_) && same_pitch(pitch, pitch_) &&
+      need_ms <= curve_.simulated_ms) {
     // The curve on hand is the one being asked for: nothing to decide, and no
     // clock read either. This is every frame the user is not editing.
     return curve_;
@@ -1002,7 +1054,7 @@ inline const EnvelopeCurve &EnvelopeCurveCache::get(const OperatorParams &op,
     return curve_;
   }
 
-  curve_ = build_envelope_curve(op, pitch);
+  curve_ = build_envelope_curve(op, pitch, need_ms);
   params_ = op;
   pitch_ = pitch;
   valid_ = true;
@@ -1071,13 +1123,13 @@ inline double release_ms(const OperatorParams &op, NotePitch pitch) {
 
 /// Where a sustain at `op`'s SR stands `elapsed_ms` after it begins, in the
 /// units the curve is drawn in: attenuation with TL added and the scale run
-/// backwards for an SSG-EG mode that inverts, clamped exactly as the
+/// backwards for a `mirrored` first ramp, clamped exactly as the
 /// simulator's output is. The phase is linear in attenuation, so its whole
 /// length places every instant inside it -- including a rate that never
 /// advances, whose length is infinite and whose level therefore never leaves
 /// the sustain. Past the end the envelope is at rest.
 inline double sustain_out_at_ms(const OperatorParams &op, NotePitch pitch,
-                                double elapsed_ms) {
+                                double elapsed_ms, bool mirrored) {
   const bool ssg = (op.ssg & 0x08) != 0;
   const int end_att =
       static_cast<int>(ssg ? kSsgFoldAttenuation : kCutAttenuation);
@@ -1099,9 +1151,8 @@ inline double sustain_out_at_ms(const OperatorParams &op, NotePitch pitch,
   }
   // Only an SSG-EG envelope inverts, and it never passes the fold, so the
   // simulator's `(0x200 - a) & 0x3FF` cannot wrap and is a subtraction.
-  const double level = (ssg && (op.ssg & 0x04) != 0)
-                           ? static_cast<double>(kSsgFoldAttenuation) - att
-                           : att;
+  const double level =
+      mirrored ? static_cast<double>(kSsgFoldAttenuation) - att : att;
   return std::min(level + static_cast<double>(op.tl & 0x7F) * 8.0,
                   static_cast<double>(kMaxAttenuation));
 }
@@ -1158,13 +1209,14 @@ inline uint8_t solve_sustain_rate(const OperatorParams &op, NotePitch pitch,
       out_attenuation > 0.0
           ? std::min(out_attenuation, static_cast<double>(kMaxAttenuation))
           : 0.0;
+  const bool mirrored = first_ramp(op, pitch).mirrored;
   OperatorParams probe = op;
   int best = 0;
   double best_distance = std::numeric_limits<double>::infinity();
   for (int rate = 0; rate <= 31; ++rate) {
     probe.sr = static_cast<uint8_t>(rate);
-    const double distance =
-        std::fabs(detail::sustain_out_at_ms(probe, pitch, elapsed) - target);
+    const double distance = std::fabs(
+        detail::sustain_out_at_ms(probe, pitch, elapsed, mirrored) - target);
     if (distance < best_distance) {
       best_distance = distance;
       best = rate;
@@ -1198,16 +1250,23 @@ inline uint8_t solve_total_level(double out_attenuation) {
 
 /// The sustain level whose attenuation, TL included, is nearest
 /// `out_attenuation`. The levels are 32 units apart except SL = 15, which is
-/// 0x3E0 rather than 480; ties go to the louder level.
+/// 0x3E0 rather than 480; ties go to the louder level. With SSG-EG the scale
+/// ends at the fold, and `mirrored` runs it backwards.
 inline uint8_t solve_sustain_level(const OperatorParams &op,
-                                   double out_attenuation) {
+                                   double out_attenuation,
+                                   bool mirrored = false) {
   const double tl_att = static_cast<double>(op.tl & 0x7F) * 8.0;
+  const bool ssg = (op.ssg & 0x08) != 0;
+  const double fold = static_cast<double>(kSsgFoldAttenuation);
   int best = 0;
   double best_distance = std::numeric_limits<double>::infinity();
   for (int sl = 0; sl < 16; ++sl) {
+    double att = static_cast<double>(sustain_attenuation(sl));
+    if (ssg) {
+      att = std::min(att, fold);
+    }
     const double distance =
-        std::fabs(static_cast<double>(sustain_attenuation(sl)) + tl_att -
-                  out_attenuation);
+        std::fabs((mirrored ? fold - att : att) + tl_att - out_attenuation);
     if (distance < best_distance) {
       best_distance = distance;
       best = sl;

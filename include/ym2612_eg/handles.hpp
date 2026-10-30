@@ -100,6 +100,9 @@ struct EnvelopeHandle {
   /// does whenever TL lifts the floor, so a millisecond there is worth more
   /// than a millisecond of release.
   double ms_per_drawn = 1.0;
+  /// The level a tilted line is measured to: the floor, or an SSG-EG release's
+  /// fold.
+  double reach_out = kFullScale;
 };
 
 struct EnvelopeHandles {
@@ -123,6 +126,13 @@ inline Point inside(const PlotArea &plot, Point pos, float radius) {
 /// can still be seen falling.
 inline double sustain_probe_ms(const EnvelopeCurve &curve, double span_ms) {
   const double start = std::max(curve.decay_end_ms, 0.0);
+  // An SSG-EG sustain ends with the first ramp.
+  if (curve.ssg) {
+    const double end = curve.ramp_end_ms > start
+                           ? std::min(curve.ramp_end_ms, span_ms)
+                           : span_ms;
+    return start + (end - start) * 0.5;
+  }
   // Half way along the part of the sustain the eye can still see falling. Past
   // the floor the line is flat and every rate lies on top of every other, so a
   // dot there would stand nowhere in particular.
@@ -155,25 +165,16 @@ inline HandleIndex nearest_handle(const EnvelopeHandles &handles, Point pos) {
   return nearest;
 }
 
-inline EnvelopeHandles handle_layout(const EnvelopeCurve &curve,
-                                     const PlotArea &plot, bool ssg_enabled,
-                                     const HandleMetrics &metrics) {
-  EnvelopeHandles out;
-  out.plot = plot;
-  out.metrics = metrics;
-  // An SSG-EG envelope is not four parameters laid end to end: the trace folds,
-  // and no point on it stands for one register.
-  if (ssg_enabled) {
-    return out;
-  }
+namespace detail {
 
-  const double span = plot.span_ms;
-  // `ms` is what the solver is asked about; `at_ms` is where on the axis that
-  // puts the dot. They differ wherever a phase does not start at zero.
-  const auto place = [&](HandleIndex index, double ms, double at_ms,
-                         double out_att, double ms_per_drawn = 1.0,
-                         bool parked = false, double anchor_ms = 0.0,
-                         double anchor_out = 0.0) {
+/// `ms` is what the solver is asked about; `at_ms` is where on the axis that
+/// puts the dot. They differ wherever a phase does not start at zero.
+struct HandlePlacer {
+  EnvelopeHandles &out;
+
+  void operator()(HandleIndex index, double ms, double at_ms, double out_att,
+                  double ms_per_drawn = 1.0, bool parked = false,
+                  double anchor_ms = 0.0, double anchor_out = 0.0) const {
     EnvelopeHandle &handle = out.items[index];
     handle.shown = true;
     handle.ms = ms;
@@ -183,8 +184,106 @@ inline EnvelopeHandles handle_layout(const EnvelopeCurve &curve,
     handle.anchor_out = anchor_out;
     handle.parked = parked;
     handle.ms_per_drawn = ms_per_drawn;
-    handle.pos = detail::inside(plot, plot.at(at_ms, out_att), metrics.radius);
-  };
+    handle.pos =
+        inside(out.plot, out.plot.at(at_ms, out_att), out.metrics.radius);
+  }
+};
+
+/// SSG-EG handles stand on the first ramp. With no sustain, the decay handle
+/// stands at the ramp's end and there is no sustain handle: SR has no effect.
+inline void place_ssg_handles(EnvelopeHandles &out,
+                              const EnvelopeCurve &curve) {
+  const PlotArea &plot = out.plot;
+  const HandleMetrics &metrics = out.metrics;
+  const HandlePlacer place{out};
+  const double span = plot.span_ms;
+  const double attack_end = curve.attack_end_ms;
+
+  // An attack past the axis waits at its edge.
+  if (attack_end > span ||
+      (attack_end < 0.0 && std::isfinite(curve.attack_ms))) {
+    place(kAttackHandle, curve.attack_ms, span,
+          curve_out_at_ms(curve.held, span), 1.0, true);
+  }
+
+  if (attack_end >= 0.0 && attack_end <= span) {
+    place(kAttackHandle, attack_end, attack_end, curve.peak_out);
+
+    const bool has_knee = curve.decay_end_ms >= 0.0;
+    const double knee_ms = has_knee ? curve.decay_end_ms : curve.ramp_end_ms;
+    const bool ends = knee_ms > attack_end;
+    const bool on_axis = ends && knee_ms <= span;
+    const double at_ms = on_axis ? knee_ms : span;
+    const double knee_out = !on_axis    ? curve_out_at_ms(curve.held, span)
+                            : has_knee ? curve.sustain_out
+                                       : curve.ramp_end_out;
+    const Point peak = plot.at(attack_end, curve.peak_out);
+    const Point knee = plot.at(at_ms, knee_out);
+    const bool clear_of_peak = std::abs(knee.x - peak.x) >= metrics.radius ||
+                               std::abs(knee.y - peak.y) >= metrics.radius;
+    if (ends && clear_of_peak) {
+      place(kDecayHandle, at_ms - attack_end, at_ms, knee_out, 1.0, !on_axis,
+            attack_end, curve.peak_out);
+    } else {
+      const double clear_ms =
+          attack_end + (metrics.grab + metrics.radius) * plot.ms_per_px();
+      place(kDecayHandle, clear_ms - attack_end, clear_ms,
+            curve_out_at_ms(curve.held, clear_ms), 1.0, true, attack_end,
+            curve.peak_out);
+    }
+  }
+
+  if (curve.decay_end_ms >= 0.0 && curve.decay_end_ms < span) {
+    const double at_ms =
+        std::max(sustain_probe_ms(curve, span),
+                 curve.decay_end_ms + metrics.grab * plot.ms_per_px());
+    const double ramp_end = curve.ramp_end_ms > curve.decay_end_ms
+                                ? std::min(curve.ramp_end_ms, span)
+                                : span;
+    const float room_x = plot.x_of(ramp_end) - plot.x_of(curve.decay_end_ms);
+    const float room_y =
+        std::abs(plot.y_of(curve.ramp_end_out) - plot.y_of(curve.sustain_out));
+    const bool has_room = room_x >= metrics.min_sustain_width &&
+                          room_y >= metrics.min_sustain_height;
+    place(kSustainHandle, at_ms - curve.decay_end_ms, at_ms,
+          curve_out_at_ms(curve.held, at_ms), 1.0, !has_room,
+          curve.decay_end_ms, curve.sustain_out);
+  }
+
+  // The release runs from full volume to the fold, or the floor if TL puts
+  // that first.
+  if (curve.release_content_ms > 0.0 && !curve.release.points.empty()) {
+    const double from_out = curve.release.points.front().out;
+    const double reach_out = std::max(curve.ramp_end_out, curve.peak_out);
+    const double fall = reach_out - from_out;
+    const double scale =
+        fall > 0.0 ? static_cast<double>(kSsgFoldAttenuation) / fall : 1.0;
+    const double reach_ms = curve.release_content_ms / scale;
+    const bool on_axis = !curve.release_truncated && reach_ms <= span;
+    const double at_ms = on_axis ? reach_ms : span;
+    place(kReleaseHandle, curve.release_content_ms, at_ms,
+          on_axis ? reach_out : curve_out_at_ms(curve.release, at_ms), scale,
+          !on_axis, 0.0, from_out);
+    out.items[kReleaseHandle].reach_out = reach_out;
+  }
+}
+
+} // namespace detail
+
+/// Every handle `curve` can offer on `plot`.
+inline EnvelopeHandles handle_layout(const EnvelopeCurve &curve,
+                                     const PlotArea &plot,
+                                     const HandleMetrics &metrics) {
+  EnvelopeHandles out;
+  out.plot = plot;
+  out.metrics = metrics;
+  if (curve.ssg) {
+    detail::place_ssg_handles(out, curve);
+    return out;
+  }
+
+  const double span = plot.span_ms;
+  const detail::HandlePlacer place{out};
 
   // The peak: TotalLevel is the level it stands at, AttackRate the time it
   // took to get there.
@@ -381,6 +480,7 @@ inline HandleEdit drag_handle(const HandleGrab &grab, const OperatorParams &op,
 
   const EnvelopeHandle &drag = grab.grabbed;
   const PlotArea &plot = grab.plot;
+  const bool ssg = (op.ssg & 0x08) != 0;
   // Where the pointer has got to, in the units the graph is drawn in.
   const double at_ms = dragged_ms(plot, drag.at_ms, moved_px.x);
   const double level = dragged_out(plot, drag.out, moved_px.y);
@@ -400,7 +500,12 @@ inline HandleEdit drag_handle(const HandleGrab &grab, const OperatorParams &op,
                                          drag.ms_per_drawn)));
     }
     if (moved_px.y != 0.0f) {
-      write(HandleField::TotalLevel, solve_total_level(level));
+      // A mirrored peak stands 0x200 below its TL.
+      const bool mirrored = first_ramp(op, pitch).mirrored;
+      write(HandleField::TotalLevel,
+            solve_total_level(
+                mirrored ? level - static_cast<double>(kSsgFoldAttenuation)
+                         : level));
     }
     break;
   case kDecayHandle: {
@@ -408,12 +513,14 @@ inline HandleEdit drag_handle(const HandleGrab &grab, const OperatorParams &op,
     // going, so the rate has to be solved against the level just set.
     OperatorParams aimed = op;
     if (moved_px.y != 0.0f) {
-      const int sustain_level = solve_sustain_level(op, level);
+      const int sustain_level =
+          solve_sustain_level(op, level, first_ramp(op, pitch).mirrored);
       // A knee dragged up onto the peak leaves no decay to describe. The
       // register for that is a decay rate of 0, which never advances: the
       // envelope holds where the attack left it. The sustain level stays one
-      // step below the peak so the knee has somewhere to come back to.
-      if (sustain_level <= 0) {
+      // step below the peak so the knee has somewhere to come back to. With
+      // SSG-EG, SL = 0 is written as it is, since DR = 0 would stop the loop.
+      if (sustain_level <= 0 && !ssg) {
         write(HandleField::SustainLevel, 1);
         write(HandleField::DecayRate, 0);
         return edit;
@@ -447,7 +554,7 @@ inline HandleEdit drag_handle(const HandleGrab &grab, const OperatorParams &op,
       write(HandleField::ReleaseRate, 0);
       break;
     }
-    const double reach = elapsed * (kFullScale - drag.anchor_out) / fall;
+    const double reach = elapsed * (drag.reach_out - drag.anchor_out) / fall;
     write(HandleField::ReleaseRate,
           solve_release_rate(op, pitch, reach * drag.ms_per_drawn));
     break;
