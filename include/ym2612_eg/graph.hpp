@@ -640,13 +640,18 @@ inline double first_time_at_level(const CurveResult &trace, double level,
 /// trace already on screen, entered later -- the first instant the trace
 /// reaches `out` IS where the voice joins it. Takes the trace rather than the
 /// whole curve, so the same question can be put to a release the simulator
-/// really ran.
-inline double release_entry_ms(const CurveResult &release, double out) {
+/// really ran. A level the trace stops short of lies further along
+/// `tail_slope`, past its last point.
+inline double release_entry_ms(const CurveResult &release, double out,
+                               double tail_slope = 0.0) {
   if (release.points.empty()) {
     return 0.0;
   }
-  return first_time_at_level(release, out, release.points.front().ms,
-                             release.points.back().ms);
+  const CurvePoint &last = release.points.back();
+  if (last.out < out && tail_slope > 0.0) {
+    return last.ms + (out - last.out) / tail_slope;
+  }
+  return first_time_at_level(release, out, release.points.front().ms, last.ms);
 }
 
 /// Where a sounding voice is on its own envelope.
@@ -659,8 +664,9 @@ struct VoiceCursor {
   /// How long the voice has been inaudible; 0 while it can still be heard.
   double silent_for_ms = 0.0;
   /// Where on the release trace this voice's release begins -- the point at
-  /// which the drawn release is already at the level the key came up on.
-  /// Negative while the key is still down.
+  /// which the drawn release is already at the level the key came up on, past
+  /// its last point when it stops short of that level. Negative while the key
+  /// is still down.
   double release_from_ms = -1.0;
   /// Where on the graph that release is drawn from: the instant the key came
   /// up, on the held trace's own time axis. Negative while held.
@@ -742,7 +748,8 @@ inline VoiceCursor cursor_for_voice(const EnvelopeCurve &curve,
     const double out = curve_out_at_ms(curve.held, at_key_off_ms);
     // The release from that level is not a new curve: it is the drawn one,
     // entered at the point where it is already at that level.
-    cursor.release_from_ms = release_entry_ms(curve.release, out);
+    cursor.release_from_ms =
+        release_entry_ms(curve.release, out, curve.release_tail_slope);
     cursor.release_origin_ms = at_key_off_ms;
     // The held part stops growing the moment the key comes up, however long
     // the release runs on after it.
@@ -751,11 +758,18 @@ inline VoiceCursor cursor_for_voice(const EnvelopeCurve &curve,
     // carries on from where it is rather than jumping to wherever that level
     // sits on a release that began at full volume.
     on_trace_ms = at_key_off_ms + released_for;
-    // Silence is a property of the release, so it moves with it.
-    silence_ms = std::isfinite(curve.release_silence_ms)
-                     ? at_key_off_ms + curve.release_silence_ms -
+    // Silence is a property of the release, so it moves with it. A release
+    // still falling where its trace stops gets there along the tail.
+    double release_silence_ms = curve.release_silence_ms;
+    if (!std::isfinite(release_silence_ms) && curve.release_truncated &&
+        curve.release_tail_slope > 0.0) {
+      release_silence_ms = release_entry_ms(
+          curve.release, kSilenceAttenuation, curve.release_tail_slope);
+    }
+    silence_ms = std::isfinite(release_silence_ms)
+                     ? at_key_off_ms + release_silence_ms -
                            cursor.release_from_ms
-                     : curve.release_silence_ms;
+                     : release_silence_ms;
   }
 
   if (!cursor.released) {
