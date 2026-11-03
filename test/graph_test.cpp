@@ -1611,6 +1611,52 @@ void test_a_released_cursor_takes_the_parked_level_with_it() {
   CHECK(std::fabs(soon.ms - late.ms) < 1e-9);
 }
 
+/// Pins that a voice let go below the last level the release trace reaches
+/// enters it past its end, along the tail: its release line starts at the
+/// level the key came up on, and its silence lies further along the tail.
+void test_a_release_from_past_the_trace_follows_its_tail() {
+  OperatorParams op;
+  op.ar = 31;
+  op.dr = 11;
+  op.sl = 15;
+  op.sr = 0;
+  op.rr = 1;
+  const EnvelopeCurve curve = build_envelope_curve(op, kMiddleC);
+  CHECK(curve.release_truncated);
+  CHECK(curve.release_tail_slope > 0.0);
+
+  const double key_off = 1280.0;
+  const double out = curve_out_at_ms(curve.held, key_off);
+  CHECK(out > curve.release.points.back().out + 64.0);
+  CHECK(out < kSilenceAttenuation);
+
+  const double released_for = 50.0;
+  const VoiceCursor cursor = cursor_for_voice(
+      curve, key_off + released_for, released_for, curve.span_ms);
+  CHECK(cursor.release_from_ms > curve.release.points.back().ms);
+  std::vector<TraceVertex> path;
+  build_trace_path(path, curve.release, curve.release_tail_slope,
+                   curve.span_ms, cursor.release_from_ms, cursor.ms,
+                   cursor.release_origin_ms - cursor.release_from_ms);
+  CHECK(path.size() >= 2);
+  if (path.size() >= 2) {
+    CHECK(std::fabs(path.front().ms - key_off) < 1e-9);
+    CHECK_ABS(path.front().out, out, 1.0);
+    CHECK(std::fabs(path.back().ms - cursor.ms) < 1e-9);
+    CHECK_ABS(path.back().out, out + curve.release_tail_slope * released_for,
+              1.0);
+  }
+
+  const double to_silence =
+      (kSilenceAttenuation - out) / curve.release_tail_slope;
+  CHECK(cursor_for_voice(curve, key_off + to_silence * 0.5, to_silence * 0.5,
+                         curve.span_ms)
+            .silent_for_ms == 0.0);
+  const VoiceCursor gone = cursor_for_voice(
+      curve, key_off + to_silence + 100.0, to_silence + 100.0, curve.span_ms);
+  CHECK(near_rel(gone.silent_for_ms, 100.0, 0.05));
+}
+
 /// Pins that silent_for_ms is 0 while still falling and starts counting only
 /// once the voice passes the release's silence point.
 void test_a_voice_reports_how_long_it_has_been_silent() {
@@ -2663,6 +2709,14 @@ void test_a_voice_is_drawn_from_where_its_key_came_up_to_its_cursor() {
           CHECK(path.empty());
           continue;
         }
+        // Let go at the bottom of the scale past the end of the trace, it
+        // enters where the tail stops: there is nothing left to draw.
+        if (cursor.release_from_ms > curve.release.points.back().ms &&
+            curve_out_at_ms(curve.held, cursor.release_origin_ms) >=
+                kFullScale) {
+          CHECK(path.empty());
+          continue;
+        }
         CHECK(!path.empty());
         if (path.empty()) {
           continue;
@@ -2919,6 +2973,7 @@ int main() {
   RUN_TEST(test_the_cursor_carries_on_into_the_release);
   RUN_TEST(test_a_release_picks_up_at_the_level_that_was_sounding);
   RUN_TEST(test_a_released_cursor_takes_the_parked_level_with_it);
+  RUN_TEST(test_a_release_from_past_the_trace_follows_its_tail);
   RUN_TEST(test_a_voice_reports_how_long_it_has_been_silent);
   RUN_TEST(test_a_held_loop_cursor_goes_round);
   RUN_TEST(test_a_voice_draws_only_what_it_has_been_through);
