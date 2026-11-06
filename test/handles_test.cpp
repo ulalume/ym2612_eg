@@ -500,15 +500,20 @@ void test_a_release_that_outran_its_budget_says_so() {
   // The release ends at the attenuation the chip cuts the output at, which TL
   // has nothing to do with: a loud patch's trace hits the bottom of the graph
   // long before the envelope behind it is done falling.
+  int truncated = 0;
   for (const int tl : {0, 100}) {
     for (int rr = 0; rr <= 15; ++rr) {
       OperatorParams op = adsr(31, 10, 2, 5, rr, tl);
       const EnvelopeCurve curve = curve_of(op);
-      CHECK(curve.release_truncated == (rr <= 3));
+      const bool outran =
+          ym2612_eg::graph::detail::release_ms(op, kMiddleC) > release_max_ms();
+      CHECK(curve.release_truncated == outran);
       // And the handle on it waits at the edge for exactly as long.
-      CHECK(layout_of(curve).items[kReleaseHandle].parked == (rr <= 3));
+      CHECK(layout_of(curve).items[kReleaseHandle].parked == outran);
+      truncated += outran ? 1 : 0;
     }
   }
+  CHECK(truncated > 0 && truncated < 32);
 }
 
 // ------------------------------------------------------ back to a register

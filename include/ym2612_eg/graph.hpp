@@ -31,18 +31,20 @@ namespace ym2612_eg::graph {
 /// Attenuation at the bottom of the graph; 0 (full volume) is at the top.
 inline constexpr double kFullScale = static_cast<double>(kMaxAttenuation);
 
-/// How wide the time axis may get, in ms: kMinSpanMs is the narrowest axis
-/// worth drawing whatever the content says, kMinHeldMs the narrowest a loop is
-/// given, kMaxHeldMs the widest an envelope that finishes is drawn at.
+/// How wide the time axis may get, in ms. kMinSpanMs is the narrowest axis of
+/// an envelope that does not loop, and kMinHeldMs the narrowest window its held
+/// envelope is given. kMaxSpanMs is the widest axis of all: the held envelope
+/// and the release are both cut there, an attack that outlasts it included.
 inline constexpr double kMinSpanMs = 25.0;
 inline constexpr double kMinHeldMs = 50.0;
-inline constexpr double kMaxHeldMs = 10000.0;
+inline constexpr double kMaxSpanMs = 20000.0;
 /// A sustain that never ends is a flat line; this much of the graph is enough
 /// to say so.
 inline constexpr double kFlatHoldShare = 0.05;
-/// Nothing is drawn wider than this, not even an attack that outlasts it.
-inline constexpr double kMaxSpanMs = 20000.0;
 
+/// The widest axis a loop is given, unless kLoopVisiblePeriods periods of a
+/// slower loop need more, up to kLoopMaxAxisMs.
+inline constexpr double kLoopAxisMs = 10000.0;
 inline constexpr double kLoopVisiblePeriods = 1.2;
 inline constexpr double kLoopMaxAxisMs = 20000.0;
 
@@ -53,9 +55,9 @@ inline constexpr double kSsgRampsPastFold = 1.2;
 /// How much of a looping graph the release may claim; past this the axis keeps
 /// the loop's scale and the release runs off the right edge instead.
 inline constexpr double kSsgSpanBudget = 2.0;
-/// How long a release is simulated for. RR = 0 never reaches silence at all,
-/// so there has to be a ceiling.
-inline constexpr double kMaxReleaseMs = 10000.0;
+/// How long a release is simulated for: as far as the widest axis. RR = 0
+/// never reaches silence at all.
+inline constexpr double kMaxReleaseMs = kMaxSpanMs;
 /// How long a voice takes to fade from the graph once it is silent.
 inline constexpr double kVoiceFadeMs = 400.0;
 
@@ -103,7 +105,7 @@ namespace detail {
 
 /// The widest axis for a loop: room for one period, up to kLoopMaxAxisMs.
 inline double loop_axis_ceiling_ms(double period) {
-  return std::min(std::max(kMaxHeldMs, kLoopVisiblePeriods * period),
+  return std::min(std::max(kLoopAxisMs, kLoopVisiblePeriods * period),
                   kLoopMaxAxisMs);
 }
 
@@ -333,7 +335,7 @@ inline EnvelopeCurve build_envelope_curve(const OperatorParams &op,
   //    envelope is allowed to run off the right edge rather than flatten the
   //    part being edited. The width is the content itself, at full precision.
   if (loops && first_ramp_of_op.end_ms >= 0.0) {
-    const double ramp_ms = period_ms / ((op.ssg & 0x02) != 0 ? 2.0 : 1.0);
+    const double ramp_ms = period_ms / ssg_ramps_per_period(op);
     const double window =
         std::min(first_ramp_of_op.end_ms + kSsgRampsPastFold * ramp_ms,
                  detail::loop_axis_ceiling_ms(period_ms));
@@ -380,7 +382,7 @@ inline EnvelopeCurve build_envelope_curve(const OperatorParams &op,
   // A trace that stops inside a linear phase goes on at that phase's rate. An
   // attack still under way keeps the slope of its last edge, since it is not
   // linear, and so does an SSG-EG trace, which folds.
-  const bool ssg = (op.ssg & 0x08) != 0;
+  const bool ssg = ssg_enabled(op);
   const int ksv = key_scale_value(op, pitch);
   out.held_tail_slope = detail::tail_slope(out.held, out.held_parked);
   if (!out.held_parked && !ssg && out.attack_end_ms >= 0.0) {
@@ -1051,8 +1053,7 @@ inline const EnvelopeCurve &EnvelopeCurveCache::get(const OperatorParams &op,
   requested_pitch_ = pitch;
   requested_valid_ = true;
 
-  const bool loops = (op.ssg & 0x08) != 0 && (op.ssg & 0x01) == 0;
-  const double need_ms = loops ? min_span_ms : 0.0;
+  const double need_ms = ssg_loops(op) ? min_span_ms : 0.0;
   if (valid_ && same_envelope(op, params_) && same_pitch(pitch, pitch_) &&
       need_ms <= curve_.simulated_ms) {
     // The curve on hand is the one being asked for: nothing to decide, and no
@@ -1126,9 +1127,8 @@ uint8_t nearest_rate(int slowest, int fastest, double target_ms,
 /// same length: key-off mirrors the level about the fold, so it climbs the
 /// same distance.
 inline double release_ms(const OperatorParams &op, NotePitch pitch) {
-  const bool ssg = (op.ssg & 0x08) != 0;
-  const int end_att =
-      static_cast<int>(ssg ? kSsgFoldAttenuation : kCutAttenuation);
+  const bool ssg = ssg_enabled(op);
+  const int end_att = phase_end_attenuation(op);
   const int rate = ym2612_eg::detail::effective_rate(
       2 * (op.rr & 0x0F) + 1, key_scale_value(op, pitch));
   return ym2612_eg::detail::linear_phase_ms(rate, 0, end_att, ssg,
@@ -1144,9 +1144,8 @@ inline double release_ms(const OperatorParams &op, NotePitch pitch) {
 /// the sustain. Past the end the envelope is at rest.
 inline double sustain_out_at_ms(const OperatorParams &op, NotePitch pitch,
                                 double elapsed_ms, bool mirrored) {
-  const bool ssg = (op.ssg & 0x08) != 0;
-  const int end_att =
-      static_cast<int>(ssg ? kSsgFoldAttenuation : kCutAttenuation);
+  const bool ssg = ssg_enabled(op);
+  const int end_att = phase_end_attenuation(op);
   const int sustain_att = std::min(sustain_attenuation(op.sl), end_att);
   const int rate = ym2612_eg::detail::effective_rate(
       op.sr & 0x1F, key_scale_value(op, pitch));
@@ -1270,7 +1269,7 @@ inline uint8_t solve_sustain_level(const OperatorParams &op,
                                    double out_attenuation,
                                    bool mirrored = false) {
   const double tl_att = static_cast<double>(op.tl & 0x7F) * 8.0;
-  const bool ssg = (op.ssg & 0x08) != 0;
+  const bool ssg = ssg_enabled(op);
   const double fold = static_cast<double>(kSsgFoldAttenuation);
   int best = 0;
   double best_distance = std::numeric_limits<double>::infinity();

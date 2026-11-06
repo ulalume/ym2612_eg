@@ -187,7 +187,7 @@ void test_an_envelope_longer_than_the_ceiling_is_cut_at_the_ceiling() {
 
   CHECK(timeline.sustain_start_ms() < kMaxSpanMs);
   CHECK(first_marker_ms(simulate_held(op, kMiddleC), MarkerKind::DecayEnd) <
-        kMaxHeldMs);
+        choose_held_ms(op, kMiddleC));
 }
 
 /// Pins that SR = 0 (a hold that never ends) takes a fixed kFlatHoldShare of
@@ -266,11 +266,12 @@ void test_a_loop_axis_shows_the_first_ramp_and_a_second_fold() {
         op.rr = 15;
         op.ssg = ssg_bits(mode);
         const EnvelopeCurve curve = build_envelope_curve(op, kMiddleC);
-        const double ramp = ssg_loop_period_ms(op, kMiddleC) /
-                            ((op.ssg & 0x02) != 0 ? 2.0 : 1.0);
+        const double period = ssg_loop_period_ms(op, kMiddleC);
+        const double ramp = period / ssg_ramps_per_period(op);
         const double window = curve.ramp_end_ms + kSsgRampsPastFold * ramp;
         CHECK(curve.ramp_end_ms > 0.0);
-        if (window > kMaxHeldMs || curve.release_content_ms > window) {
+        // A loop slower than this is simulated for too few folds to measure.
+        if (window > kLoopAxisMs || curve.release_content_ms > window) {
           continue;
         }
         CHECK(near_rel(curve.span_ms, window, 1e-9));
@@ -434,11 +435,10 @@ void test_a_slow_attack_ssg_loop_reports_a_musical_rate() {
   CHECK(periods <= 4.0);
 }
 
-/// Pins that release_max_ms() does not depend on the held envelope's own
-/// registers.
+/// Pins that a release is simulated as far as the widest axis, whatever the
+/// held envelope's own registers are.
 void test_the_release_budget_is_its_own() {
-  CHECK(release_max_ms() >= 4000.0);
-  CHECK(release_max_ms() <= 10000.0);
+  CHECK(release_max_ms() == kMaxSpanMs);
   const double budget = release_max_ms();
   for (const OperatorParams &op :
        {adsr(31, 31, 0, 31, 7, 0), adsr(1, 1, 15, 1, 7, 0), worked_example()}) {
@@ -504,7 +504,6 @@ void test_the_attack_and_decay_are_never_cut() {
   beyond.attack_ms = 30000.0;
   CHECK(beyond.sustain_start_ms() > kMaxSpanMs);
   CHECK(window_for_timeline_ms(beyond) == kMaxSpanMs);
-  CHECK(window_for_timeline_ms(enormous) > kMaxHeldMs);
 
   const OperatorParams slow = adsr(1, 12, 6, 4, 5, 0);
   const PhaseDurations real = phase_durations(slow, kMiddleC);
@@ -564,7 +563,7 @@ void test_every_phase_present_is_at_least_partly_visible() {
           const double window = choose_held_ms(op, kMiddleC);
           if (start >= kMaxSpanMs) {
             CHECK(window == kMaxSpanMs);
-          } else if (start > 0.0 && start < kMaxHeldMs) {
+          } else if (start > 0.0) {
             CHECK(window > start);
           } else {
             CHECK(window >= start);
@@ -761,6 +760,38 @@ void test_the_axis_does_not_jump_between_neighbouring_values() {
 
 // ------------------------------------------------------------------ the axis
 
+/// A long release widens the axis as far as a long sustain does: both stop at
+/// kMaxSpanMs, and a release that ends before it is drawn to its end.
+void test_a_long_release_widens_the_axis_as_far_as_a_long_sustain() {
+  // RR = 1 outlasts the widest axis.
+  OperatorParams endless = adsr(19, 6, 9, 0, 1, 0);
+  endless.tl = 15;
+  const EnvelopeCurve cut = build_envelope_curve(endless, kMiddleC);
+  CHECK(cut.release_truncated);
+  CHECK(near_rel(cut.release_content_ms, kMaxSpanMs, 0.001));
+  CHECK(near_rel(cut.span_ms, kMaxSpanMs, 0.001));
+
+  // SR = 1 does too, and stops at the same place.
+  const EnvelopeCurve held = build_envelope_curve(adsr(19, 6, 9, 1, 15, 0), kMiddleC);
+  CHECK(held.span_ms == kMaxSpanMs);
+
+  // A release between half the widest axis and all of it is drawn whole.
+  bool found = false;
+  for (int rr = 0; rr < 16 && !found; ++rr) {
+    const OperatorParams op = adsr(31, 31, 0, 31, rr, 0);
+    const double length = ym2612_eg::graph::detail::release_ms(op, kMiddleC);
+    if (length <= kMaxSpanMs * 0.5 || length >= kMaxSpanMs * 0.95) {
+      continue;
+    }
+    found = true;
+    const EnvelopeCurve curve = build_envelope_curve(op, kMiddleC);
+    CHECK(!curve.release_truncated);
+    CHECK(curve.span_ms == curve.release_content_ms);
+    CHECK(curve.span_ms > kMaxSpanMs * 0.5);
+  }
+  CHECK(found);
+}
+
 /// Pins that the span is simply the content it has to hold (held window and
 /// release), at full precision -- not rounded onto a ladder of round numbers.
 void test_the_span_is_the_content_it_has_to_hold() {
@@ -771,9 +802,8 @@ void test_the_span_is_the_content_it_has_to_hold() {
   };
   for (const auto &op : patches) {
     const EnvelopeCurve curve = build_envelope_curve(op, kMiddleC);
-    CHECK(curve.span_ms >= curve.held_ms || curve.span_ms == kMaxHeldMs);
-    CHECK(curve.span_ms >= curve.release_content_ms ||
-          curve.span_ms >= curve.held_ms * 3.9);
+    CHECK(curve.span_ms >= curve.held_ms);
+    CHECK(curve.span_ms >= curve.release_content_ms);
     CHECK(curve.span_ms >= kMinSpanMs);
   }
 }
@@ -1620,7 +1650,7 @@ void test_a_release_from_past_the_trace_follows_its_tail() {
   op.dr = 11;
   op.sl = 15;
   op.sr = 0;
-  op.rr = 1;
+  op.rr = 0;
   const EnvelopeCurve curve = build_envelope_curve(op, kMiddleC);
   CHECK(curve.release_truncated);
   CHECK(curve.release_tail_slope > 0.0);
@@ -2472,10 +2502,10 @@ double drawn_slope(const CurveResult &trace, double from_ms) {
 }
 
 void test_a_release_past_the_simulation_goes_on_at_its_own_slope() {
-  // RR 2 at KS 1 on block 4 is a slow staircase whose last edge, once
-  // decimated, is a single step: past 10 s the line has to keep the slope of
-  // the 10 s before it rather than bend.
-  OperatorParams op = adsr(25, 4, 3, 3, 2, 1);
+  // RR 1 at KS 1 on block 4 is a slow staircase whose last edge, once
+  // decimated, is a single step: past the simulation the line has to keep the
+  // slope of the release before it rather than bend.
+  OperatorParams op = adsr(25, 4, 3, 3, 1, 1);
   op.tl = 33;
   NotePitch pitch;
   pitch.fnum = 644;
@@ -2937,6 +2967,7 @@ int main() {
   RUN_TEST(test_the_axis_does_not_jump_between_neighbouring_values);
 
   RUN_TEST(test_the_span_is_the_content_it_has_to_hold);
+  RUN_TEST(test_a_long_release_widens_the_axis_as_far_as_a_long_sustain);
   RUN_TEST(test_the_span_does_not_depend_on_where_the_axis_has_been);
   RUN_TEST(test_the_grid_step_divides_the_span_sensibly);
 

@@ -130,8 +130,7 @@ inline HeldRun run_held(const OperatorParams &op, NotePitch pitch,
   EgSimulator sim(op, pitch);
   sim.reset(counter_phase, start_att);
   sim.key_on();
-  const int end_att = (op.ssg & 0x08) != 0 ? kSsgFoldAttenuation
-                                           : kCutAttenuation;
+  const int end_att = phase_end_attenuation(op);
   constexpr uint64_t kSampleLimit = uint64_t{1} << 40;
   for (uint64_t i = 0; i < kSampleLimit;) {
     uint32_t n = sim.skippable_samples();
@@ -173,7 +172,7 @@ inline HeldRun run_held(const OperatorParams &op, NotePitch pitch,
 /// can step past a window short of the fold.
 inline bool window_can_be_skipped(const OperatorParams &op, NotePitch pitch) {
   const int sustain = sustain_attenuation(op.sl);
-  if ((op.ssg & 0x08) == 0 || sustain == 0 || sustain >= kSsgFoldAttenuation)
+  if (!ssg_enabled(op) || sustain == 0 || sustain >= kSsgFoldAttenuation)
     return false;
   const int rate = effective_rate(op.dr & 0x1F, key_scale_value(op, pitch));
   bool full = false, smaller = false;
@@ -247,7 +246,7 @@ inline uint16_t curve_counter_phase(const OperatorParams &op, NotePitch pitch,
 /// sample_curve() measures it; infinite when the loop stops before three folds.
 inline double loop_ramp_samples(const OperatorParams &op, NotePitch pitch,
                                 uint16_t start_att, uint16_t counter_phase) {
-  const uint32_t ramps = (op.ssg & 0x02) != 0 ? 2 : 1;
+  const uint32_t ramps = static_cast<uint32_t>(ssg_ramps_per_period(op));
   const HeldRun run = run_held(op, pitch, counter_phase, start_att,
                                kMeasuredLoopPeriods * ramps);
   const double mean = mean_fold_interval(run.folds);
@@ -308,12 +307,9 @@ inline PhaseDurations phase_durations(const OperatorParams &op, NotePitch pitch,
   }
 
   const int ksv = key_scale_value(op, pitch);
-  const bool ssg = (op.ssg & 0x08) != 0;
+  const bool ssg = ssg_enabled(op);
   const double eg_hz = eg_rate_hz(clock_hz);
-  // Where the held envelope runs out of scale: the output is cut dead at 0x3F0,
-  // and with SSG-EG the fold and the hold latch are at 0x200.
-  const int end_att = ssg ? static_cast<int>(kSsgFoldAttenuation)
-                          : static_cast<int>(kCutAttenuation);
+  const int end_att = phase_end_attenuation(op);
   const int sustain_att = std::min(sustain_attenuation(op.sl), end_att);
 
   const int ar = detail::effective_rate(op.ar & 0x1F, ksv);
@@ -340,7 +336,7 @@ struct FirstRamp {
 inline FirstRamp first_ramp(const OperatorParams &op, NotePitch pitch,
                             double clock_hz = kNtscClockHz) {
   FirstRamp ramp;
-  if ((op.ssg & 0x08) == 0) {
+  if (!ssg_enabled(op)) {
     return ramp;
   }
   const detail::HeldRun run =
@@ -360,13 +356,10 @@ inline FirstRamp first_ramp(const OperatorParams &op, NotePitch pitch,
 /// infinite for a loop that stops before its third fold (SsgNeverLoops).
 inline double ssg_loop_period_ms(const OperatorParams &op, NotePitch pitch,
                                  double clock_hz = kNtscClockHz) {
-  // Enabled and hold clear: the ramp restarts instead of latching.
-  const bool loops = (op.ssg & 0x08) != 0 && (op.ssg & 0x01) == 0;
-  if (!loops) {
+  if (!ssg_loops(op)) {
     return 0.0;
   }
-  // The alternating modes invert on every fold: two ramps to a period.
-  const double ramps_per_period = (op.ssg & 0x02) != 0 ? 2.0 : 1.0;
+  const double ramps_per_period = ssg_ramps_per_period(op);
   return detail::loop_ramp_samples(
              op, pitch, kMaxAttenuation,
              detail::curve_counter_phase(op, pitch, false)) *

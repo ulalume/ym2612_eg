@@ -23,6 +23,26 @@ struct OperatorParams {
                    //   bit3 enable, bit2 attack, bit1 alternate, bit0 hold
 };
 
+inline bool ssg_enabled(const OperatorParams &op) {
+  return (op.ssg & 0x08) != 0;
+}
+
+/// SSG-EG restarts its ramp at the fold instead of holding there.
+inline bool ssg_loops(const OperatorParams &op) {
+  return ssg_enabled(op) && (op.ssg & 0x01) == 0;
+}
+
+/// Two when SSG-EG alternates, which inverts on every fold.
+inline int ssg_ramps_per_period(const OperatorParams &op) {
+  return (op.ssg & 0x02) != 0 ? 2 : 1;
+}
+
+/// Where a decay, sustain or release runs out of scale: the fold with SSG-EG,
+/// otherwise the level at which the output is cut dead.
+inline uint16_t phase_end_attenuation(const OperatorParams &op) {
+  return ssg_enabled(op) ? kSsgFoldAttenuation : kCutAttenuation;
+}
+
 // Key scaling derives from block + F-num, so pitch changes the envelope.
 struct NotePitch {
   uint16_t fnum = 0; // 11-bit
@@ -97,7 +117,7 @@ inline int key_scale_value(const OperatorParams &op, NotePitch pitch) {
 // point the ramp reaches and 0x200 is full volume. On key-on the inversion
 // flag is clear, so the attack bit alone decides.
 inline uint16_t loudest_attenuation(const OperatorParams &op) {
-  const bool inverted = (op.ssg & 0x08) != 0 && (op.ssg & 0x04) != 0;
+  const bool inverted = ssg_enabled(op) && (op.ssg & 0x04) != 0;
   return inverted ? kSsgFoldAttenuation : uint16_t{0};
 }
 
