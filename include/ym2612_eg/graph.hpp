@@ -31,18 +31,20 @@ namespace ym2612_eg::graph {
 /// Attenuation at the bottom of the graph; 0 (full volume) is at the top.
 inline constexpr double kFullScale = static_cast<double>(kMaxAttenuation);
 
-/// How wide the time axis may get, in ms: kMinSpanMs is the narrowest axis
-/// worth drawing whatever the content says, kMinHeldMs the narrowest a loop is
-/// given, kMaxHeldMs the widest an envelope that finishes is drawn at.
+/// How wide the time axis may get, in ms. kMinSpanMs is the narrowest axis of
+/// an envelope that does not loop, and kMinHeldMs the narrowest window its held
+/// envelope is given. kMaxSpanMs is the widest axis of all: the held envelope
+/// and the release are both cut there, an attack that outlasts it included.
 inline constexpr double kMinSpanMs = 25.0;
 inline constexpr double kMinHeldMs = 50.0;
-inline constexpr double kMaxHeldMs = 10000.0;
+inline constexpr double kMaxSpanMs = 20000.0;
 /// A sustain that never ends is a flat line; this much of the graph is enough
 /// to say so.
 inline constexpr double kFlatHoldShare = 0.05;
-/// Nothing is drawn wider than this, not even an attack that outlasts it.
-inline constexpr double kMaxSpanMs = 20000.0;
 
+/// The widest axis a loop is given, unless kLoopVisiblePeriods periods of a
+/// slower loop need more, up to kLoopMaxAxisMs.
+inline constexpr double kLoopAxisMs = 10000.0;
 inline constexpr double kLoopVisiblePeriods = 1.2;
 inline constexpr double kLoopMaxAxisMs = 20000.0;
 
@@ -53,9 +55,9 @@ inline constexpr double kSsgRampsPastFold = 1.2;
 /// How much of a looping graph the release may claim; past this the axis keeps
 /// the loop's scale and the release runs off the right edge instead.
 inline constexpr double kSsgSpanBudget = 2.0;
-/// How long a release is simulated for. RR = 0 never reaches silence at all,
-/// so there has to be a ceiling.
-inline constexpr double kMaxReleaseMs = 10000.0;
+/// How long a release is simulated for: as far as the widest axis. RR = 0
+/// never reaches silence at all.
+inline constexpr double kMaxReleaseMs = kMaxSpanMs;
 /// How long a voice takes to fade from the graph once it is silent.
 inline constexpr double kVoiceFadeMs = 400.0;
 
@@ -103,7 +105,7 @@ namespace detail {
 
 /// The widest axis for a loop: room for one period, up to kLoopMaxAxisMs.
 inline double loop_axis_ceiling_ms(double period) {
-  return std::min(std::max(kMaxHeldMs, kLoopVisiblePeriods * period),
+  return std::min(std::max(kLoopAxisMs, kLoopVisiblePeriods * period),
                   kLoopMaxAxisMs);
 }
 
