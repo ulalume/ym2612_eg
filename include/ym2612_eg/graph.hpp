@@ -333,7 +333,7 @@ inline EnvelopeCurve build_envelope_curve(const OperatorParams &op,
   //    envelope is allowed to run off the right edge rather than flatten the
   //    part being edited. The width is the content itself, at full precision.
   if (loops && first_ramp_of_op.end_ms >= 0.0) {
-    const double ramp_ms = period_ms / ((op.ssg & 0x02) != 0 ? 2.0 : 1.0);
+    const double ramp_ms = period_ms / ssg_ramps_per_period(op);
     const double window =
         std::min(first_ramp_of_op.end_ms + kSsgRampsPastFold * ramp_ms,
                  detail::loop_axis_ceiling_ms(period_ms));
@@ -380,7 +380,7 @@ inline EnvelopeCurve build_envelope_curve(const OperatorParams &op,
   // A trace that stops inside a linear phase goes on at that phase's rate. An
   // attack still under way keeps the slope of its last edge, since it is not
   // linear, and so does an SSG-EG trace, which folds.
-  const bool ssg = (op.ssg & 0x08) != 0;
+  const bool ssg = ssg_enabled(op);
   const int ksv = key_scale_value(op, pitch);
   out.held_tail_slope = detail::tail_slope(out.held, out.held_parked);
   if (!out.held_parked && !ssg && out.attack_end_ms >= 0.0) {
@@ -1051,8 +1051,7 @@ inline const EnvelopeCurve &EnvelopeCurveCache::get(const OperatorParams &op,
   requested_pitch_ = pitch;
   requested_valid_ = true;
 
-  const bool loops = (op.ssg & 0x08) != 0 && (op.ssg & 0x01) == 0;
-  const double need_ms = loops ? min_span_ms : 0.0;
+  const double need_ms = ssg_loops(op) ? min_span_ms : 0.0;
   if (valid_ && same_envelope(op, params_) && same_pitch(pitch, pitch_) &&
       need_ms <= curve_.simulated_ms) {
     // The curve on hand is the one being asked for: nothing to decide, and no
@@ -1126,9 +1125,8 @@ uint8_t nearest_rate(int slowest, int fastest, double target_ms,
 /// same length: key-off mirrors the level about the fold, so it climbs the
 /// same distance.
 inline double release_ms(const OperatorParams &op, NotePitch pitch) {
-  const bool ssg = (op.ssg & 0x08) != 0;
-  const int end_att =
-      static_cast<int>(ssg ? kSsgFoldAttenuation : kCutAttenuation);
+  const bool ssg = ssg_enabled(op);
+  const int end_att = phase_end_attenuation(op);
   const int rate = ym2612_eg::detail::effective_rate(
       2 * (op.rr & 0x0F) + 1, key_scale_value(op, pitch));
   return ym2612_eg::detail::linear_phase_ms(rate, 0, end_att, ssg,
@@ -1144,9 +1142,8 @@ inline double release_ms(const OperatorParams &op, NotePitch pitch) {
 /// the sustain. Past the end the envelope is at rest.
 inline double sustain_out_at_ms(const OperatorParams &op, NotePitch pitch,
                                 double elapsed_ms, bool mirrored) {
-  const bool ssg = (op.ssg & 0x08) != 0;
-  const int end_att =
-      static_cast<int>(ssg ? kSsgFoldAttenuation : kCutAttenuation);
+  const bool ssg = ssg_enabled(op);
+  const int end_att = phase_end_attenuation(op);
   const int sustain_att = std::min(sustain_attenuation(op.sl), end_att);
   const int rate = ym2612_eg::detail::effective_rate(
       op.sr & 0x1F, key_scale_value(op, pitch));
@@ -1270,7 +1267,7 @@ inline uint8_t solve_sustain_level(const OperatorParams &op,
                                    double out_attenuation,
                                    bool mirrored = false) {
   const double tl_att = static_cast<double>(op.tl & 0x7F) * 8.0;
-  const bool ssg = (op.ssg & 0x08) != 0;
+  const bool ssg = ssg_enabled(op);
   const double fold = static_cast<double>(kSsgFoldAttenuation);
   int best = 0;
   double best_distance = std::numeric_limits<double>::infinity();

@@ -480,7 +480,7 @@ inline HandleEdit drag_handle(const HandleGrab &grab, const OperatorParams &op,
 
   const EnvelopeHandle &drag = grab.grabbed;
   const PlotArea &plot = grab.plot;
-  const bool ssg = (op.ssg & 0x08) != 0;
+  const bool ssg = ssg_enabled(op);
   // Where the pointer has got to, in the units the graph is drawn in.
   const double at_ms = dragged_ms(plot, drag.at_ms, moved_px.x);
   const double level = dragged_out(plot, drag.out, moved_px.y);

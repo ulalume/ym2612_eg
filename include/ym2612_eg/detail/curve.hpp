@@ -218,12 +218,8 @@ inline CurveResult sample_curve(const CurveRequest &request) {
   sim.reset(counter_phase, request.start_att);
   sim.key_on();
 
-  const bool ssg_enabled = (request.op.ssg & 0x08) != 0;
-  const bool ssg_hold = (request.op.ssg & 0x01) != 0;
-  const bool ssg_alternate = (request.op.ssg & 0x02) != 0;
-  const bool looping_mode = ssg_enabled && !ssg_hold;
-  // Modes 2 and 6 (alternate, no hold) draw two ramps per visible period.
-  const int ramps_per_period = ssg_alternate ? 2 : 1;
+  const bool looping_mode = ssg_loops(request.op);
+  const int ramps_per_period = ssg_ramps_per_period(request.op);
   // Each fold ends one ramp, so a held loop stops after this many folds.
   const size_t fold_limit =
       static_cast<size_t>(detail::kMeasuredLoopPeriods * ramps_per_period);
@@ -415,7 +411,7 @@ inline CurveResult sample_curve(const CurveRequest &request) {
 
   if (request.op.ar == 0)
     res.warnings.push_back(CurveWarning::AttackFrozen);
-  if (ssg_enabled && request.op.ar < 31)
+  if (ssg_enabled(request.op) && request.op.ar < 31)
     res.warnings.push_back(CurveWarning::SsgArBelow31);
   // Every fold happens with the key held, so three drawn folds already show
   // the loop runs; fewer are settled by following the held key.
