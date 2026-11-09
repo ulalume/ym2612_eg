@@ -8,7 +8,9 @@
 
 #include <cmath>
 #include <cstdint>
+#include <initializer_list>
 #include <iostream>
+#include <utility>
 
 using namespace ym2612_eg;
 using namespace ym2612_eg::graph;
@@ -799,6 +801,158 @@ void test_a_drag_writes_only_the_registers_its_handle_names() {
   CHECK(writes > 50);
 }
 
+// ------------------------------------------------------------ the gap
+
+/// A plot of hand-placed dots, every one shown, 3 px in radius and 2 px apart
+/// at the least: 8 px between centres at one height.
+EnvelopeHandles dots(std::initializer_list<std::pair<HandleIndex, Point>> at) {
+  EnvelopeHandles handles;
+  handles.plot.min = Point{20.0f, 10.0f};
+  handles.plot.max = Point{220.0f, 110.0f};
+  handles.metrics.gap = 2.0f;
+  for (const auto &[index, pos] : at) {
+    handles.items[index].shown = true;
+    handles.items[index].pos = pos;
+  }
+  return handles;
+}
+
+float distance(const EnvelopeHandle &a, const EnvelopeHandle &b) {
+  return std::hypot(a.pos.x - b.pos.x, a.pos.y - b.pos.y);
+}
+
+void test_crowded_dots_keep_their_order_a_gap_apart() {
+  EnvelopeHandles handles =
+      dots({{kAttackHandle, {100.0f, 50.0f}},
+            {kDecayHandle, {101.0f, 50.0f}},
+            {kSustainHandle, {102.0f, 50.0f}}});
+  graph::detail::spread_handles(handles);
+  CHECK(near_abs(handles.items[kAttackHandle].pos.x, 100.0, 1e-4));
+  CHECK(near_abs(handles.items[kDecayHandle].pos.x, 108.0, 1e-4));
+  CHECK(near_abs(handles.items[kSustainHandle].pos.x, 116.0, 1e-4));
+  for (const HandleIndex index :
+       {kAttackHandle, kDecayHandle, kSustainHandle}) {
+    CHECK(handles.items[index].pos.y == 50.0f);
+  }
+
+  // At different heights they only need as much room across as the height
+  // leaves: 8 px apart along the slant.
+  EnvelopeHandles slanted = dots({{kAttackHandle, {100.0f, 50.0f}},
+                                  {kDecayHandle, {100.0f, 55.0f}}});
+  graph::detail::spread_handles(slanted);
+  CHECK(near_abs(distance(slanted.items[kAttackHandle],
+                          slanted.items[kDecayHandle]),
+                 8.0, 1e-3));
+  CHECK(slanted.items[kDecayHandle].pos.x > slanted.items[kAttackHandle].pos.x);
+
+  // Dots that already stand clear, or cannot meet, stay where they are.
+  EnvelopeHandles clear = dots({{kAttackHandle, {100.0f, 50.0f}},
+                                {kDecayHandle, {100.0f, 70.0f}},
+                                {kSustainHandle, {150.0f, 70.0f}}});
+  graph::detail::spread_handles(clear);
+  CHECK(clear.items[kAttackHandle].pos.x == 100.0f);
+  CHECK(clear.items[kDecayHandle].pos.x == 100.0f);
+  CHECK(clear.items[kSustainHandle].pos.x == 150.0f);
+}
+
+void test_crowded_dots_at_the_right_edge_are_pushed_back() {
+  // The last place a dot fits is 217: the edge less its radius.
+  EnvelopeHandles handles =
+      dots({{kAttackHandle, {214.0f, 50.0f}},
+            {kDecayHandle, {215.0f, 50.0f}},
+            {kSustainHandle, {216.0f, 50.0f}}});
+  graph::detail::spread_handles(handles);
+  CHECK(near_abs(handles.items[kSustainHandle].pos.x, 217.0, 1e-4));
+  CHECK(near_abs(handles.items[kDecayHandle].pos.x, 209.0, 1e-4));
+  CHECK(near_abs(handles.items[kAttackHandle].pos.x, 201.0, 1e-4));
+}
+
+void test_the_release_dot_stands_beside_the_others() {
+  // It meets the attack dot, and goes to the nearer clear side of it.
+  EnvelopeHandles handles = dots({{kAttackHandle, {100.0f, 50.0f}},
+                                  {kDecayHandle, {120.0f, 50.0f}},
+                                  {kReleaseHandle, {102.0f, 50.0f}}});
+  graph::detail::spread_handles(handles);
+  CHECK(handles.items[kAttackHandle].pos.x == 100.0f);
+  CHECK(handles.items[kDecayHandle].pos.x == 120.0f);
+  CHECK(near_abs(handles.items[kReleaseHandle].pos.x, 108.0, 1e-4));
+  CHECK(handles.items[kReleaseHandle].pos.y == 50.0f);
+
+  // The nearer side is taken by the decay dot, so it goes to the far one.
+  EnvelopeHandles hemmed = dots({{kAttackHandle, {100.0f, 50.0f}},
+                                 {kDecayHandle, {110.0f, 50.0f}},
+                                 {kReleaseHandle, {103.0f, 50.0f}}});
+  graph::detail::spread_handles(hemmed);
+  CHECK(near_abs(hemmed.items[kReleaseHandle].pos.x, 92.0, 1e-4));
+
+  // One already clear stays.
+  EnvelopeHandles clear = dots({{kAttackHandle, {100.0f, 50.0f}},
+                                {kReleaseHandle, {130.0f, 50.0f}}});
+  graph::detail::spread_handles(clear);
+  CHECK(clear.items[kReleaseHandle].pos.x == 130.0f);
+}
+
+void test_a_gap_moves_only_where_the_dots_are_drawn() {
+  // Dots this size crowd one another on a graph this small.
+  HandleMetrics wide;
+  wide.radius = 8.5f;
+  wide.grab = 10.5f;
+  HandleMetrics apart = wide;
+  apart.gap = 2.0f;
+  const float least = apart.radius * 2.0f + apart.gap;
+
+  int moved = 0;
+  for (int ar : {31, 24, 16, 8}) {
+    for (int dr : {31, 20, 10, 0}) {
+      for (int sl : {0, 1, 3, 8, 15}) {
+        for (int rr : {15, 8, 2}) {
+          for (int ssg : {0, 0x08, 0x0A}) {
+            OperatorParams op = adsr(ar, dr, sl, 6, rr, 10);
+            op.ssg = static_cast<uint8_t>(ssg);
+            const EnvelopeCurve curve = curve_of(op);
+            const PlotArea plot = plot_over(curve);
+            const EnvelopeHandles as_drawn = handle_layout(curve, plot, wide);
+            const EnvelopeHandles spread = handle_layout(curve, plot, apart);
+            for (int i = 0; i < kHandleCount; ++i) {
+              const EnvelopeHandle &a = as_drawn.items[i];
+              const EnvelopeHandle &b = spread.items[i];
+              // No gap: every dot where the curve puts it.
+              const Point where = graph::detail::inside(
+                  plot, plot.at(a.at_ms, a.out), wide.radius);
+              CHECK(!a.shown || a.pos.x == where.x);
+              // With one: everything but where it is drawn across is as it
+              // was, so a drag reads the same values.
+              CHECK(a.shown == b.shown);
+              CHECK(a.pos.y == b.pos.y);
+              CHECK(a.ms == b.ms && a.out == b.out && a.at_ms == b.at_ms);
+              CHECK(a.parked == b.parked);
+              CHECK(!b.shown ||
+                    (b.pos.x >= plot.min.x + apart.radius - 1e-3f &&
+                     b.pos.x <= plot.max.x - apart.radius + 1e-3f));
+              if (a.pos.x != b.pos.x) {
+                ++moved;
+              }
+              for (int j = i + 1; j < kHandleCount; ++j) {
+                if (b.shown && spread.items[j].shown) {
+                  CHECK(distance(b, spread.items[j]) >= least - 0.02f);
+                }
+              }
+            }
+            for (int i = kAttackHandle; i < kSustainHandle; ++i) {
+              for (int j = i + 1; j <= kSustainHandle; ++j) {
+                if (spread.items[i].shown && spread.items[j].shown) {
+                  CHECK(spread.items[i].pos.x <= spread.items[j].pos.x);
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+  CHECK(moved > 0);
+}
+
 int main() {
   std::cout << "handles_test\n";
 
@@ -835,6 +989,11 @@ int main() {
   RUN_TEST(test_the_handle_and_field_values_are_fixed);
   RUN_TEST(test_each_handle_names_the_registers_it_sets);
   RUN_TEST(test_a_drag_writes_only_the_registers_its_handle_names);
+
+  RUN_TEST(test_crowded_dots_keep_their_order_a_gap_apart);
+  RUN_TEST(test_crowded_dots_at_the_right_edge_are_pushed_back);
+  RUN_TEST(test_the_release_dot_stands_beside_the_others);
+  RUN_TEST(test_a_gap_moves_only_where_the_dots_are_drawn);
 
   return testing::summary();
 }

@@ -68,13 +68,19 @@ struct HandleMetrics {
   float grab = 6.0f;
   float min_sustain_height = 6.0f;
   float min_sustain_width = 8.0f;
+  /// The least room left between two dots. Above zero, dots that would come
+  /// closer are moved apart along the axis; zero leaves every dot where the
+  /// curve puts it.
+  float gap = 0.0f;
 };
 
 struct EnvelopeHandle {
   /// False for a handle that cannot be dragged honestly: it is neither drawn
   /// nor hit-tested.
   bool shown = false;
-  /// Where it is drawn, clamped so the whole dot stays inside the plot.
+  /// Where it is drawn and grabbed, clamped so the whole dot stays inside the
+  /// plot. With a gap in the metrics it can stand off `at_ms` along the axis,
+  /// moved clear of the others; a drag still reads `at_ms` and `out`.
   Point pos;
   /// What the across parameter's solver is asked about: the length of that
   /// phase alone, or -- for the sustain, which has no end to grab -- how far
@@ -83,7 +89,8 @@ struct EnvelopeHandle {
   /// What the down parameter's solver is asked about.
   double out = 0.0;
   /// Where the dot stands on the axis, in the milliseconds the graph is drawn
-  /// in. `ms` is what the solver is told; these are what the pointer moves.
+  /// in, before a gap moves it. `ms` is what the solver is told; these are
+  /// what the pointer moves.
   double at_ms = 0.0;
   /// Where the phase this handle belongs to leaves its start, in the same
   /// drawn units and in attenuation. A pointer anywhere along the line from
@@ -268,6 +275,80 @@ inline void place_ssg_handles(EnvelopeHandles &out,
   }
 }
 
+/**
+ * Moves dots that would come closer than `2 * radius + gap` apart along the
+ * axis, inside the plot. The attack, decay and sustain dots follow one another
+ * in time and keep that order, pushed right and, at the plot's right edge,
+ * back left; the release dot, on a line of its own, goes to the nearest place
+ * clear of them. Only `pos` moves.
+ */
+inline void spread_handles(EnvelopeHandles &handles) {
+  const float radius = handles.metrics.radius;
+  const float least = radius * 2.0f + handles.metrics.gap;
+  const float left = handles.plot.min.x + radius;
+  const float right = handles.plot.max.x - radius;
+  // How far apart along the axis two dots have to be at their heights, or
+  // nothing where they cannot meet.
+  const auto apart = [least](const EnvelopeHandle &a, const EnvelopeHandle &b) {
+    const float dy = a.pos.y - b.pos.y;
+    return a.shown && b.shown && std::abs(dy) < least
+               ? std::sqrt(least * least - dy * dy)
+               : 0.0f;
+  };
+
+  std::array<EnvelopeHandle *, 3> chain{};
+  std::size_t count = 0;
+  for (const HandleIndex index :
+       {kAttackHandle, kDecayHandle, kSustainHandle}) {
+    if (handles.items[index].shown) {
+      chain[count++] = &handles.items[index];
+    }
+  }
+  for (std::size_t k = 1; k < count; ++k) {
+    chain[k]->pos.x = std::max(
+        chain[k]->pos.x, chain[k - 1]->pos.x + apart(*chain[k], *chain[k - 1]));
+  }
+  for (std::size_t k = count; k-- > 0;) {
+    const float limit =
+        k + 1 < count ? chain[k + 1]->pos.x - apart(*chain[k], *chain[k + 1])
+                      : right;
+    chain[k]->pos.x = std::max(std::min(chain[k]->pos.x, limit), left);
+  }
+
+  EnvelopeHandle &release = handles.items[kReleaseHandle];
+  if (!release.shown) {
+    return;
+  }
+  const auto clear_at = [&](float x) {
+    for (std::size_t k = 0; k < count; ++k) {
+      if (std::abs(x - chain[k]->pos.x) < apart(release, *chain[k]) - 0.01f) {
+        return false;
+      }
+    }
+    return x >= left && x <= right;
+  };
+  if (clear_at(release.pos.x)) {
+    return;
+  }
+  // Beside each dot it meets, on either side: the nearest clear one.
+  float best = release.pos.x;
+  float best_distance = -1.0f;
+  for (std::size_t k = 0; k < count; ++k) {
+    const float room = apart(release, *chain[k]);
+    if (room <= 0.0f) {
+      continue;
+    }
+    for (const float x : {chain[k]->pos.x + room, chain[k]->pos.x - room}) {
+      const float distance = std::abs(x - release.pos.x);
+      if (clear_at(x) && (best_distance < 0.0f || distance < best_distance)) {
+        best = x;
+        best_distance = distance;
+      }
+    }
+  }
+  release.pos.x = best;
+}
+
 } // namespace detail
 
 /// Every handle `curve` can offer on `plot`.
@@ -279,6 +360,9 @@ inline EnvelopeHandles handle_layout(const EnvelopeCurve &curve,
   out.metrics = metrics;
   if (curve.ssg) {
     detail::place_ssg_handles(out, curve);
+    if (metrics.gap > 0.0f) {
+      detail::spread_handles(out);
+    }
     return out;
   }
 
@@ -380,6 +464,9 @@ inline EnvelopeHandles handle_layout(const EnvelopeCurve &curve,
           scale, !ends_on_axis, 0.0, curve.peak_out);
   }
 
+  if (metrics.gap > 0.0f) {
+    detail::spread_handles(out);
+  }
   return out;
 }
 
