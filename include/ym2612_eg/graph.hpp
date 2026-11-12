@@ -79,6 +79,10 @@ inline bool same_envelope(const OperatorParams &lhs, const OperatorParams &rhs) 
          lhs.ks == rhs.ks && lhs.ssg == rhs.ssg;
 }
 
+inline bool same_pitch(NotePitch lhs, NotePitch rhs) {
+  return lhs.fnum == rhs.fnum && lhs.block == rhs.block;
+}
+
 /// The release's budget is its own: tying it to the held window would let AR
 /// and DR change how long a release is drawn.
 inline double release_max_ms() { return kMaxReleaseMs; }
@@ -87,12 +91,12 @@ inline double release_max_ms() { return kMaxReleaseMs; }
 /// at the instant the sustain begins so the attack and decay are never cut,
 /// and bounded by kMaxSpanMs.
 inline double window_for_timeline_ms(const PhaseDurations &phases) {
-  const double sustain_start = phases.attack_ms + phases.decay_ms;
+  const double sustain_start = phases.sustain_start_ms();
   // A sustain that never ends has no length to be the axis. It draws a flat
   // line, which says the same thing at any width, so it takes a fixed share of
   // the graph rather than a share of the axis it would otherwise decide.
   const double whole = std::isfinite(phases.sustain_ms)
-                           ? sustain_start + phases.sustain_ms
+                           ? phases.lifetime_ms()
                            : sustain_start / (1.0 - kFlatHoldShare);
   // The ceiling never cuts the attack and decay, and kMaxSpanMs is where that
   // concession runs out: a phase that never advances lasts forever, and
@@ -277,10 +281,21 @@ inline EnvelopeCurve build_envelope_curve(const OperatorParams &op,
   EnvelopeCurve out;
 
   // 1. What the axis has to hold: the loop period, or the phase durations.
-  const double period_ms = ssg_loop_period_ms(op, pitch);
+  //    A loop's first ramp is the head of the run its period is measured over,
+  //    so the one run answers both.
+  double period_ms = 0.0;
+  FirstRamp first_ramp_of_op;
+  if (ssg_loops(op)) {
+    const ym2612_eg::detail::HeldRun run = ym2612_eg::detail::measured_loop_run(
+        op, pitch, kMaxAttenuation,
+        ym2612_eg::detail::curve_counter_phase(op, pitch, false));
+    period_ms = ym2612_eg::detail::loop_period_ms(run, op, kNtscClockHz);
+    first_ramp_of_op = ym2612_eg::detail::first_ramp_of(run, op, kNtscClockHz);
+  } else {
+    first_ramp_of_op = first_ramp(op, pitch);
+  }
   const bool loops = period_ms > 0.0 && std::isfinite(period_ms);
   out.held_ms = detail::held_ms_for_period(op, pitch, period_ms);
-  const FirstRamp first_ramp_of_op = first_ramp(op, pitch);
 
   // 2. The release on its own, keyed on at full volume and released at once,
   //    so it takes the chip's key-off rules: the SSG inversion latch, the 4x
@@ -368,12 +383,8 @@ inline EnvelopeCurve build_envelope_curve(const OperatorParams &op,
   out.attack_end_ms = first_marker_ms(out.held, MarkerKind::AttackEnd);
   out.decay_end_ms = first_marker_ms(out.held, MarkerKind::DecayEnd);
 
-  // The markers come back sorted by time, so the folds do too.
-  for (const Marker &m : out.held.markers) {
-    if (m.kind == MarkerKind::SsgFold) {
-      out.ssg_folds.push_back(m.ms);
-    }
-  }
+  // Every fold, where the markers stop at their cap.
+  out.ssg_folds = out.held.fold_ms;
 
   // Silence is only raised once the trace has come to rest.
   out.held_silence_ms = detail::silence_or_never(out.held);
@@ -394,7 +405,7 @@ inline EnvelopeCurve build_envelope_curve(const OperatorParams &op,
       detail::tail_slope(out.release, !out.release_truncated);
   if (out.release_truncated && !ssg) {
     out.release_tail_slope = detail::linear_phase_slope(
-        ym2612_eg::detail::effective_rate(2 * (op.rr & 0x0F) + 1, ksv));
+        ym2612_eg::detail::release_rate(op, ksv));
   }
 
   out.ssg = ssg;
@@ -403,7 +414,7 @@ inline EnvelopeCurve build_envelope_curve(const OperatorParams &op,
 
   // The levels the registers name, in the same output units as the curve.
   const int fold = static_cast<int>(kSsgFoldAttenuation);
-  const int tl_att = static_cast<int>(op.tl) * 8;
+  const int tl_att = tl_attenuation(op);
   const int sustain_att = ssg ? std::min(sustain_attenuation(op.sl), fold)
                               : sustain_attenuation(op.sl);
   const auto drawn = [&](int att) {
@@ -875,8 +886,7 @@ inline const EnvelopeCurve *VoiceCurveCache::get(const OperatorParams &op,
                                                  NotePitch reference_pitch,
                                                  int &build_budget) {
   const bool same_context = valid_ && same_envelope(op, params_) &&
-                            reference_pitch.fnum == reference_pitch_.fnum &&
-                            reference_pitch.block == reference_pitch_.block &&
+                            same_pitch(reference_pitch, reference_pitch_) &&
                             reference_span_ms_ == reference.span_ms;
   if (!same_context) {
     // Everything here was built for registers or an axis that no longer
@@ -1002,15 +1012,36 @@ inline double steady_now_ms() {
   return std::chrono::duration<double, std::milli>(since_epoch).count();
 }
 
+namespace detail {
+
+/// The width a loop is simulated across to be drawn on an axis of `axis_ms`:
+/// the next power of two, up to the widest axis. A curve is thinned to fit
+/// kMaxPoints over the width it was simulated across, so one width per axis
+/// would rebuild on every frame an axis moves and one width for all would
+/// draw a narrow axis from a curve thinned for a wide one. Steps of two keep
+/// the curve within twice the detail the axis needs, whichever way it came.
+inline double simulated_width_ms(double axis_ms) {
+  if (!(axis_ms > 0.0) || !std::isfinite(axis_ms)) {
+    return 0.0;
+  }
+  int exponent = 0;
+  const double mantissa = std::frexp(axis_ms, &exponent); // in [0.5, 1)
+  const double power = mantissa == 0.5 ? axis_ms : std::ldexp(1.0, exponent);
+  return std::min(power, std::max(axis_ms, kMaxSpanMs));
+}
+
+} // namespace detail
+
 /// Remembers one operator's curve and rebuilds it only when the registers (or
-/// the note) actually change, or the axis a loop is drawn on no longer fits
-/// the width it was simulated across. While dragging, a rebuild the throttle
-/// has not licensed yet is skipped and last frame's curve handed back instead --
-/// except the value a drag ends on is always built the frame after it stops
-/// moving, whatever the throttle says.
+/// the note) actually change, or the axis a loop is drawn on moves into
+/// another detail::simulated_width_ms(). While dragging, a rebuild the
+/// throttle has not licensed yet is skipped and last frame's curve handed back
+/// instead -- except the value a drag ends on is always built the frame after
+/// it stops moving, whatever the throttle says.
 class EnvelopeCurveCache {
 public:
-  /// `min_span_ms` is the axis being drawn; a loop is simulated across it.
+  /// `min_span_ms` is the axis being drawn; a loop is simulated across it. One
+  /// cache serves one axis: asked for two in turn, it rebuilds for each.
   const EnvelopeCurve &get(const OperatorParams &op, NotePitch pitch,
                            double min_span_ms = 0.0);
 
@@ -1041,10 +1072,6 @@ private:
 inline const EnvelopeCurve &EnvelopeCurveCache::get(const OperatorParams &op,
                                                     NotePitch pitch,
                                                     double min_span_ms) {
-  const auto same_pitch = [](NotePitch lhs, NotePitch rhs) {
-    return lhs.fnum == rhs.fnum && lhs.block == rhs.block;
-  };
-
   // Whether this is the second frame in a row to ask for the same thing --
   // measured against the previous REQUEST rather than against the curve, so a
   // value that arrived while a rebuild was deferred still counts as settled.
@@ -1054,14 +1081,10 @@ inline const EnvelopeCurve &EnvelopeCurveCache::get(const OperatorParams &op,
   requested_pitch_ = pitch;
   requested_valid_ = true;
 
-  const double need_ms = ssg_loops(op) ? min_span_ms : 0.0;
-  // A loop simulated across a much wider axis is thinned to fit kMaxPoints,
-  // and on a narrower one its teeth would show as a ramp and a flat line.
-  const bool too_coarse =
-      curve_.simulated_ms >
-      2.0 * std::max({need_ms, curve_.span_ms, curve_.held_ms});
+  const double want_ms = ssg_loops(op) ? detail::simulated_width_ms(min_span_ms) : 0.0;
   if (valid_ && same_envelope(op, params_) && same_pitch(pitch, pitch_) &&
-      need_ms <= curve_.simulated_ms && !too_coarse) {
+      curve_.simulated_ms ==
+          std::max({want_ms, curve_.span_ms, curve_.held_ms})) {
     // The curve on hand is the one being asked for: nothing to decide, and no
     // clock read either. This is every frame the user is not editing.
     return curve_;
@@ -1075,7 +1098,7 @@ inline const EnvelopeCurve &EnvelopeCurveCache::get(const OperatorParams &op,
     return curve_;
   }
 
-  curve_ = build_envelope_curve(op, pitch, need_ms);
+  curve_ = build_envelope_curve(op, pitch, want_ms);
   params_ = op;
   pitch_ = pitch;
   valid_ = true;
@@ -1135,8 +1158,8 @@ uint8_t nearest_rate(int slowest, int fastest, double target_ms,
 inline double release_ms(const OperatorParams &op, NotePitch pitch) {
   const bool ssg = ssg_enabled(op);
   const int end_att = phase_end_attenuation(op);
-  const int rate = ym2612_eg::detail::effective_rate(
-      2 * (op.rr & 0x0F) + 1, key_scale_value(op, pitch));
+  const int rate =
+      ym2612_eg::detail::release_rate(op, key_scale_value(op, pitch));
   return ym2612_eg::detail::linear_phase_ms(rate, 0, end_att, ssg,
                                             eg_rate_hz(kNtscClockHz));
 }
@@ -1172,7 +1195,7 @@ inline double sustain_out_at_ms(const OperatorParams &op, NotePitch pitch,
   // simulator's `(0x200 - a) & 0x3FF` cannot wrap and is a subtraction.
   const double level =
       mirrored ? static_cast<double>(kSsgFoldAttenuation) - att : att;
-  return std::min(level + static_cast<double>(op.tl & 0x7F) * 8.0,
+  return std::min(level + static_cast<double>(tl_attenuation(op)),
                   static_cast<double>(kMaxAttenuation));
 }
 
@@ -1274,7 +1297,7 @@ inline uint8_t solve_total_level(double out_attenuation) {
 inline uint8_t solve_sustain_level(const OperatorParams &op,
                                    double out_attenuation,
                                    bool mirrored = false) {
-  const double tl_att = static_cast<double>(op.tl & 0x7F) * 8.0;
+  const double tl_att = static_cast<double>(tl_attenuation(op));
   const bool ssg = ssg_enabled(op);
   const double fold = static_cast<double>(kSsgFoldAttenuation);
   int best = 0;

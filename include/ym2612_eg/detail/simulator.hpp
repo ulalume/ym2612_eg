@@ -43,6 +43,11 @@ inline uint16_t phase_end_attenuation(const OperatorParams &op) {
   return ssg_enabled(op) ? kSsgFoldAttenuation : kCutAttenuation;
 }
 
+/// TL as attenuation: it is the top seven bits of the ten, so 8 units a step.
+inline int tl_attenuation(const OperatorParams &op) {
+  return (op.tl & 0x7F) << 3;
+}
+
 // Key scaling derives from block + F-num, so pitch changes the envelope.
 struct NotePitch {
   uint16_t fnum = 0; // 11-bit
@@ -109,6 +114,15 @@ inline uint8_t NotePitch::keycode() const {
 inline int key_scale_value(const OperatorParams &op, NotePitch pitch) {
   return pitch.keycode() >> (3 - (op.ks & 3));
 }
+
+namespace detail {
+
+// The release register is 4 bits: R = 2*RR + 1, so it can never be 0.
+inline int release_rate(const OperatorParams &op, int ksv) {
+  return effective_rate(2 * (op.rr & 0x0F) + 1, ksv);
+}
+
+} // namespace detail
 
 // The internal attenuation at which this operator is at its LOUDEST, i.e. the
 // level a key-on starts a release from. Normally 0, the top of the scale.
@@ -352,8 +366,7 @@ private:
     rate_[0] = detail::effective_rate(params_.ar & 0x1F, ksv_);
     rate_[1] = detail::effective_rate(params_.dr & 0x1F, ksv_);
     rate_[2] = detail::effective_rate(params_.sr & 0x1F, ksv_);
-    // Release register is 4-bit: R = 2*RR + 1, so it can never be 0.
-    rate_[3] = detail::effective_rate(2 * (params_.rr & 0x0F) + 1, ksv_);
+    rate_[3] = detail::release_rate(params_, ksv_);
     sustain_att_ = ym2612_eg::sustain_attenuation(params_.sl);
     ssg_enable_ = (params_.ssg & 0x08) != 0;
     ssg_attack_ = (params_.ssg & 0x04) != 0;
@@ -438,7 +451,7 @@ private:
     int a = att_;
     if (inverted)
       a = (0x200 - a) & 0x3FF;
-    const int o = a + (static_cast<int>(params_.tl & 0x7F) << 3);
+    const int o = a + tl_attenuation(params_);
     return static_cast<uint16_t>(o > kMaxAttenuation ? kMaxAttenuation : o);
   }
 

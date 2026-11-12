@@ -324,7 +324,9 @@ void test_a_held_axis_is_simulated_across() {
   CHECK(cache.rebuild_count() == 2);
   CHECK(reaching.simulated_ms >= wider);
   CHECK(reaching.held.points.back().ms >= wider * 0.99);
-  CHECK(cache.get(loop, kMiddleC, wider * 0.5).simulated_ms >= wider);
+  // An axis inside the same doubling is drawn from the same curve.
+  const double simulated = reaching.simulated_ms;
+  CHECK(cache.get(loop, kMiddleC, simulated * 0.75).simulated_ms == simulated);
   CHECK(cache.rebuild_count() == 2);
 
   EnvelopeCurveCache plain;
@@ -358,6 +360,76 @@ void test_a_loop_is_rebuilt_as_its_axis_narrows() {
     CHECK(narrow.held.points[i].ms == exact.held.points[i].ms);
     CHECK(narrow.held.points[i].att == exact.held.points[i].att);
   }
+}
+
+/// An axis on the move rebuilds a loop once for every doubling it crosses,
+/// not once a frame, and the curve it ends on is the one a cache that had
+/// only ever seen that axis holds.
+void test_a_moving_axis_rebuilds_a_loop_once_a_doubling() {
+  const OperatorParams loop = ssg_patch(4, 31, 26, 15, 14, 15, 0);
+  const EnvelopeCurve exact = build_envelope_curve(loop, kMiddleC);
+  const double floor_ms = std::max(exact.span_ms, exact.held_ms);
+
+  EnvelopeCurveCache cache;
+  double axis = floor_ms;
+  cache.get(loop, kMiddleC, axis);
+  int frames = 0;
+  while (axis < 5000.0) {
+    axis *= 1.02;
+    cache.get(loop, kMiddleC, axis);
+    ++frames;
+  }
+  const int doublings =
+      static_cast<int>(std::ceil(std::log2(5000.0 * 1.02 / floor_ms)));
+  CHECK(frames > 4 * doublings);
+  CHECK(cache.rebuild_count() <= 1 + doublings);
+  const int widened = cache.rebuild_count();
+
+  while (axis > floor_ms) {
+    axis = std::max(axis / 1.02, floor_ms);
+    cache.get(loop, kMiddleC, axis);
+  }
+  CHECK(cache.rebuild_count() - widened <= doublings);
+
+  // Wherever the axis has been, the curve is the one this axis asks for.
+  for (const double at : {floor_ms, 37.0, 300.0, 4096.0, 4097.0, 20000.0}) {
+    EnvelopeCurveCache fresh;
+    const EnvelopeCurve &first = fresh.get(loop, kMiddleC, at);
+    const EnvelopeCurve &moved = cache.get(loop, kMiddleC, at);
+    CHECK(moved.simulated_ms == first.simulated_ms);
+    CHECK(moved.simulated_ms >= at);
+    CHECK(moved.simulated_ms <= 2.0 * std::max(at, floor_ms));
+    CHECK(moved.held.points.size() == first.held.points.size());
+  }
+  // The widest axis is simulated as it is rather than rounded past it.
+  CHECK(cache.get(loop, kMiddleC, kMaxSpanMs).simulated_ms == kMaxSpanMs);
+}
+
+/// A fast loop across a wide axis has more folds than the markers hold, and
+/// the cursor still wraps on the last of them rather than part way along.
+void test_a_wide_loop_keeps_every_fold() {
+  const OperatorParams loop = ssg_patch(0, 31, 24, 15, 0, 15, 0);
+  const double axis = 10000.0;
+  const EnvelopeCurve curve = build_envelope_curve(loop, kC0, axis);
+  CHECK(curve.held.markers.size() >= ym2612_eg::detail::kMaxMarkers);
+  CHECK(curve.ssg_folds.size() == curve.held.fold_ms.size());
+  CHECK(curve.ssg_folds.back() > axis - 20.0);
+  // Just short of the last fold on the axis the cursor has not wrapped yet.
+  const double late = curve.ssg_folds.back() - 1.0;
+  CHECK(wrapped_into_loop_ms(curve, late, axis) == late);
+}
+
+/// TL is seven bits: a value with the eighth set names the same levels as the
+/// curve is drawn at.
+void test_the_named_levels_mask_tl_as_the_curve_does() {
+  OperatorParams op = worked_example();
+  op.tl = 20;
+  const EnvelopeCurve masked = build_envelope_curve(op, kMiddleC);
+  op.tl = 0x80 | 20;
+  const EnvelopeCurve wide = build_envelope_curve(op, kMiddleC);
+  CHECK(wide.peak_out == masked.peak_out);
+  CHECK(wide.sustain_out == masked.sustain_out);
+  CHECK(wide.peak_out == 20 * 8);
 }
 
 /// A cursor wraps between the folds past the attack.
@@ -2976,6 +3048,9 @@ int main() {
   RUN_TEST(test_a_release_widens_a_loop_axis_only_so_far);
   RUN_TEST(test_a_held_axis_is_simulated_across);
   RUN_TEST(test_a_loop_is_rebuilt_as_its_axis_narrows);
+  RUN_TEST(test_a_moving_axis_rebuilds_a_loop_once_a_doubling);
+  RUN_TEST(test_a_wide_loop_keeps_every_fold);
+  RUN_TEST(test_the_named_levels_mask_tl_as_the_curve_does);
   RUN_TEST(test_a_cursor_wraps_on_the_folds_of_the_ramps);
   RUN_TEST(test_the_named_levels_stand_on_the_trace);
   RUN_TEST(test_an_ssg_ramp_with_no_sustain_ignores_the_sustain_rate);
