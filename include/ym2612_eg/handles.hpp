@@ -133,19 +133,15 @@ inline Point inside(const PlotArea &plot, Point pos, float radius) {
 /// can still be seen falling.
 inline double sustain_probe_ms(const EnvelopeCurve &curve, double span_ms) {
   const double start = std::max(curve.decay_end_ms, 0.0);
-  // An SSG-EG sustain ends with the first ramp.
-  if (curve.ssg) {
-    const double end = curve.ramp_end_ms > start
-                           ? std::min(curve.ramp_end_ms, span_ms)
-                           : span_ms;
-    return start + (end - start) * 0.5;
-  }
-  // Half way along the part of the sustain the eye can still see falling. Past
-  // the floor the line is flat and every rate lies on top of every other, so a
-  // dot there would stand nowhere in particular.
+  // An SSG-EG sustain ends with the first ramp. Any other is read half way
+  // along the part the eye can still see falling: past the floor the line is
+  // flat and every rate lies on top of every other, so a dot there would stand
+  // nowhere in particular.
   const double end =
-      std::min(first_time_at_level(curve.held, kFullScale, start, span_ms),
-               span_ms);
+      curve.ssg ? (curve.ramp_end_ms > start
+                       ? std::min(curve.ramp_end_ms, span_ms)
+                       : span_ms)
+                : first_time_at_level(curve.held, kFullScale, start, span_ms);
   return start + (end - start) * 0.5;
 }
 
@@ -374,12 +370,11 @@ inline EnvelopeHandles handle_layout(const EnvelopeCurve &curve,
   if (curve.attack_end_ms >= 0.0 && curve.attack_end_ms <= span) {
     place(kAttackHandle, curve.attack_end_ms, curve.attack_end_ms,
           curve.peak_out);
-  }
 
-  // The knee, whose time is the decay's own length rather than where it falls
-  // on the axis. A slow decay can end past the axis, and then the knee waits
-  // at the right-hand edge on the line it would leave.
-  if (curve.attack_end_ms >= 0.0 && curve.attack_end_ms <= span) {
+    // The knee, whose time is the decay's own length rather than where it
+    // falls on the axis. A slow decay can end past the axis, and then the knee
+    // waits at the right-hand edge on the line it would leave.
+    //
     // Just clear of the peak, where the decay would begin. A decay rate of 0
     // never advances and a sustain level of 0 has nowhere to fall to: either
     // way there is no knee on the line, and this is where pulling one out

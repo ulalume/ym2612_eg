@@ -493,6 +493,46 @@ void test_parking_at_the_sustain_level_still_reports_the_decay() {
   CHECK_ABS(r.park_ms, marker_ms(r, MarkerKind::DecayEnd), 1.0);
 }
 
+// The markers stop at their cap -- a fast loop raises several a ramp -- but
+// the list of folds does not, and agrees with the markers as far as they go.
+void test_the_folds_outlast_the_marker_cap() {
+  CurveRequest req;
+  req.op = OperatorParams{31, 24, 0, 15, 15, 0, 0, 0x08}; // a 139 Hz loop
+  req.pitch = kRks0;
+  req.gate_ms = 10000.0;
+  req.max_ms = 10000.0;
+  const CurveResult r = sample_curve(req);
+
+  CHECK(r.markers.size() >= detail::kMaxMarkers);
+  const size_t marked = count_marker(r, MarkerKind::SsgFold);
+  CHECK(r.fold_ms.size() > marked);
+  // One fold a period, to the end of the span.
+  CHECK_ABS(static_cast<double>(r.fold_ms.size()), r.loop_hz * 10.0, 2.0);
+  CHECK(r.fold_ms.back() > 9990.0f);
+  CHECK(std::is_sorted(r.fold_ms.begin(), r.fold_ms.end()));
+  size_t k = 0;
+  for (const Marker &m : r.markers)
+    if (m.kind == MarkerKind::SsgFold)
+      CHECK(m.ms == r.fold_ms[k++]);
+}
+
+// A band fills the markers on its own, and the key-off, the park and the
+// silence that follow it are still recorded.
+void test_the_key_off_and_silence_outlast_the_marker_cap() {
+  CurveRequest req;
+  req.op = OperatorParams{0, 3, 0, 15, 4, 0, 3, 0x0E}; // AR=0, SSG type 6
+  req.pitch = kC4;
+  req.gate_ms = 2000.0;
+  req.max_ms = 6000.0;
+  const CurveResult r = sample_curve(req);
+
+  CHECK(count_marker(r, MarkerKind::SsgInvert) >= detail::kMaxMarkers - 8);
+  CHECK(r.markers.size() > detail::kMaxMarkers);
+  CHECK_ABS(marker_ms(r, MarkerKind::KeyOff), 2000.0, 0.1);
+  CHECK(has_marker(r, MarkerKind::Park));
+  CHECK(marker_ms(r, MarkerKind::Silence) > 2000.0);
+}
+
 } // namespace
 
 int main() {
@@ -513,5 +553,7 @@ int main() {
   RUN_TEST(test_marker_points_are_kept);
   RUN_TEST(test_clock_selection);
   RUN_TEST(test_a_sample_rate_oscillation_stays_bounded);
+  RUN_TEST(test_the_folds_outlast_the_marker_cap);
+  RUN_TEST(test_the_key_off_and_silence_outlast_the_marker_cap);
   return testing::summary();
 }

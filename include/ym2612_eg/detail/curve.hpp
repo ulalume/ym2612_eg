@@ -61,6 +61,9 @@ struct CurveRequest {
 struct CurveResult {
   std::vector<CurvePoint> points;
   std::vector<Marker> markers;
+  // Every SSG-EG fold, in order. The markers stop at kMaxMarkers; this does
+  // not, since a loop's folds are what a cursor wraps on.
+  std::vector<float> fold_ms;
   double loop_hz = 0.0; // SSG loop frequency; 0 when not looping
   double park_ms = std::numeric_limits<double>::infinity();
   std::vector<CurveWarning> warnings;
@@ -72,7 +75,8 @@ namespace detail {
 // within kDecimationEpsilon attenuation units of the undecimated one.
 inline constexpr double kDecimationEpsilon = 0.9;
 // A pathological patch (SSG alternate with AR < 31 toggles every sample) can
-// raise an event on every single sample; cap what we record.
+// raise an event on every single sample; cap what we record.  The key-off, a
+// park and the silence happen a handful of times and are recorded regardless.
 inline constexpr size_t kMaxMarkers = 4096;
 /// Vertex ceiling. An envelope that oscillates at the sample rate -- an SSG-EG
 /// alternate mode with AR < 31 -- has a genuine value on every sample, so
@@ -101,16 +105,15 @@ inline std::vector<CurvePoint> reduce(const std::vector<CurvePoint> &pts) {
     const double end =
         span > 0.0 ? t0 + span * static_cast<double>(slot + 1) / slots
                    : std::numeric_limits<double>::infinity();
+    // The slot's first point always belongs to it.
     size_t low = i, high = i;
-    size_t n = 0;
-    while (i < pts.size() &&
-           (static_cast<double>(pts[i].ms) <= end || n == 0)) {
-      if (pts[i].out < pts[low].out)
-        low = i;
-      if (pts[i].out > pts[high].out)
-        high = i;
-      ++i;
-      ++n;
+    uint16_t low_out = pts[i].out, high_out = pts[i].out;
+    for (++i; i < pts.size() && static_cast<double>(pts[i].ms) <= end; ++i) {
+      const uint16_t o = pts[i].out;
+      low = o < low_out ? i : low;
+      low_out = o < low_out ? o : low_out;
+      high = o > high_out ? i : high;
+      high_out = o > high_out ? o : high_out;
     }
     if (low == high) {
       out.push_back(pts[low]);
@@ -127,8 +130,9 @@ inline std::vector<CurvePoint> reduce(const std::vector<CurvePoint> &pts) {
 // Ramer-Douglas-Peucker over one span, iterative so a 100k-point ramp cannot
 // blow the stack.  Vertical distance, worst of the two channels.
 inline void rdp_span(const std::vector<CurvePoint> &pts, size_t lo, size_t hi,
-                     double eps, std::vector<uint8_t> &keep, uint64_t &budget) {
-  std::vector<std::pair<size_t, size_t>> stack;
+                     double eps, std::vector<uint8_t> &keep, uint64_t &budget,
+                     std::vector<std::pair<size_t, size_t>> &stack) {
+  stack.clear();
   stack.emplace_back(lo, hi);
   while (!stack.empty()) {
     if (budget == 0) {
@@ -175,7 +179,7 @@ inline void rdp_span(const std::vector<CurvePoint> &pts, size_t lo, size_t hi,
 /// oscillation would otherwise make this quadratic.
 inline constexpr uint64_t kDecimationBudget = 400000;
 
-inline std::vector<CurvePoint> decimate(const std::vector<CurvePoint> &raw,
+inline std::vector<CurvePoint> decimate(std::vector<CurvePoint> raw,
                                         std::vector<uint8_t> locked,
                                         double eps) {
   if (raw.size() < 3)
@@ -184,22 +188,27 @@ inline std::vector<CurvePoint> decimate(const std::vector<CurvePoint> &raw,
   locked.front() = 1;
   locked.back() = 1;
 
-  std::vector<uint8_t> keep = locked;
+  // rdp_span() only marks vertices strictly inside (anchor, i), all of them
+  // behind the scan, so the locks and the keeps can share one array.
+  std::vector<uint8_t> &keep = locked;
+  std::vector<std::pair<size_t, size_t>> stack;
   uint64_t budget = kDecimationBudget;
   size_t anchor = 0;
   for (size_t i = 1; i < raw.size(); ++i) {
     if (!locked[i])
       continue;
-    rdp_span(raw, anchor, i, eps, keep, budget);
+    if (i > anchor + 1)
+      rdp_span(raw, anchor, i, eps, keep, budget, stack);
     anchor = i;
   }
 
-  std::vector<CurvePoint> out;
-  out.reserve(raw.size() / 4 + 8);
+  // Compact in place: the write index never passes the read index.
+  size_t n = 0;
   for (size_t i = 0; i < raw.size(); ++i)
     if (keep[i])
-      out.push_back(raw[i]);
-  return out;
+      raw[n++] = raw[i];
+  raw.resize(n);
+  return raw;
 }
 
 } // namespace detail
@@ -256,8 +265,8 @@ inline CurveResult sample_curve(const CurveRequest &request) {
     emit(ms, sim.output(), sim.attenuation(), force);
   };
 
-  auto add_marker = [&](double ms, MarkerKind kind) {
-    if (res.markers.size() >= detail::kMaxMarkers)
+  auto add_marker = [&](double ms, MarkerKind kind, bool always = false) {
+    if (!always && res.markers.size() >= detail::kMaxMarkers)
       return false;
     res.markers.push_back(Marker{static_cast<float>(ms), kind});
     return true;
@@ -290,12 +299,18 @@ inline CurveResult sample_curve(const CurveRequest &request) {
   bool key_off_done = gate_forever;
   bool parked = false;
 
+  // Whether the sample about to be stepped is already known to move: a skip
+  // that was not unbounded ends on the sample the envelope moves on (or on the
+  // gate, or the end of the axis), so nothing below could skip again.
+  bool at_move = false;
+  // is_static() as of the last change of state, so it is asked once a sample.
+  bool resting = sim.is_static();
   for (uint64_t i = 0; i < max_samples; ++i) {
     // Across a stretch the simulator cannot move through, every sample repeats
     // the last one -- no event, no vertex, no change of silence or park state
     // -- so it can be crossed whole. The exceptions are the sample an
     // unrecorded park lands on and the one key-off lands on.
-    if (parked || !sim.is_static()) {
+    if (!at_move && (parked || !resting)) {
       uint64_t room = max_samples - i;
       if (!key_off_done)
         room = i < gate_sample ? std::min(room, gate_sample - i) : uint64_t{0};
@@ -303,6 +318,9 @@ inline CurveResult sample_curve(const CurveRequest &request) {
       if (skip >= 2) {
         sim.skip(static_cast<uint32_t>(skip));
         i += skip - 1;
+        at_move = skip < detail::kUnboundedSkip;
+        if (!at_move)
+          resting = sim.is_static();
         continue;
       }
 
@@ -333,6 +351,7 @@ inline CurveResult sample_curve(const CurveRequest &request) {
         }
         sim.skip(static_cast<uint32_t>(band));
         i += band - 1;
+        resting = sim.is_static();
         continue;
       }
     }
@@ -340,7 +359,7 @@ inline CurveResult sample_curve(const CurveRequest &request) {
     if (!key_off_done && i >= gate_sample) {
       const double ms = static_cast<double>(i) * ms_per_sample;
       sim.key_off();
-      add_marker(ms, MarkerKind::KeyOff);
+      add_marker(ms, MarkerKind::KeyOff, true);
       // The SSG inversion latch lands on the key-off sample, so the last
       // level of the held note has to be kept before it is stepped over.
       push_point(ms, true);
@@ -352,6 +371,7 @@ inline CurveResult sample_curve(const CurveRequest &request) {
       track_silence(ms, sim.output());
     }
 
+    at_move = false;
     sim.step();
     const double ms = sim.time_ms();
     const uint32_t ev = sim.step_events();
@@ -365,6 +385,7 @@ inline CurveResult sample_curve(const CurveRequest &request) {
       if (ev & detail::kEvSsgFold) {
         marked |= add_marker(ms, MarkerKind::SsgFold);
         fold_samples.push_back(i);
+        res.fold_ms.push_back(static_cast<float>(ms));
       }
       if (ev & detail::kEvSsgInvert)
         marked |= add_marker(ms, MarkerKind::SsgInvert);
@@ -376,13 +397,14 @@ inline CurveResult sample_curve(const CurveRequest &request) {
     push_point(ms, marked);
     track_silence(ms, sim.output());
 
-    if (!parked && sim.is_static()) {
+    resting = sim.is_static();
+    if (!parked && resting) {
       parked = true;
       // park_ms is the FIRST time the envelope came to rest (e.g. the sustain
       // hold of an SR=0 patch); later Park markers still record re-parks.
       if (!std::isfinite(res.park_ms))
         res.park_ms = ms;
-      add_marker(ms, MarkerKind::Park);
+      add_marker(ms, MarkerKind::Park, true);
       push_point(ms, true);
     }
     if (parked && key_off_done)
@@ -404,7 +426,7 @@ inline CurveResult sample_curve(const CurveRequest &request) {
   // stayed there.  Only meaningful once the envelope has come to rest.
   const bool at_rest = parked || sim.attenuation() >= kMaxAttenuation;
   if (at_rest && silence_start_ms >= 0.0) {
-    add_marker(silence_start_ms, MarkerKind::Silence);
+    add_marker(silence_start_ms, MarkerKind::Silence, true);
     if (silence_index < locked.size())
       locked[silence_index] = 1;
   }
@@ -427,7 +449,8 @@ inline CurveResult sample_curve(const CurveRequest &request) {
                    [](const Marker &a, const Marker &b) { return a.ms < b.ms; });
 
   res.points = detail::reduce(
-      detail::decimate(raw, std::move(locked), detail::kDecimationEpsilon));
+      detail::decimate(std::move(raw), std::move(locked),
+                       detail::kDecimationEpsilon));
   return res;
 }
 

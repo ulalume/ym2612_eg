@@ -117,7 +117,6 @@ struct HeldRun {
   int64_t decay_end = -1;
   int64_t ramp_end = -1;
   std::vector<uint64_t> folds;
-  bool at_rest = false;
 };
 
 /// Keys on at `counter_phase` from `start_att` and follows the envelope to
@@ -138,14 +137,14 @@ inline HeldRun run_held(const OperatorParams &op, NotePitch pitch,
       uint16_t first = 0, second = 0;
       n = sim.alternating_samples(first, second);
     }
-    if (sim.is_static() || n >= kUnboundedSkip) {
-      run.at_rest = true;
-      break;
-    }
+    if (sim.is_static() || n >= kUnboundedSkip)
+      break; // at rest
     if (n > 0) {
+      // A bounded skip ends on the sample the envelope moves on.
       sim.skip(n);
       i += n;
-      continue;
+      if (i >= kSampleLimit)
+        break;
     }
     sim.step();
     const uint32_t ev = sim.step_events();
@@ -244,13 +243,24 @@ inline uint16_t curve_counter_phase(const OperatorParams &op, NotePitch pitch,
 
 /// The mean ramp of a held SSG-EG loop in output samples, measured as
 /// sample_curve() measures it; infinite when the loop stops before three folds.
-inline double loop_ramp_samples(const OperatorParams &op, NotePitch pitch,
-                                uint16_t start_att, uint16_t counter_phase) {
-  const uint32_t ramps = static_cast<uint32_t>(ssg_ramps_per_period(op));
-  const HeldRun run = run_held(op, pitch, counter_phase, start_att,
-                               kMeasuredLoopPeriods * ramps);
+inline double loop_ramp_samples(const HeldRun &run) {
   const double mean = mean_fold_interval(run.folds);
   return mean > 0.0 ? mean : std::numeric_limits<double>::infinity();
+}
+
+/// The held run a loop's period is measured over. Its head is the run to the
+/// end of the first ramp: the same key-on, followed further.
+inline HeldRun measured_loop_run(const OperatorParams &op, NotePitch pitch,
+                                 uint16_t start_att, uint16_t counter_phase) {
+  const uint32_t ramps = static_cast<uint32_t>(ssg_ramps_per_period(op));
+  return run_held(op, pitch, counter_phase, start_att,
+                  kMeasuredLoopPeriods * ramps);
+}
+
+inline double loop_ramp_samples(const OperatorParams &op, NotePitch pitch,
+                                uint16_t start_att, uint16_t counter_phase) {
+  return loop_ramp_samples(
+      measured_loop_run(op, pitch, start_att, counter_phase));
 }
 
 } // namespace detail
@@ -332,16 +342,12 @@ struct FirstRamp {
   bool mirrored = false;
 };
 
-/// The defaults for a patch with SSG-EG off.
-inline FirstRamp first_ramp(const OperatorParams &op, NotePitch pitch,
-                            double clock_hz = kNtscClockHz) {
+namespace detail {
+
+/// The first ramp of an SSG-EG envelope, read off a held run of it.
+inline FirstRamp first_ramp_of(const HeldRun &run, const OperatorParams &op,
+                               double clock_hz) {
   FirstRamp ramp;
-  if (!ssg_enabled(op)) {
-    return ramp;
-  }
-  const detail::HeldRun run =
-      detail::run_held(op, pitch, detail::curve_counter_phase(op, pitch, false),
-                       kMaxAttenuation, 0);
   ramp.mirrored =
       run.attack_end >= 0 ? run.inverted_after_attack : (op.ssg & 0x04) != 0;
   if (run.ramp_end >= 0) {
@@ -349,6 +355,29 @@ inline FirstRamp first_ramp(const OperatorParams &op, NotePitch pitch,
         static_cast<double>(run.ramp_end) * 1000.0 / sample_rate_hz(clock_hz);
   }
   return ramp;
+}
+
+/// The loop period a measured_loop_run() saw, in ms; infinite when the loop
+/// stopped before its third fold.
+inline double loop_period_ms(const HeldRun &run, const OperatorParams &op,
+                             double clock_hz) {
+  const double ramps_per_period = ssg_ramps_per_period(op);
+  return loop_ramp_samples(run) * ramps_per_period * 1000.0 /
+         sample_rate_hz(clock_hz);
+}
+
+} // namespace detail
+
+/// The defaults for a patch with SSG-EG off.
+inline FirstRamp first_ramp(const OperatorParams &op, NotePitch pitch,
+                            double clock_hz = kNtscClockHz) {
+  if (!ssg_enabled(op)) {
+    return FirstRamp{};
+  }
+  return detail::first_ramp_of(
+      detail::run_held(op, pitch, detail::curve_counter_phase(op, pitch, false),
+                       kMaxAttenuation, 0),
+      op, clock_hz);
 }
 
 /// The visible period of an SSG-EG loop at `pitch`, in ms, as sample_curve()
@@ -359,11 +388,10 @@ inline double ssg_loop_period_ms(const OperatorParams &op, NotePitch pitch,
   if (!ssg_loops(op)) {
     return 0.0;
   }
-  const double ramps_per_period = ssg_ramps_per_period(op);
-  return detail::loop_ramp_samples(
-             op, pitch, kMaxAttenuation,
-             detail::curve_counter_phase(op, pitch, false)) *
-         ramps_per_period * 1000.0 / sample_rate_hz(clock_hz);
+  return detail::loop_period_ms(
+      detail::measured_loop_run(op, pitch, kMaxAttenuation,
+                                detail::curve_counter_phase(op, pitch, false)),
+      op, clock_hz);
 }
 
 /// The fraction of key-on phases -- counter values, and the three samples of an
