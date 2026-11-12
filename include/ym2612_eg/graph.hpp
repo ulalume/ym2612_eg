@@ -1003,8 +1003,9 @@ inline double steady_now_ms() {
 }
 
 /// Remembers one operator's curve and rebuilds it only when the registers (or
-/// the note) actually change. While dragging, a rebuild the throttle has not
-/// licensed yet is skipped and last frame's curve handed back instead --
+/// the note) actually change, or the axis a loop is drawn on no longer fits
+/// the width it was simulated across. While dragging, a rebuild the throttle
+/// has not licensed yet is skipped and last frame's curve handed back instead --
 /// except the value a drag ends on is always built the frame after it stops
 /// moving, whatever the throttle says.
 class EnvelopeCurveCache {
@@ -1054,8 +1055,13 @@ inline const EnvelopeCurve &EnvelopeCurveCache::get(const OperatorParams &op,
   requested_valid_ = true;
 
   const double need_ms = ssg_loops(op) ? min_span_ms : 0.0;
+  // A loop simulated across a much wider axis is thinned to fit kMaxPoints,
+  // and on a narrower one its teeth would show as a ramp and a flat line.
+  const bool too_coarse =
+      curve_.simulated_ms >
+      2.0 * std::max({need_ms, curve_.span_ms, curve_.held_ms});
   if (valid_ && same_envelope(op, params_) && same_pitch(pitch, pitch_) &&
-      need_ms <= curve_.simulated_ms) {
+      need_ms <= curve_.simulated_ms && !too_coarse) {
     // The curve on hand is the one being asked for: nothing to decide, and no
     // clock read either. This is every frame the user is not editing.
     return curve_;
