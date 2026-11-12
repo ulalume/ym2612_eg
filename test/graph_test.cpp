@@ -334,6 +334,32 @@ void test_a_held_axis_is_simulated_across() {
   CHECK(plain.rebuild_count() == 1);
 }
 
+/// A loop first simulated across a wide axis is rebuilt as the axis narrows,
+/// so its teeth survive on the axis it ends up drawn on.
+void test_a_loop_is_rebuilt_as_its_axis_narrows() {
+  EnvelopeCurveCache cache;
+  const OperatorParams loop = ssg_patch(4, 31, 26, 15, 14, 15, 0);
+  const EnvelopeCurve exact = build_envelope_curve(loop, kMiddleC);
+  CHECK(exact.ssg_folds.size() >= 2);
+
+  double axis = 5000.0;
+  cache.get(loop, kMiddleC, axis);
+  while (axis > exact.span_ms) {
+    axis = std::max(axis * 0.8, exact.span_ms);
+    cache.get(loop, kMiddleC, axis);
+  }
+  const EnvelopeCurve &narrow = cache.get(loop, kMiddleC, axis);
+  CHECK(narrow.simulated_ms <= 2.0 * std::max(exact.span_ms, exact.held_ms));
+  // Point for point the same as the exact curve across the axis.
+  for (std::size_t i = 0; i < exact.held.points.size() &&
+                          exact.held.points[i].ms <= exact.span_ms;
+       ++i) {
+    CHECK(i < narrow.held.points.size());
+    CHECK(narrow.held.points[i].ms == exact.held.points[i].ms);
+    CHECK(narrow.held.points[i].att == exact.held.points[i].att);
+  }
+}
+
 /// A cursor wraps between the folds past the attack.
 void test_a_cursor_wraps_on_the_folds_of_the_ramps() {
   OperatorParams op;
@@ -2949,6 +2975,7 @@ int main() {
   RUN_TEST(test_a_loop_axis_shows_the_first_ramp_and_a_second_fold);
   RUN_TEST(test_a_release_widens_a_loop_axis_only_so_far);
   RUN_TEST(test_a_held_axis_is_simulated_across);
+  RUN_TEST(test_a_loop_is_rebuilt_as_its_axis_narrows);
   RUN_TEST(test_a_cursor_wraps_on_the_folds_of_the_ramps);
   RUN_TEST(test_the_named_levels_stand_on_the_trace);
   RUN_TEST(test_an_ssg_ramp_with_no_sustain_ignores_the_sustain_rate);
